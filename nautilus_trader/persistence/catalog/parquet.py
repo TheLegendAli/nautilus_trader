@@ -2109,7 +2109,6 @@ class ParquetDataCatalog(BaseDataCatalog):
                 continue
 
             if table is None:
-                print(f"No data for {cls_name}")
                 continue
 
             # Apply post read fixes
