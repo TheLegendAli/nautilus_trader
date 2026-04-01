@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -75,7 +75,7 @@ pub enum OrderEventType {
 
 pub trait OrderEvent: 'static + Send {
     fn id(&self) -> UUID4;
-    fn kind(&self) -> &str;
+    fn type_name(&self) -> &'static str;
     fn order_type(&self) -> Option<OrderType>;
     fn order_side(&self) -> Option<OrderSide>;
     fn trader_id(&self) -> TraderId;

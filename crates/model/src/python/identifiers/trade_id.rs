@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,7 +15,6 @@
 
 use std::{
     collections::hash_map::DefaultHasher,
-    ffi::CString,
     hash::{Hash, Hasher},
 };
 
@@ -27,35 +26,37 @@ use pyo3::{
     types::{PyString, PyTuple},
 };
 
-use crate::identifiers::trade_id::{TRADE_ID_LEN, TradeId};
+use crate::identifiers::TradeId;
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TradeId {
+    /// Represents a valid trade match ID (assigned by a trading venue).
+    ///
+    /// The unique ID assigned to the trade entity once it is received or matched by
+    /// the venue or central counterparty.
+    ///
+    /// Can correspond to the `TradeID <1003> field` of the FIX protocol.
+    ///
+    /// Maximum length is 36 characters.
     #[new]
     fn py_new(value: &str) -> PyResult<Self> {
         Self::new_checked(value).map_err(to_pyvalue_err)
     }
 
     fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
+        let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
         let binding = py_tuple.get_item(0)?;
-        let value_str = binding.downcast::<PyString>()?.extract::<&str>()?;
-
-        // TODO: Extract this to single function
-        let c_string = CString::new(value_str).expect("`CString` conversion failed");
-        let bytes = c_string.as_bytes_with_nul();
-        let mut value = [0; TRADE_ID_LEN];
-        value[..bytes.len()].copy_from_slice(bytes);
-        self.value = value;
-
+        let value_str = binding.cast::<PyString>()?.extract::<&str>()?;
+        *self = Self::new(value_str);
         Ok(())
     }
 
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
         (self.to_string(),).into_py_any(py)
     }
 
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
         let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
         let state = self.__getstate__(py)?;
         (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
@@ -66,7 +67,8 @@ impl TradeId {
         Self::from("NULL")
     }
 
-    fn __richcmp__(&self, other: PyObject, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
+    #[allow(clippy::needless_pass_by_value)]
+    fn __richcmp__(&self, other: Py<PyAny>, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         if let Ok(other) = other.extract::<Self>(py) {
             match op {
                 CompareOp::Eq => self.eq(&other).into_py_any_unwrap(py),
@@ -96,8 +98,8 @@ impl TradeId {
     }
 
     #[getter]
-    fn value(&self) -> String {
-        self.to_string()
+    fn value(&self) -> &str {
+        self.as_str()
     }
 
     #[staticmethod]

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -16,12 +16,12 @@
 use std::num::NonZeroUsize;
 
 use chrono::{DateTime, Utc};
-use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     data::{BarType, DataType},
     identifiers::{ClientId, InstrumentId, Venue},
 };
+use ustr::Ustr;
 
 use super::check_client_id_or_venue;
 
@@ -29,23 +29,33 @@ use super::check_client_id_or_venue;
 pub struct RequestCustomData {
     pub client_id: ClientId,
     pub data_type: DataType,
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
+    pub limit: Option<NonZeroUsize>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestCustomData {
     /// Creates a new [`RequestCustomData`] instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client_id: ClientId,
         data_type: DataType,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             client_id,
             data_type,
+            start,
+            end,
+            limit,
             request_id,
             ts_init,
             params,
@@ -61,7 +71,7 @@ pub struct RequestInstrument {
     pub client_id: Option<ClientId>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestInstrument {
@@ -74,7 +84,7 @@ impl RequestInstrument {
         client_id: Option<ClientId>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -96,7 +106,7 @@ pub struct RequestInstruments {
     pub venue: Option<Venue>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestInstruments {
@@ -109,7 +119,7 @@ impl RequestInstruments {
         venue: Option<Venue>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         check_client_id_or_venue(&client_id, &venue);
         Self {
@@ -131,7 +141,7 @@ pub struct RequestBookSnapshot {
     pub client_id: Option<ClientId>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestBookSnapshot {
@@ -143,7 +153,7 @@ impl RequestBookSnapshot {
         client_id: Option<ClientId>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -165,7 +175,7 @@ pub struct RequestQuotes {
     pub client_id: Option<ClientId>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestQuotes {
@@ -179,7 +189,7 @@ impl RequestQuotes {
         client_id: Option<ClientId>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -203,7 +213,7 @@ pub struct RequestTrades {
     pub client_id: Option<ClientId>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestTrades {
@@ -217,13 +227,127 @@ impl RequestTrades {
         client_id: Option<ClientId>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
             start,
             end,
             limit,
+            client_id,
+            request_id,
+            ts_init,
+            params,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestFundingRates {
+    pub instrument_id: InstrumentId,
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
+    pub limit: Option<NonZeroUsize>,
+    pub client_id: Option<ClientId>,
+    pub request_id: UUID4,
+    pub ts_init: UnixNanos,
+    pub params: Option<Params>,
+}
+
+impl RequestFundingRates {
+    /// Creates a new [`RequestFundingRates`] instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        request_id: UUID4,
+        ts_init: UnixNanos,
+        params: Option<Params>,
+    ) -> Self {
+        Self {
+            instrument_id,
+            start,
+            end,
+            limit,
+            client_id,
+            request_id,
+            ts_init,
+            params,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestForwardPrices {
+    pub venue: Venue,
+    pub underlying: Ustr,
+    pub instrument_id: Option<InstrumentId>,
+    pub client_id: Option<ClientId>,
+    pub request_id: UUID4,
+    pub ts_init: UnixNanos,
+    pub params: Option<Params>,
+}
+
+impl RequestForwardPrices {
+    /// Creates a new [`RequestForwardPrices`] instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        venue: Venue,
+        underlying: Ustr,
+        instrument_id: Option<InstrumentId>,
+        client_id: Option<ClientId>,
+        request_id: UUID4,
+        ts_init: UnixNanos,
+        params: Option<Params>,
+    ) -> Self {
+        Self {
+            venue,
+            underlying,
+            instrument_id,
+            client_id,
+            request_id,
+            ts_init,
+            params,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestBookDepth {
+    pub instrument_id: InstrumentId,
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
+    pub limit: Option<NonZeroUsize>,
+    pub depth: Option<NonZeroUsize>,
+    pub client_id: Option<ClientId>,
+    pub request_id: UUID4,
+    pub ts_init: UnixNanos,
+    pub params: Option<Params>,
+}
+
+impl RequestBookDepth {
+    /// Creates a new [`RequestBookDepth`] instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        instrument_id: InstrumentId,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        limit: Option<NonZeroUsize>,
+        depth: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        request_id: UUID4,
+        ts_init: UnixNanos,
+        params: Option<Params>,
+    ) -> Self {
+        Self {
+            instrument_id,
+            start,
+            end,
+            limit,
+            depth,
             client_id,
             request_id,
             ts_init,
@@ -241,7 +365,7 @@ pub struct RequestBars {
     pub client_id: Option<ClientId>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestBars {
@@ -255,7 +379,7 @@ impl RequestBars {
         client_id: Option<ClientId>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             bar_type,

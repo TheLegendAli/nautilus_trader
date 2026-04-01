@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,12 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::str::FromStr;
-
-use nautilus_core::python::{
-    IntoPyObjectNautilusExt, parsing::get_required_string, to_pyvalue_err,
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    str::FromStr,
 };
-use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+
+use nautilus_core::python::{parsing::get_required_string, to_pyvalue_err};
+use pyo3::{prelude::*, types::PyDict};
 
 use crate::{
     identifiers::InstrumentId,
@@ -26,18 +28,12 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl AccountBalance {
+    /// Represents an account balance denominated in a particular currency.
     #[new]
     fn py_new(total: Money, locked: Money, free: Money) -> PyResult<Self> {
         Self::new_checked(total, locked, free).map_err(to_pyvalue_err)
-    }
-
-    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
-        match op {
-            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
-            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
-            _ => py.NotImplemented(),
-        }
     }
 
     fn __repr__(&self) -> String {
@@ -46,6 +42,21 @@ impl AccountBalance {
 
     fn __str__(&self) -> String {
         self.to_string()
+    }
+
+    fn __hash__(&self) -> isize {
+        let mut h = DefaultHasher::new();
+        self.total.raw.hash(&mut h);
+        self.locked.raw.hash(&mut h);
+        self.free.raw.hash(&mut h);
+        self.currency.code.hash(&mut h);
+        h.finish() as isize
+    }
+
+    /// Returns a copy of this balance.
+    #[pyo3(name = "copy")]
+    fn py_copy(&self) -> Self {
+        *self
     }
 
     /// Constructs an [`AccountBalance`] from a Python dict.
@@ -82,7 +93,7 @@ impl AccountBalance {
     ///
     /// Returns a `PyErr` if serialization fails.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("type", stringify!(AccountBalance))?;
         dict.set_item(
@@ -115,17 +126,12 @@ impl AccountBalance {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MarginBalance {
+    /// Creates a new `MarginBalance` instance.
     #[new]
     fn py_new(initial: Money, maintenance: Money, instrument: InstrumentId) -> Self {
         Self::new(initial, maintenance, instrument)
-    }
-    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
-        match op {
-            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
-            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
-            _ => py.NotImplemented(),
-        }
     }
 
     fn __repr__(&self) -> String {
@@ -134,6 +140,21 @@ impl MarginBalance {
 
     fn __str__(&self) -> String {
         self.to_string()
+    }
+
+    fn __hash__(&self) -> isize {
+        let mut h = DefaultHasher::new();
+        self.initial.raw.hash(&mut h);
+        self.maintenance.raw.hash(&mut h);
+        self.currency.code.hash(&mut h);
+        self.instrument_id.hash(&mut h);
+        h.finish() as isize
+    }
+
+    /// Returns a copy of this margin balance.
+    #[pyo3(name = "copy")]
+    fn py_copy(&self) -> Self {
+        *self
     }
 
     /// Constructs a [`MarginBalance`] from a Python dict.
@@ -158,7 +179,7 @@ impl MarginBalance {
         let account_balance = Self::new(
             Money::new(initial, currency),
             Money::new(maintenance, currency),
-            InstrumentId::from(instrument_id_str.as_str()),
+            InstrumentId::from(instrument_id_str),
         );
         Ok(account_balance)
     }
@@ -169,11 +190,8 @@ impl MarginBalance {
     ///
     /// Returns a `PyErr` if serialization fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if parsing numeric values (`unwrap()`) fails due to invalid format.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("type", stringify!(MarginBalance))?;
         dict.set_item(

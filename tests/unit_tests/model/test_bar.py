@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -421,8 +421,6 @@ class TestBarSpecification:
             BarAggregation.TICK_RUNS,
             BarAggregation.VOLUME_RUNS,
             BarAggregation.VALUE_RUNS,
-            BarAggregation.MONTH,
-            BarAggregation.YEAR,
         ],
     )
     def test_get_interval_ns_and_timedelta_non_time_aggregations_raise_error(
@@ -433,15 +431,43 @@ class TestBarSpecification:
         spec = BarSpecification(1, aggregation, PriceType.LAST)
 
         # Act & Assert
-        if aggregation in [BarAggregation.MONTH, BarAggregation.YEAR]:
-            match = f"get_interval_ns not supported for the `BarAggregation.{aggregation.name}` aggregation"
-        else:
-            match = "Aggregation not time based"
+        match = "Aggregation not time based"
 
         with pytest.raises(ValueError, match=match):
             spec.get_interval_ns()
         with pytest.raises(ValueError, match=match):
             spec.timedelta
+
+    @pytest.mark.parametrize(
+        ("step", "aggregation", "expected_timedelta"),
+        [
+            # MONTH aggregations - returns proxy value (30 days)
+            (1, BarAggregation.MONTH, pd.Timedelta(days=30)),
+            (2, BarAggregation.MONTH, pd.Timedelta(days=60)),
+            (3, BarAggregation.MONTH, pd.Timedelta(days=90)),
+            # YEAR aggregations - returns proxy value (365 days)
+            (1, BarAggregation.YEAR, pd.Timedelta(days=365)),
+            (2, BarAggregation.YEAR, pd.Timedelta(days=730)),
+        ],
+    )
+    def test_get_interval_ns_and_timedelta_month_year_proxy_values(
+        self,
+        step: int,
+        aggregation: BarAggregation,
+        expected_timedelta: pd.Timedelta,
+    ):
+        # Arrange
+        spec = BarSpecification(step, aggregation, PriceType.LAST)
+
+        # Act
+        actual_ns = spec.get_interval_ns()
+        actual_timedelta = spec.timedelta
+
+        # Assert
+        assert actual_ns == expected_timedelta.value
+        assert actual_timedelta == expected_timedelta
+        # Verify consistency between methods
+        assert actual_timedelta == pd.Timedelta(nanoseconds=actual_ns)
 
     def test_properties(self):
         # Arrange, Act
@@ -615,6 +641,20 @@ class TestBarType:
         # Assert
         assert expected == bar_type
 
+    def test_bar_type_from_str_with_utf8_symbol(self):
+        # Arrange
+        non_ascii_instrument = "TËST-PÉRP.BINANCE"
+        non_ascii_bar_type = "TËST-PÉRP.BINANCE-1-MINUTE-LAST-EXTERNAL"
+
+        # Act
+        bar_type = BarType.from_str(non_ascii_bar_type)
+
+        # Assert
+        assert bar_type.instrument_id == InstrumentId.from_str(non_ascii_instrument)
+        assert bar_type.spec == BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST)
+        assert bar_type.aggregation_source == AggregationSource.EXTERNAL
+        assert str(bar_type) == non_ascii_bar_type
+
     def test_properties(self):
         # Arrange, Act
         instrument_id = InstrumentId(Symbol("AUD/USD"), Venue("SIM"))
@@ -625,6 +665,36 @@ class TestBarType:
         assert bar_type.instrument_id == instrument_id
         assert bar_type.spec == bar_spec
         assert bar_type.aggregation_source == AggregationSource.EXTERNAL
+
+    def test_id_spec_key_ignores_aggregation_source(self):
+        # Arrange
+        bar_type_external = BarType.from_str("ESM4.XCME-1-MINUTE-LAST-EXTERNAL")
+        bar_type_internal = BarType.from_str("ESM4.XCME-1-MINUTE-LAST-INTERNAL")
+
+        # Act
+        key_external = bar_type_external.id_spec_key()
+        key_internal = bar_type_internal.id_spec_key()
+
+        # Assert: full equality should differ
+        assert bar_type_external != bar_type_internal
+
+        # Assert: id_spec_key should be the same
+        assert key_external == key_internal
+
+        # Assert: tuple components are correct
+        assert key_external == (bar_type_external.instrument_id, bar_type_external.spec)
+
+    def test_id_spec_key_can_be_used_as_dict_key(self):
+        # Arrange
+        bar_type_external = BarType.from_str("ESM4.XCME-1-MINUTE-LAST-EXTERNAL")
+        bar_type_internal = BarType.from_str("ESM4.XCME-1-MINUTE-LAST-INTERNAL")
+        lookup: dict[tuple, str] = {}
+
+        # Act: register with external bar type
+        lookup[bar_type_external.id_spec_key()] = "registered"
+
+        # Assert: lookup with internal bar type should find it
+        assert lookup.get(bar_type_internal.id_spec_key()) == "registered"
 
 
 class TestBar:
@@ -812,18 +882,20 @@ class TestBar:
 
     def test_from_raw_returns_expected_bar(self):
         # Arrange
+        bar_type = BarType.from_str("EUR/USD.IDEALPRO-5-MINUTE-MID-EXTERNAL")
         open_price = 1.06210
         high_price = 1.06355
         low_price = 1.06205
         close_price = 1.06320
+        precision = 5
 
         raw_bar = [
-            BarType.from_str("EUR/USD.IDEALPRO-5-MINUTE-MID-EXTERNAL"),
-            convert_to_raw_int(open_price, 5),
-            convert_to_raw_int(high_price, 5),
-            convert_to_raw_int(low_price, 5),
-            convert_to_raw_int(close_price, 5),
-            5,
+            bar_type,
+            convert_to_raw_int(open_price, precision),
+            convert_to_raw_int(high_price, precision),
+            convert_to_raw_int(low_price, precision),
+            convert_to_raw_int(close_price, precision),
+            precision,
             convert_to_raw_int(100_000, 0),
             0,
             1672012800000000000,
@@ -834,16 +906,14 @@ class TestBar:
         result = Bar.from_raw(*raw_bar)
 
         # Assert
-        assert result == Bar(
-            BarType.from_str("EUR/USD.IDEALPRO-5-MINUTE-MID-EXTERNAL"),
-            Price.from_str("1.06210"),
-            Price.from_str("1.06355"),
-            Price.from_str("1.06205"),
-            Price.from_str("1.06320"),
-            Quantity.from_int(100_000),
-            1672012800000000000,
-            1672013100300000000,
-        )
+        assert result.bar_type == bar_type
+        assert result.volume == Quantity.from_int(100_000)
+        assert result.open.raw == raw_bar[1]
+        assert result.high.raw == raw_bar[2]
+        assert result.low.raw == raw_bar[3]
+        assert result.close.raw == raw_bar[4]
+        assert result.ts_event == 1672012800000000000
+        assert result.ts_init == 1672013100300000000
 
     def test_from_dict_returns_expected_bar(self):
         # Arrange

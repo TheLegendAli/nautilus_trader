@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -31,6 +31,47 @@ class TestBinanceCoreFunctions:
         # Assert
         assert result == "ETHUSDT"
 
+    @pytest.mark.parametrize(
+        ("symbol", "expected"),
+        [
+            # Linear (USDT-M) perpetuals: strip -PERP suffix
+            ("BTCUSDT-PERP", "BTCUSDT"),
+            ("ETHUSDT-PERP", "ETHUSDT"),
+            ("BNBUSDT-PERP", "BNBUSDT"),
+            ("BTCBUSD-PERP", "BTCBUSD"),
+            # Short-base linear perpetuals
+            ("AIUSDT-PERP", "AIUSDT"),
+            # COIN-M (inverse) perpetuals: replace -PERP with _PERP
+            ("BTCUSD-PERP", "BTCUSD_PERP"),
+            ("ETHUSD-PERP", "ETHUSD_PERP"),
+            ("BNBUSD-PERP", "BNBUSD_PERP"),
+            ("LINKUSD-PERP", "LINKUSD_PERP"),
+            ("DOTUSD-PERP", "DOTUSD_PERP"),
+            # Spot / no -PERP suffix: pass through
+            ("BTCUSDT", "BTCUSDT"),
+            ("ETHUSDT", "ETHUSDT"),
+        ],
+    )
+    def test_format_symbol_perp_variants(self, symbol, expected):
+        assert BinanceSymbol(symbol) == expected
+
+    @pytest.mark.parametrize(
+        ("symbol", "account_type", "expected"),
+        [
+            # COIN-M perpetuals round-trip
+            ("BTCUSD_PERP", BinanceAccountType.COIN_FUTURES, "BTCUSD-PERP"),
+            ("BNBUSD_PERP", BinanceAccountType.COIN_FUTURES, "BNBUSD-PERP"),
+            # Linear perpetuals round-trip
+            ("BTCUSDT", BinanceAccountType.USDT_FUTURES, "BTCUSDT-PERP"),
+            ("ETHUSDT", BinanceAccountType.USDT_FUTURES, "ETHUSDT-PERP"),
+            # Spot: no suffix added
+            ("BTCUSDT", BinanceAccountType.SPOT, "BTCUSDT"),
+        ],
+    )
+    def test_parse_as_nautilus(self, symbol, account_type, expected):
+        result = BinanceSymbol(symbol).parse_as_nautilus(account_type)
+        assert result == expected
+
     def test_convert_symbols_list_to_json_array(self):
         # Arrange
         symbols = ["BTCUSDT", "ETHUSDT-PERP", " XRDUSDT"]
@@ -47,8 +88,8 @@ class TestBinanceCoreFunctions:
             [BinanceAccountType.SPOT, True],
             [BinanceAccountType.MARGIN, False],
             [BinanceAccountType.ISOLATED_MARGIN, False],
-            [BinanceAccountType.USDT_FUTURE, False],
-            [BinanceAccountType.COIN_FUTURE, False],
+            [BinanceAccountType.USDT_FUTURES, False],
+            [BinanceAccountType.COIN_FUTURES, False],
         ],
     )
     def test_binance_account_type_is_spot(self, account_type, expected):
@@ -61,8 +102,8 @@ class TestBinanceCoreFunctions:
             [BinanceAccountType.SPOT, False],
             [BinanceAccountType.MARGIN, True],
             [BinanceAccountType.ISOLATED_MARGIN, True],
-            [BinanceAccountType.USDT_FUTURE, False],
-            [BinanceAccountType.COIN_FUTURE, False],
+            [BinanceAccountType.USDT_FUTURES, False],
+            [BinanceAccountType.COIN_FUTURES, False],
         ],
     )
     def test_binance_account_type_is_margin(self, account_type, expected):
@@ -75,8 +116,8 @@ class TestBinanceCoreFunctions:
             [BinanceAccountType.SPOT, True],
             [BinanceAccountType.MARGIN, True],
             [BinanceAccountType.ISOLATED_MARGIN, True],
-            [BinanceAccountType.USDT_FUTURE, False],
-            [BinanceAccountType.COIN_FUTURE, False],
+            [BinanceAccountType.USDT_FUTURES, False],
+            [BinanceAccountType.COIN_FUTURES, False],
         ],
     )
     def test_binance_account_type_is_spot_or_margin(self, account_type, expected):
@@ -89,8 +130,8 @@ class TestBinanceCoreFunctions:
             [BinanceAccountType.SPOT, False],
             [BinanceAccountType.MARGIN, False],
             [BinanceAccountType.ISOLATED_MARGIN, False],
-            [BinanceAccountType.USDT_FUTURE, True],
-            [BinanceAccountType.COIN_FUTURE, True],
+            [BinanceAccountType.USDT_FUTURES, True],
+            [BinanceAccountType.COIN_FUTURES, True],
         ],
     )
     def test_binance_account_type_is_futures(self, account_type, expected):

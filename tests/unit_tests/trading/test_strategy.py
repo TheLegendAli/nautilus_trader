@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -22,7 +22,7 @@ import pytest
 import pytz
 
 from nautilus_trader.backtest.data_client import BacktestMarketDataClient
-from nautilus_trader.backtest.exchange import SimulatedExchange
+from nautilus_trader.backtest.engine import SimulatedExchange
 from nautilus_trader.backtest.execution_client import BacktestExecClient
 from nautilus_trader.backtest.models import FillModel
 from nautilus_trader.backtest.models import LatencyModel
@@ -36,9 +36,11 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.engine import ExecutionEngine
-from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
+from nautilus_trader.indicators import ExponentialMovingAverage
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import OmsType
@@ -196,8 +198,14 @@ class TestStrategy:
             "external_order_claims": None,
             "manage_contingent_orders": False,
             "manage_gtd_expiry": False,
+            "manage_stop": False,
             "log_events": True,
             "log_commands": True,
+            "log_rejected_due_post_only_as_warning": True,
+            "market_exit_interval_ms": 100,
+            "market_exit_max_attempts": 100,
+            "market_exit_time_in_force": TimeInForce.GTC,
+            "market_exit_reduce_only": True,
         }
 
     def test_strategy_to_importable_config(self) -> None:
@@ -229,8 +237,14 @@ class TestStrategy:
             "external_order_claims": ["ETHUSDT-PERP.DYDX"],
             "manage_contingent_orders": True,
             "manage_gtd_expiry": True,
+            "manage_stop": False,
             "log_events": False,
             "log_commands": True,
+            "log_rejected_due_post_only_as_warning": True,
+            "market_exit_interval_ms": 100,
+            "market_exit_max_attempts": 100,
+            "market_exit_time_in_force": TimeInForce.GTC,
+            "market_exit_reduce_only": True,
         }
 
     def test_strategy_equality(self) -> None:
@@ -430,6 +444,39 @@ class TestStrategy:
         assert "on_dispose" in strategy.calls
         assert strategy.is_disposed
 
+    def test_dispose_cancels_all_timers(self) -> None:
+        # Arrange
+        bar_type = TestDataStubs.bartype_audusd_1min_bid()
+        strategy = MockStrategy(bar_type)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        start_time = datetime.now(pytz.utc) + timedelta(milliseconds=100)
+        strategy.clock.set_timer(
+            "test_timer1",
+            timedelta(milliseconds=100),
+            start_time,
+            stop_time=None,
+        )
+        strategy.clock.set_timer(
+            "test_timer2",
+            timedelta(milliseconds=200),
+            start_time,
+            stop_time=None,
+        )
+
+        # Act
+        strategy.dispose()
+
+        # Assert
+        assert strategy.clock.timer_count == 0
+        assert strategy.is_disposed
+
     def test_save_load(self) -> None:
         # Arrange
         bar_type = TestDataStubs.bartype_audusd_1min_bid()
@@ -582,7 +629,9 @@ class TestStrategy:
         strategy.register_indicator_for_quote_ticks(AUDUSD_SIM.id, ema)
 
         # Act
-        strategy.handle_quote_ticks([])
+        tick: QuoteTick
+        for tick in []:
+            strategy.handle_quote_tick(tick)
 
         # Assert
         assert ema.count == 0
@@ -604,7 +653,8 @@ class TestStrategy:
         tick = TestDataStubs.quote_tick(AUDUSD_SIM)
 
         # Act
-        strategy.handle_quote_ticks([tick])
+        for t in [tick]:
+            strategy.handle_quote_tick(t)
 
         # Assert
         assert ema.count == 1
@@ -649,7 +699,8 @@ class TestStrategy:
         tick = TestDataStubs.trade_tick(AUDUSD_SIM)
 
         # Act
-        strategy.handle_trade_ticks([tick])
+        for t in [tick]:
+            strategy.handle_trade_tick(t)
 
         # Assert
         assert ema.count == 1
@@ -669,7 +720,9 @@ class TestStrategy:
         strategy.register_indicator_for_trade_ticks(AUDUSD_SIM.id, ema)
 
         # Act
-        strategy.handle_trade_ticks([])
+        tick: TradeTick
+        for tick in []:
+            strategy.handle_trade_tick(tick)
 
         # Assert
         assert ema.count == 0
@@ -714,7 +767,8 @@ class TestStrategy:
         bar = TestDataStubs.bar_5decimal()
 
         # Act
-        strategy.handle_bars([bar])
+        for b in [bar]:
+            strategy.handle_bar(b)
 
         # Assert
         assert ema.count == 1
@@ -735,7 +789,9 @@ class TestStrategy:
         strategy.register_indicator_for_bars(bar_type, ema)
 
         # Act
-        strategy.handle_bars([])
+        bar: Bar
+        for bar in []:
+            strategy.handle_bar(bar)
 
         # Assert
         assert ema.count == 0
@@ -1549,6 +1605,37 @@ class TestStrategy:
         assert order1 in self.cache.orders_closed()
         assert order2 in strategy.cache.orders_closed()
 
+    def test_cancel_all_orders_with_inflight_orders_sends_command(self) -> None:
+        # Arrange
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order = strategy.order_factory.stop_market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("90.007"),
+        )
+
+        # Submit order but don't process exchange (order stays in SUBMITTED/inflight state)
+        strategy.submit_order(order)
+        assert order.status == OrderStatus.SUBMITTED
+        assert order in self.cache.orders_inflight()
+        assert order not in self.cache.orders_open()
+
+        # Act
+        strategy.cancel_all_orders(_USDJPY_SIM.id)
+        self.exchange.process(0)
+
+        # Assert
+        assert order.status == OrderStatus.CANCELED
+
     def test_close_position_when_position_already_closed_does_nothing(self) -> None:
         # Arrange
         strategy = Strategy()
@@ -1663,6 +1750,107 @@ class TestStrategy:
         for order in orders:
             if order.side == OrderSide.SELL:
                 assert order.tags == ["EXIT"]
+
+    def test_close_position_with_quote_quantity_true(self) -> None:
+        # Arrange
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        strategy.submit_order(order)
+        self.exchange.process(0)
+
+        position = self.cache.positions_open()[0]
+
+        # Act
+        strategy.close_position(position, quote_quantity=True)
+
+        # Assert
+        orders = self.cache.orders(instrument_id=_USDJPY_SIM.id)
+        closing_orders = [o for o in orders if o.side == OrderSide.SELL]
+        assert len(closing_orders) == 1
+        assert closing_orders[0].is_quote_quantity
+
+    def test_close_position_with_quote_quantity_false(self) -> None:
+        # Arrange
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        strategy.submit_order(order)
+        self.exchange.process(0)
+
+        position = self.cache.positions_open()[0]
+
+        # Act
+        strategy.close_position(position, quote_quantity=False)
+
+        # Assert
+        orders = self.cache.orders(instrument_id=_USDJPY_SIM.id)
+        closing_orders = [o for o in orders if o.side == OrderSide.SELL]
+        assert len(closing_orders) == 1
+        assert not closing_orders[0].is_quote_quantity
+
+    def test_close_all_positions_with_quote_quantity_true(self) -> None:
+        # Arrange
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        order1 = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        order2 = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        strategy.submit_order(order1)
+        self.exchange.process(0)
+        strategy.submit_order(order2)
+        self.exchange.process(0)
+
+        # Act
+        strategy.close_all_positions(_USDJPY_SIM.id, quote_quantity=True)
+
+        # Assert
+        orders = self.cache.orders(instrument_id=_USDJPY_SIM.id)
+        closing_orders = [o for o in orders if o.side == OrderSide.SELL]
+        assert len(closing_orders) == 2
+        for order in closing_orders:
+            assert order.is_quote_quantity
 
     @pytest.mark.parametrize(
         ("contingency_type"),
@@ -1912,3 +2100,581 @@ class TestStrategy:
         assert entry_order.status == OrderStatus.FILLED
         assert tp_order.status == OrderStatus.FILLED
         assert sl_order.status == OrderStatus.CANCELED
+
+    def test_market_exit(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Submit an order that will remain open
+        order = strategy.order_factory.limit(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            price=Price.from_str("10.000"),  # Far from market
+        )
+        strategy.submit_order(order)
+        self.exchange.process(0)
+        assert order.status == OrderStatus.ACCEPTED
+
+        # Act
+        strategy.market_exit()
+
+        # 1st check: cancels orders immediately in market_exit()
+        self.exchange.process(0)  # Process the cancel command
+        assert order.status == OrderStatus.CANCELED
+
+        # Advance time to trigger check timer
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert - strategy stays running after market exit
+        assert strategy.state == ComponentState.RUNNING
+
+    def test_market_exit_with_position(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Open a position
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+        self.exchange.process(0)
+        assert not strategy.portfolio.is_completely_flat()
+
+        # Act
+        strategy.market_exit()
+
+        # 1st call to market_exit() calls close_all_positions immediately
+        self.exchange.process(0)  # Process the closing market order
+        assert strategy.portfolio.is_completely_flat()
+
+        # Advance time to trigger check timer
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert - strategy stays running after market exit
+        assert strategy.state == ComponentState.RUNNING
+
+    def test_market_exit_with_time_in_force(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            market_exit_interval_ms=10,
+            market_exit_time_in_force=TimeInForce.IOC,
+        )
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Open a position
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+        self.exchange.process(0)
+
+        # Act
+        strategy.market_exit()
+
+        # Assert - closing order uses specified time_in_force
+        self.exchange.process(0)
+        closing_order = self.cache.orders()[-1]
+        assert closing_order.time_in_force == TimeInForce.IOC
+        assert strategy.portfolio.is_completely_flat()
+
+    def test_market_exit_max_attempts_reached(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            market_exit_interval_ms=10,
+            market_exit_max_attempts=3,
+        )
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Submit order that won't be processed (simulating stuck inflight order)
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+
+        # Don't process the order so it stays inflight
+        assert order.status == OrderStatus.SUBMITTED
+
+        # Act
+        strategy.market_exit()
+
+        # Advance time enough for max_attempts (3) to be reached
+        for _ in range(4):
+            for handler in self.clock.advance_time(
+                self.clock.timestamp_ns() + pd.Timedelta(milliseconds=15).value,
+            ):
+                handler.handle()
+
+        # Assert - strategy stays running even after max attempts
+        assert strategy.state == ComponentState.RUNNING
+
+    def test_manage_stop_performs_market_exit_then_stops(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            manage_stop=True,
+            market_exit_interval_ms=10,
+        )
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Open a position
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+        self.exchange.process(0)
+        assert not strategy.portfolio.is_completely_flat()
+
+        # Act - stop() should trigger market exit first
+        strategy.stop()
+
+        # Process the closing market order
+        self.exchange.process(0)
+        assert strategy.portfolio.is_completely_flat()
+
+        # Advance time to complete market exit
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert - strategy should be stopped after market exit completes
+        assert strategy.state == ComponentState.STOPPED
+
+    def test_manage_stop_during_market_exit_waits_then_stops(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            manage_stop=True,
+            market_exit_interval_ms=10,
+        )
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Open a position
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+        self.exchange.process(0)
+
+        # Start market exit first (user-initiated)
+        strategy.market_exit()
+        assert strategy.state == ComponentState.RUNNING
+
+        # Now call stop() while market exit is in progress
+        strategy.stop()
+
+        # Strategy should still be running (waiting for market exit)
+        assert strategy.state == ComponentState.RUNNING
+
+        # Process the closing market order
+        self.exchange.process(0)
+
+        # Advance time to complete market exit
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert - strategy should stop after market exit completes
+        assert strategy.state == ComponentState.STOPPED
+
+    def test_manage_stop_called_multiple_times_during_exit(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            manage_stop=True,
+            market_exit_interval_ms=10,
+        )
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Open a position
+        order = strategy.order_factory.market(
+            _USDJPY_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+        self.exchange.process(0)
+
+        # Act - call stop() multiple times
+        strategy.stop()
+        strategy.stop()
+        strategy.stop()
+
+        # Strategy should still be running (waiting for market exit)
+        assert strategy.state == ComponentState.RUNNING
+
+        # Process the closing market order
+        self.exchange.process(0)
+
+        # Advance time to complete market exit
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert - strategy should stop after market exit completes
+        assert strategy.state == ComponentState.STOPPED
+
+    def test_market_exit_calls_hooks(self) -> None:
+        # Arrange
+        class HookTrackingStrategy(Strategy):
+            def __init__(self, config):
+                super().__init__(config)
+                self.on_market_exit_called = False
+                self.post_market_exit_called = False
+
+            def on_market_exit(self):
+                self.on_market_exit_called = True
+
+            def post_market_exit(self):
+                self.post_market_exit_called = True
+
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = HookTrackingStrategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Act
+        strategy.market_exit()
+
+        # on_market_exit called immediately
+        assert strategy.on_market_exit_called
+
+        # Advance time to complete the exit
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert
+        assert strategy.post_market_exit_called
+        assert strategy.state == ComponentState.RUNNING
+
+    def test_market_exit_when_already_in_progress_logs_warning(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Act
+        strategy.market_exit()
+        strategy.market_exit()  # Second call should warn
+
+        # Assert - strategy should still complete normally and stay running
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        assert strategy.state == ComponentState.RUNNING
+
+    def test_market_exit_when_not_running_logs_warning(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Act - call market_exit without starting
+        strategy.market_exit()
+
+        # Assert - no timer should be set, strategy remains in ready state
+        assert strategy.state == ComponentState.READY
+        assert not strategy.is_exiting()
+
+    def test_submit_order_denied_during_market_exit_when_not_reduce_only(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+        strategy.market_exit()
+
+        # Act - submit non-reduce-only order during exit
+        order = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(order)
+
+        # Assert - order should be denied
+        assert order.status == OrderStatus.DENIED
+
+    def test_submit_order_allowed_during_market_exit_when_reduce_only(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+        strategy.market_exit()
+
+        # Act - submit reduce-only order during exit
+        order = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            reduce_only=True,
+        )
+        strategy.submit_order(order)
+
+        # Assert - order should be submitted (not denied)
+        assert order.status != OrderStatus.DENIED
+
+    def test_submit_order_allowed_during_market_exit_when_tagged(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+        strategy.market_exit()
+
+        # Act - submit non-reduce-only order tagged as market exit
+        order = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            tags=["MARKET_EXIT"],
+        )
+        strategy.submit_order(order)
+
+        # Assert - order should be submitted (not denied)
+        assert order.status != OrderStatus.DENIED
+
+    def test_submit_order_list_denied_during_market_exit_when_not_all_reduce_only(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+        strategy.market_exit()
+
+        # Act - submit order list with non-reduce-only order during exit
+        order1 = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        order2 = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            reduce_only=True,
+        )
+        order_list = OrderList(
+            order_list_id=strategy.order_factory.generate_order_list_id(),
+            orders=[order1, order2],
+        )
+        strategy.submit_order_list(order_list)
+
+        # Assert - orders should be denied
+        assert order1.status == OrderStatus.DENIED
+        assert order2.status == OrderStatus.DENIED
+
+    def test_submit_order_list_allowed_during_market_exit_when_all_reduce_only(self) -> None:
+        # Arrange
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+        strategy.market_exit()
+
+        # Act - submit order list with all reduce-only orders during exit
+        order1 = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+            reduce_only=True,
+        )
+        order2 = strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(50_000),
+            reduce_only=True,
+        )
+        order_list = OrderList(
+            order_list_id=strategy.order_factory.generate_order_list_id(),
+            orders=[order1, order2],
+        )
+        strategy.submit_order_list(order_list)
+
+        # Assert - orders should not be denied
+        assert order1.status != OrderStatus.DENIED
+        assert order2.status != OrderStatus.DENIED
+
+    def test_manage_stop_completes_even_when_post_market_exit_raises(self) -> None:
+        # Arrange
+        class FailingPostExitStrategy(Strategy):
+            def post_market_exit(self):
+                raise RuntimeError("Simulated error in post_market_exit")
+
+        config = StrategyConfig(
+            manage_stop=True,
+            market_exit_interval_ms=10,
+        )
+        strategy = FailingPostExitStrategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Act - stop() should still complete even if post_market_exit raises
+        strategy.stop()
+
+        # Advance time to complete market exit
+        for handler in self.clock.advance_time(
+            self.clock.timestamp_ns() + pd.Timedelta(milliseconds=20).value,
+        ):
+            handler.handle()
+
+        # Assert - strategy should be stopped despite the exception
+        assert strategy.state == ComponentState.STOPPED
+
+    def test_stop_during_market_exit_with_manage_stop_false_cleans_up_state(self) -> None:
+        # Arrange - manage_stop=False (default)
+        config = StrategyConfig(market_exit_interval_ms=10)
+        strategy = Strategy(config=config)
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        strategy.start()
+
+        # Start a market exit manually
+        strategy.market_exit()
+        assert strategy.is_exiting()
+
+        # Act - call stop() while market exit is in progress
+        strategy.stop()
+
+        # Assert - strategy should be stopped and market exit state cleaned up
+        assert strategy.state == ComponentState.STOPPED
+        assert not strategy.is_exiting()

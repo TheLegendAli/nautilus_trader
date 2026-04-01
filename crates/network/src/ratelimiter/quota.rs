@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,8 +15,6 @@
 
 use std::{num::NonZeroU32, prelude::v1::*, time::Duration};
 
-use nonzero_ext::nonzero;
-
 use super::nanos::Nanos;
 
 /// A rate-limiting quota.
@@ -27,11 +25,11 @@ use super::nanos::Nanos;
 ///
 /// Neither the number of cells nor the replenishment unit of time may be zero.
 ///
-/// # Burst sizes
+/// # Burst Sizes
 /// There are multiple ways of expressing the same quota: a quota given as `Quota::per_second(1)`
 /// allows, on average, the same number of cells through as a quota given as `Quota::per_minute(60)`.
 /// The quota of `Quota::per_minute(60)` has a burst size of 60 cells, meaning it is
-/// possible to accomodate 60 cells in one go, after which the equivalent of a minute of inactivity
+/// possible to accommodate 60 cells in one go, after which the equivalent of a minute of inactivity
 /// is required for the burst allowance to be fully restored.
 ///
 /// Burst size gets really important when you construct a rate limiter that should allow multiple
@@ -44,7 +42,11 @@ use super::nanos::Nanos;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.network")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.network", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.network")
 )]
 pub struct Quota {
     pub(crate) max_burst: NonZeroU32,
@@ -55,13 +57,19 @@ pub struct Quota {
 impl Quota {
     /// Construct a quota for a number of cells per second. The given number of cells is also
     /// assumed to be the maximum burst size.
+    ///
+    /// Returns `None` if `max_burst` is so large that the replenish interval rounds to zero
+    /// nanoseconds (i.e. `max_burst > 1_000_000_000`).
     #[must_use]
-    pub const fn per_second(max_burst: NonZeroU32) -> Self {
+    pub const fn per_second(max_burst: NonZeroU32) -> Option<Self> {
         let replenish_interval_ns = Duration::from_secs(1).as_nanos() / (max_burst.get() as u128);
-        Self {
+        if replenish_interval_ns == 0 {
+            return None;
+        }
+        Some(Self {
             max_burst,
             replenish_1_per: Duration::from_nanos(replenish_interval_ns as u64),
-        }
+        })
     }
 
     /// Construct a quota for a number of cells per 60-second period. The given number of cells is
@@ -79,8 +87,7 @@ impl Quota {
     /// of cells is also assumed to be the maximum burst size.
     #[must_use]
     pub const fn per_hour(max_burst: NonZeroU32) -> Self {
-        let replenish_interval_ns =
-            Duration::from_secs(60 * 60).as_nanos() / (max_burst.get() as u128);
+        let replenish_interval_ns = Duration::from_hours(1).as_nanos() / (max_burst.get() as u128);
         Self {
             max_burst,
             replenish_1_per: Duration::from_nanos(replenish_interval_ns as u64),
@@ -100,8 +107,9 @@ impl Quota {
         if replenish_1_per.as_nanos() == 0 {
             None
         } else {
+            #[allow(clippy::missing_panics_doc)]
             Some(Self {
-                max_burst: nonzero!(1u32),
+                max_burst: NonZeroU32::new(1).unwrap(),
                 replenish_1_per,
             })
         }
@@ -183,11 +191,11 @@ impl Quota {
         let tau_u64 = tau.as_u64();
 
         // Validate division won't be zero or overflow
-        assert!((t_u64 != 0), "Invalid GCRA parameter: t cannot be zero");
+        assert!(t_u64 != 0, "Invalid GCRA parameter: t cannot be zero");
 
         let division_result = tau_u64 / t_u64;
         assert!(
-            (division_result != 0),
+            division_result != 0,
             "Invalid GCRA parameters: tau/t results in zero burst capacity"
         );
         assert!(
@@ -206,9 +214,6 @@ impl Quota {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 // #[cfg(test)]
 // mod test {
 //     use nonzero_ext::nonzero;

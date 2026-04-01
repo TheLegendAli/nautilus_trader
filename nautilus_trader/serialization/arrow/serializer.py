@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,9 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import inspect
 from collections.abc import Callable
 from io import BytesIO
-from typing import Any, Union
+from typing import Any
+from typing import Union
 
 import pyarrow as pa
 
@@ -28,6 +30,7 @@ from nautilus_trader.core.data import Data
 from nautilus_trader.core.message import Event
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import CustomData
+from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.data import IndexPriceUpdate
 from nautilus_trader.model.data import InstrumentClose
 from nautilus_trader.model.data import MarkPriceUpdate
@@ -43,11 +46,13 @@ from nautilus_trader.model.events import PositionEvent
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.wranglers_v2 import BarDataWranglerV2
 from nautilus_trader.persistence.wranglers_v2 import OrderBookDeltaDataWranglerV2
+from nautilus_trader.persistence.wranglers_v2 import OrderBookDepth10DataWranglerV2
 from nautilus_trader.persistence.wranglers_v2 import QuoteTickDataWranglerV2
 from nautilus_trader.persistence.wranglers_v2 import TradeTickDataWranglerV2
 from nautilus_trader.serialization.arrow.implementations import account_state
 from nautilus_trader.serialization.arrow.implementations import component_commands
 from nautilus_trader.serialization.arrow.implementations import component_events
+from nautilus_trader.serialization.arrow.implementations import funding_rate_update
 from nautilus_trader.serialization.arrow.implementations import instruments
 from nautilus_trader.serialization.arrow.implementations import order_events
 from nautilus_trader.serialization.arrow.implementations import position_events
@@ -66,6 +71,7 @@ NautilusRustDataType = Union[  # noqa: UP007 (mypy does not like pipe operators)
 ]
 
 _ARROW_ENCODERS: dict[type, Callable] = {}
+_ARROW_BATCH_ENCODERS: dict[type, Callable] = {}
 _ARROW_DECODERS: dict[type, Callable] = {}
 _SCHEMAS: dict[type, pa.Schema] = {}
 
@@ -83,6 +89,7 @@ def register_arrow(
     schema: pa.Schema | None,
     encoder: Callable | None = None,
     decoder: Callable | None = None,
+    batch_encoder: Callable | None = None,
 ) -> None:
     """
     Register a new class for serialization to parquet.
@@ -95,20 +102,24 @@ def register_arrow(
         If the schema cannot be correctly inferred from a subset of the data
         (i.e. if certain values may be missing in the first chunk).
     encoder : Callable, optional
-        The callable to encode instances of type `cls_type` to Arrow record batches.
+        The callable to encode a single instance of type `cls_type` to an Arrow record batch.
     decoder : Callable, optional
         The callable to decode rows from Arrow record batches into `cls_type`.
-    table : type, optional
-        An optional table override for `cls`. Used if `cls` is going to be
-        transformed and stored in a table other than its own.
+    batch_encoder : Callable, optional
+        The callable to encode a list of instances to a single Arrow record batch.
+        When provided, `serialize_batch` uses this instead of encoding per item,
+        which preserves metadata consistency across the batch.
 
     """
     PyCondition.type(schema, pa.Schema, "schema")
     PyCondition.type_or_none(encoder, Callable, "encoder")
     PyCondition.type_or_none(decoder, Callable, "decoder")
+    PyCondition.type_or_none(batch_encoder, Callable, "batch_encoder")
 
     if encoder is not None:
         _ARROW_ENCODERS[data_cls] = encoder
+    if batch_encoder is not None:
+        _ARROW_BATCH_ENCODERS[data_cls] = batch_encoder
     if decoder is not None:
         _ARROW_DECODERS[data_cls] = decoder
     if schema is not None:
@@ -124,6 +135,7 @@ class ArrowSerializer:
     def _unpack_container_objects(data_cls: type, data: list[Any]) -> list[Data]:
         if data_cls == OrderBookDeltas:
             return [delta for deltas in data for delta in deltas.deltas]
+
         return data
 
     @staticmethod
@@ -150,7 +162,7 @@ class ArrowSerializer:
             case nautilus_pyo3.Bar:
                 batch_bytes = nautilus_pyo3.bars_to_arrow_record_batch_bytes(data)
             case _:
-                if data_cls == OrderBookDelta or data_cls == OrderBookDeltas:
+                if data_cls in (OrderBookDelta, OrderBookDeltas):
                     pyo3_deltas = OrderBookDelta.to_pyo3_list(data)
                     batch_bytes = nautilus_pyo3.book_deltas_to_arrow_record_batch_bytes(
                         pyo3_deltas,
@@ -184,9 +196,12 @@ class ArrowSerializer:
                         pyo3_instrument_closes,
                     )
                 elif data_cls == OrderBookDepth10:
-                    raise RuntimeError(
-                        f"Unsupported Rust defined data type for catalog write, was `{data_cls}`. "
-                        "You need to use a loader which returns `nautilus_pyo3.OrderBookDepth10` objects.",
+                    data = [
+                        nautilus_pyo3.OrderBookDepth10.from_dict(OrderBookDepth10.to_dict(item))
+                        for item in data
+                    ]
+                    batch_bytes = nautilus_pyo3.book_depth10_to_arrow_record_batch_bytes(
+                        data,
                     )
                 else:
                     raise RuntimeError(
@@ -204,6 +219,7 @@ class ArrowSerializer:
     ) -> pa.RecordBatch:
         if isinstance(data, CustomData):
             data = data.data
+
         data_cls = data_cls or type(data)
         if data_cls is None:
             raise RuntimeError("`cls` was `None` when a value was expected")
@@ -219,6 +235,7 @@ class ArrowSerializer:
 
         batch = delegate(data)
         assert isinstance(batch, pa.RecordBatch)
+
         return batch
 
     @staticmethod
@@ -248,11 +265,18 @@ class ArrowSerializer:
         """
         if data_cls in RUST_SERIALIZERS or data_cls.__name__ in RUST_STR_SERIALIZERS:
             return ArrowSerializer.rust_defined_to_record_batch(data, data_cls=data_cls)
+
+        batch_delegate = _ARROW_BATCH_ENCODERS.get(data_cls)
+        if batch_delegate is not None:
+            batch = batch_delegate(data)
+            return pa.Table.from_batches([batch], schema=batch.schema)
+
         batches = [ArrowSerializer.serialize(obj, data_cls) for obj in data]
+
         return pa.Table.from_batches(batches, schema=batches[0].schema)
 
     @staticmethod
-    def deserialize(data_cls: type, batch: pa.RecordBatch | pa.Table) -> Data:
+    def deserialize(data_cls: type, batch: pa.RecordBatch | pa.Table) -> list[Data | Event]:
         """
         Deserialize the given `Parquet` specification bytes to an object.
 
@@ -278,6 +302,7 @@ class ArrowSerializer:
             if data_cls in RUST_SERIALIZERS:
                 if isinstance(batch, pa.RecordBatch):
                     batch = pa.Table.from_batches([batch])
+
                 return ArrowSerializer._deserialize_rust(data_cls=data_cls, table=batch)
             raise TypeError(
                 f"Cannot deserialize object `{data_cls}`. Register a "
@@ -291,6 +316,7 @@ class ArrowSerializer:
         Wrangler = {
             OrderBookDelta: OrderBookDeltaDataWranglerV2,
             OrderBookDeltas: OrderBookDeltaDataWranglerV2,
+            OrderBookDepth10: OrderBookDepth10DataWranglerV2,
             QuoteTick: QuoteTickDataWranglerV2,
             TradeTick: TradeTickDataWranglerV2,
             Bar: BarDataWranglerV2,
@@ -304,6 +330,7 @@ class ArrowSerializer:
 
         wrangler = Wrangler.from_schema(table.schema)
         ticks = wrangler.from_arrow(table)
+
         return ticks
 
 
@@ -311,7 +338,16 @@ def make_dict_serializer(schema: pa.Schema) -> Callable[[list[Data | Event]], pa
     def inner(data: list[Data | Event]) -> pa.RecordBatch:
         if not isinstance(data, list):
             data = [data]
-        dicts = [d.to_dict(d) for d in data]
+
+        if not data:
+            return dicts_to_record_batch([], schema=schema)
+
+        raw = inspect.getattr_static(type(data[0]), "to_dict")
+        if isinstance(raw, staticmethod):
+            dicts = [d.to_dict(d) for d in data]
+        else:
+            dicts = [d.to_dict() for d in data]
+
         return dicts_to_record_batch(dicts, schema=schema)
 
     return inner
@@ -430,3 +466,10 @@ for position_cls in PositionEvent.__subclasses__():
         encoder=position_events.serialize,
         decoder=position_events.deserialize(position_cls),
     )
+
+register_arrow(
+    FundingRateUpdate,
+    schema=NAUTILUS_ARROW_SCHEMA[FundingRateUpdate],
+    encoder=funding_rate_update.serialize,
+    decoder=funding_rate_update.deserialize,
+)

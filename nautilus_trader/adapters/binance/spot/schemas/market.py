@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -129,6 +129,7 @@ class BinanceSpotOrderBookPartialDepthData(msgspec.Struct):
 
         for idx, bid in enumerate(self.bids):
             flags = 0
+
             if idx == bids_len - 1 and asks_len == 0:
                 # F_LAST, 1 << 7
                 # Last message in the book event or packet from the venue for a given `instrument_id`
@@ -146,6 +147,7 @@ class BinanceSpotOrderBookPartialDepthData(msgspec.Struct):
 
         for idx, ask in enumerate(self.asks):
             flags = 0
+
             if idx == asks_len - 1:
                 # F_LAST, 1 << 7
                 # Last message in the book event or packet from the venue for a given `instrument_id`
@@ -202,16 +204,18 @@ class BinanceSpotTradeData(msgspec.Struct):
     def parse_to_trade_tick(
         self,
         instrument_id: InstrumentId,
-        ts_init: int,
+        ts_init: int | None = None,
     ) -> TradeTick:
+        ts_event = millis_to_nanos(self.T)
+
         return TradeTick(
             instrument_id=instrument_id,
             price=Price.from_str(self.p),
             size=Quantity.from_str(self.q),
             aggressor_side=AggressorSide.SELLER if self.m else AggressorSide.BUYER,
             trade_id=TradeId(str(self.t)),
-            ts_event=millis_to_nanos(self.T),
-            ts_init=ts_init,
+            ts_event=ts_event,
+            ts_init=(ts_init or ts_event),
         )
 
 

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -21,6 +21,7 @@ from typing import Any
 import msgspec
 import pandas as pd
 
+from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.common import Environment
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.common.config import ImportableActorConfig
@@ -35,71 +36,15 @@ from nautilus_trader.data.config import DataEngineConfig
 from nautilus_trader.execution.config import ExecEngineConfig
 from nautilus_trader.live.config import LiveDataClientConfig
 from nautilus_trader.model.data import Bar
-from nautilus_trader.model.data import BarType
+from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.enums import BookType
+from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.enums import OtoTriggerMode
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.persistence.funcs import parse_filters_expr
 from nautilus_trader.risk.config import RiskEngineConfig
 from nautilus_trader.system.config import NautilusKernelConfig
-
-
-def parse_filters_expr(s: str | None):
-    """
-    Parse a pyarrow.dataset filter expression from a string.
-
-    >>> parse_filters_expr('field("Currency") == "CHF"')
-    <pyarrow.dataset.Expression (Currency == "CHF")>
-
-    >>> parse_filters_expr("print('hello')")
-
-    >>> parse_filters_expr("None")
-
-    """
-    import re
-
-    from pyarrow.dataset import field
-
-    if not s:
-        return None
-
-    # Normalise single-quoted filters so our regex only has to reason about
-    # the double-quoted form produced by Nautilus itself. If the expression
-    # already contains double quotes we leave it unchanged to avoid corrupting
-    # mixed quoting scenarios.
-    if "'" in s and '"' not in s:
-        s = s.replace("'", '"')
-
-    # Security: Only allow very specific PyArrow field expressions
-    # Pattern matches: field("name") == "value", field("name") != "value", etc.
-    # Optional opening/closing parentheses are allowed around each comparison so
-    # we can safely compose expressions such as
-    #     (field("Currency") == "CHF") | (field("Symbol") == "USD")
-    # Supported grammar (regex-validated):
-    #     [ '(' ] field("name") <op> "literal" [ ')' ] ( ( '|' | '&' ) ... )*
-    safe_pattern = (
-        r"^(\()?"
-        r'field\("[^"]+"\)\s*[!=<>]+\s*"[^"]*"'
-        r"(\))?"
-        r'(\s*[|&]\s*(\()?field\("[^"]+"\)\s*[!=<>]+\s*"[^"]*"(\))?)*$'
-    )
-
-    if not re.match(safe_pattern, s.strip()):
-        raise ValueError(
-            f"Filter expression '{s}' is not allowed. Only field() comparisons are permitted.",
-        )
-
-    try:
-        # For now, rely on the regex validation above to guarantee safety and
-        # evaluate the expression in a minimal global namespace that only exposes
-        # the `field` helper. Built-ins are intentionally left untouched because
-        # PyArrow requires access to them (for example it imports `decimal` under
-        # the hood). Stripping them leads to a hard crash inside the C++ layer
-        # of Arrow. The expression is still safe because the regex prevents any
-        # reference other than the allowed `field(...)` comparisons.
-        allowed_globals = {"field": field}
-        return eval(s, allowed_globals, {})  # noqa: S307
-
-    except Exception as e:
-        raise ValueError(f"Failed to parse filter expression '{s}': {e}")
 
 
 class BacktestVenueConfig(NautilusConfig, frozen=True):
@@ -110,10 +55,10 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
     ----------
     name : str
         The name of the venue.
-    oms_type : str
+    oms_type : OmsType | str
         The order management system type for the exchange. If ``HEDGING`` will
         generate new position IDs.
-    account_type : str
+    account_type : AccountType | str
         The account type for the exchange.
     starting_balances : list[Money | str]
         The starting account balances (specify one for a single asset account).
@@ -123,12 +68,20 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
         The account default leverage (for margin accounts).
     leverages : dict[str, float], optional
         The instrument specific leverage configuration (for margin accounts).
-    book_type : str
+    margin_model : MarginModelConfig, optional
+        The margin calculation model configuration. Default 'leveraged'.
+    modules : list[ImportableActorConfig], optional
+        The simulation modules for the venue.
+    fill_model : ImportableFillModelConfig, optional
+        The fill model for the venue.
+    latency_model : ImportableLatencyModelConfig, optional
+        The latency model for the venue.
+    fee_model : ImportableFeeModelConfig, optional
+        The fee model for the venue.
+    book_type : str, default 'L1_MBP'
         The default order book type.
     routing : bool, default False
         If multi-venue routing should be enabled for the execution client.
-    frozen_account : bool, default False
-        If the account for this exchange is frozen (balances will not change).
     reject_stop_orders : bool, default True
         If stop orders are rejected on submission if trigger price is in the market.
     support_gtd_orders : bool, default True
@@ -136,12 +89,18 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
     support_contingent_orders : bool, default True
         If contingent orders will be supported/respected by the venue.
         If False, then it's expected the strategy will be managing any contingent orders.
+    oto_trigger_mode : OtoTriggerMode | str, default "PARTIAL"
+        The OTO trigger mode for contingent orders:
+        - ``PARTIAL``: release child orders pro-rata to each partial fill (default).
+        - ``FULL``: release child orders only once the parent is fully filled.
     use_position_ids : bool, default True
         If venue position IDs will be generated on order fills.
     use_random_ids : bool, default False
         If all venue generated identifiers will be random UUID4's.
     use_reduce_only : bool, default True
         If the `reduce_only` execution instruction on orders will be honored.
+    use_market_order_acks : bool, default False
+        If OrderAccepted events will be generated for market orders before filling.
     bar_execution : bool, default True
         If bars should be processed by the matching engine(s) (and move the market).
     bar_adaptive_high_low_ordering : bool, default False
@@ -151,42 +110,65 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
         If True, the processing order adapts with the heuristic:
         - If High is closer to Open than Low then the processing order is Open, High, Low, Close.
         - If Low is closer to Open than High then the processing order is Open, Low, High, Close.
-    trade_execution : bool, default False
+    trade_execution : bool, default True
         If trades should be processed by the matching engine(s) (and move the market).
-    modules : list[ImportableActorConfig], optional
-        The simulation modules for the venue.
-    fill_model : ImportableFillModelConfig, optional
-        The fill model for the venue.
-    latency_model : ImportableLatencyModelConfig, optional
-        The latency model for the venue.
-    fee_model : ImportableFeeModelConfig, optional
-        The fee model for the venue.
+    liquidity_consumption : bool, default False
+        If liquidity consumption should be tracked per price level. When enabled, fills
+        consume available liquidity which resets when fresh data arrives at that level.
+        When disabled, each iteration can fill against the full book liquidity independently.
+    queue_position : bool, default False
+        If queue position tracking should be enabled for limit orders during trade
+        execution mode. When enabled, limit orders only fill after the quantity ahead
+        of them (at order placement time) has been traded through or the price level
+        is deleted. Requires trade_execution=True.
+    allow_cash_borrowing : bool, default False
+        If borrowing is allowed for cash accounts (negative balances).
+    frozen_account : bool, default False
+        If the account for this exchange is frozen (balances will not change).
+    price_protection_points : NonNegativeInt, default 0
+        Defines an exchange-calculated price boundary (in points) to prevent
+        marketable orders from executing at excessively aggressive prices.
+        For BUY orders: protection_price = ask + (points * price_increment).
+        For SELL orders: protection_price = bid - (points * price_increment).
+        Set to 0 to disable price protection.
+    settlement_prices : dict[InstrumentId, float], optional
+        Map of instrument ID to settlement price for expiring instruments.
+        For futures, positions close at this price instead of market.
+        For options, the option leg settles at this price.
 
     """
 
     name: str
-    oms_type: str
-    account_type: str
+    oms_type: OmsType | str
+    account_type: AccountType | str
     starting_balances: list[str]
     base_currency: str | None = None
     default_leverage: float = 1.0
     leverages: dict[str, float] | None = None
-    book_type: str = "L1_MBP"
-    routing: bool = False
-    frozen_account: bool = False
-    reject_stop_orders: bool = True
-    support_gtd_orders: bool = True
-    support_contingent_orders: bool = True
-    use_position_ids: bool = True
-    use_random_ids: bool = False
-    use_reduce_only: bool = True
-    bar_execution: bool = True
-    bar_adaptive_high_low_ordering: bool = False
-    trade_execution: bool = False
+    margin_model: MarginModelConfig | None = None
     modules: list[ImportableActorConfig] | None = None
     fill_model: ImportableFillModelConfig | None = None
     latency_model: ImportableLatencyModelConfig | None = None
     fee_model: ImportableFeeModelConfig | None = None
+    book_type: BookType | str = "L1_MBP"
+    routing: bool = False
+    reject_stop_orders: bool = True
+    support_gtd_orders: bool = True
+    support_contingent_orders: bool = True
+    oto_trigger_mode: OtoTriggerMode | str = "PARTIAL"
+    use_position_ids: bool = True
+    use_random_ids: bool = False
+    use_reduce_only: bool = True
+    use_market_order_acks: bool = False
+    bar_execution: bool = True
+    bar_adaptive_high_low_ordering: bool = False
+    trade_execution: bool = True
+    liquidity_consumption: bool = False
+    queue_position: bool = False
+    allow_cash_borrowing: bool = False
+    frozen_account: bool = False
+    price_protection_points: NonNegativeInt = 0
+    settlement_prices: dict[InstrumentId, float] | None = None
 
 
 class BacktestDataConfig(NautilusConfig, frozen=True):
@@ -203,6 +185,8 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
         The `fsspec` filesystem protocol for the catalog.
     catalog_fs_storage_options : dict, optional
         The `fsspec` storage options.
+    catalog_fs_rust_storage_options : dict, optional
+        The `fsspec` storage options for the Rust backend.
     instrument_id : InstrumentId | str, optional
         The instrument ID for the data configuration.
     start_time : str or int, optional
@@ -212,7 +196,7 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
         The end time for the data configuration.
         Can be an ISO 8601 format datetime string, or UNIX nanoseconds integer.
     filter_expr : str, optional
-        The additional filter expressions for the data catalog query.
+        The additional filter expressions for a data catalog query that uses pyarrow.
     client_id : str, optional
         The client ID for the data configuration.
     metadata : dict or callable, optional
@@ -226,6 +210,9 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
     bar_types : list[BarType | str], optional
         The bar types for the data catalog query.
         Can be used if instrument_id is not specified.
+    optimize_file_loading : bool, default False
+        If True, registers entire directories with the query backend for efficient
+        loading. If False, registers each file individually (e.g. for precise file control).
 
     """
 
@@ -233,6 +220,7 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
     data_cls: str
     catalog_fs_protocol: str | None = None
     catalog_fs_storage_options: dict | None = None
+    catalog_fs_rust_storage_options: dict | None = None
     instrument_id: InstrumentId | None = None
     start_time: str | int | None = None
     end_time: str | int | None = None
@@ -242,6 +230,7 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
     bar_spec: str | None = None
     instrument_ids: list[str] | None = None
     bar_types: list[str] | None = None
+    optimize_file_loading: bool = False
 
     @property
     def data_type(self) -> type:
@@ -259,7 +248,7 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
             return self.data_cls
 
     @property
-    def query(self) -> dict[str, Any]:  # noqa: C901
+    def query(self) -> dict[str, Any]:
         """
         Return a catalog query object for the configuration.
 
@@ -268,52 +257,33 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
         dict[str, Any]
 
         """
-        filter_expr: str | None = None
+        identifiers = []
 
         if self.data_cls is Bar:
-            used_bar_types = []
+            if self.bar_types:
+                identifiers = [str(bar_type) for bar_type in self.bar_types]
+            elif self.instrument_id and self.bar_spec:
+                identifiers = [f"{self.instrument_id}-{self.bar_spec}-EXTERNAL"]
+            elif self.instrument_ids and self.bar_spec:
+                identifiers = [
+                    f"{instrument_id}-{self.bar_spec}-EXTERNAL"
+                    for instrument_id in self.instrument_ids
+                ]
 
-            if self.bar_types is None and self.instrument_ids is None:
-                assert self.instrument_id, "No `instrument_id` for Bar data config"
-                assert self.bar_spec, "No `bar_spec` for Bar data config"
-
-            if self.instrument_id is not None and self.bar_spec is not None:
-                bar_type = f"{self.instrument_id}-{self.bar_spec}-EXTERNAL"
-                used_bar_types = [bar_type]
-            elif self.bar_types is not None:
-                used_bar_types = self.bar_types
-            elif self.instrument_ids is not None and self.bar_spec is not None:
-                for instrument_id in self.instrument_ids:
-                    used_bar_types.append(f"{instrument_id}-{self.bar_spec}-EXTERNAL")
-
-            if len(used_bar_types) > 0:
-                filter_expr = f'(field("bar_type") == "{used_bar_types[0]}")'
-
-            for bar_type in used_bar_types[1:]:
-                filter_expr = f'{filter_expr} | (field("bar_type") == "{bar_type}")'
-        else:
-            filter_expr = self.filter_expr
-
-        used_identifiers = None
-
-        if self.instrument_id is not None:
-            used_identifiers = [self.instrument_id]
-        elif self.instrument_ids is not None:
-            used_identifiers = self.instrument_ids
-        elif self.bar_types is not None:
-            bar_types: list[BarType] = [
-                BarType.from_str(bar_type) if type(bar_type) is str else bar_type
-                for bar_type in self.bar_types
-            ]
-            used_identifiers = [bar_type.instrument_id for bar_type in bar_types]
+        if not identifiers:
+            if self.instrument_id:
+                identifiers = [self.instrument_id]
+            elif self.instrument_ids:
+                identifiers = self.instrument_ids
 
         return {
             "data_cls": self.data_type,
-            "identifiers": used_identifiers,
+            "identifiers": identifiers,
             "start": self.start_time,
             "end": self.end_time,
-            "filter_expr": parse_filters_expr(filter_expr),
+            "filter_expr": parse_filters_expr(self.filter_expr),
             "metadata": self.metadata,
+            "optimize_file_loading": self.optimize_file_loading,
         }
 
     @property
@@ -394,9 +364,10 @@ class BacktestEngineConfig(NautilusKernelConfig, frozen=True):
 
     environment: Environment = Environment.BACKTEST
     trader_id: TraderId = "BACKTESTER-001"
-    data_engine: DataEngineConfig = DataEngineConfig()
-    risk_engine: RiskEngineConfig = RiskEngineConfig()
-    exec_engine: ExecEngineConfig = ExecEngineConfig()
+    cache: CacheConfig | None = CacheConfig(drop_instruments_on_reset=False)
+    data_engine: DataEngineConfig | None = DataEngineConfig()
+    risk_engine: RiskEngineConfig | None = RiskEngineConfig()
+    exec_engine: ExecEngineConfig | None = ExecEngineConfig()
     run_analysis: bool = True
 
     def __post_init__(self):
@@ -470,8 +441,6 @@ class FillModelConfig(NautilusConfig, frozen=True):
     ----------
     prob_fill_on_limit : float, default 1.0
         The probability of limit order filling if the market rests on its price.
-    prob_fill_on_stop : float, default 1.0
-        The probability of stop orders filling if the market rests on its price.
     prob_slippage : float, default 0.0
         The probability of order fill prices slipping by one tick.
     random_seed : int, optional
@@ -480,7 +449,6 @@ class FillModelConfig(NautilusConfig, frozen=True):
     """
 
     prob_fill_on_limit: float = 1.0
-    prob_fill_on_stop: float = 1.0
     prob_slippage: float = 0.0
     random_seed: int | None = None
 
@@ -725,3 +693,73 @@ class FXRolloverInterestConfig(SimulationModuleConfig, frozen=True):
     """
 
     rate_data: pd.DataFrame  # TODO: This could probably just become JSON data
+
+
+class MarginModelConfig(NautilusConfig, frozen=True):
+    """
+    Configuration for margin calculation models.
+
+    Parameters
+    ----------
+    model_type : str, default 'leveraged'
+        The type of margin model to use. Options:
+        - "standard": Fixed percentages without leverage division (traditional brokers)
+        - "leveraged": Margin requirements reduced by leverage (current Nautilus behavior)
+        - Custom class path for custom models
+    config : dict, optional
+        Additional configuration parameters for custom models.
+
+    """
+
+    model_type: str = "leveraged"
+    config: dict = {}
+
+
+class MarginModelFactory:
+    """
+    Provides margin model creation from configurations.
+    """
+
+    @staticmethod
+    def create(config: MarginModelConfig):
+        """
+        Create a margin model from the given configuration.
+
+        Parameters
+        ----------
+        config : MarginModelConfig
+            The configuration for the margin model.
+
+        Returns
+        -------
+        MarginModel
+            The created margin model instance.
+
+        Raises
+        ------
+        ValueError
+            If the model type is unknown or invalid.
+
+        """
+        from nautilus_trader.backtest.models import LeveragedMarginModel
+        from nautilus_trader.backtest.models import StandardMarginModel
+
+        model_type = config.model_type.lower()
+
+        if model_type == "standard":
+            return StandardMarginModel()
+        elif model_type == "leveraged":
+            return LeveragedMarginModel()
+        else:
+            # Try to import custom model
+            try:
+                from nautilus_trader.common.config import resolve_path
+
+                model_cls = resolve_path(config.model_type)
+                return model_cls(config)
+            except Exception as e:
+                raise ValueError(
+                    f"Unknown `MarginModel` type '{config.model_type}'. "
+                    f"Supported types: 'standard', 'leveraged', "
+                    f"or a fully qualified class path. Error: {e}",
+                ) from e

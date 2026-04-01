@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -16,18 +16,46 @@
 use nautilus_model::data::Bar;
 use pyo3::prelude::*;
 
-use crate::{indicator::Indicator, momentum::stochastics::Stochastics};
+use crate::{
+    average::MovingAverageType,
+    indicator::Indicator,
+    momentum::stochastics::{Stochastics, StochasticsDMethod},
+};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Stochastics {
+    /// Creates a new `Stochastics` instance with default parameters.
+    ///
+    /// This is the backward-compatible constructor that produces identical output
+    /// to the original Nautilus implementation, setting the following to:
+    /// - `slowing = 1` (no slowing applied to %K)
+    /// - `ma_type = Exponential` (unused when slowing = 1 or with Ratio method)
+    /// - `d_method = Ratio` (Nautilus native %D calculation)
     #[new]
+    #[pyo3(signature = (period_k, period_d, slowing=None, ma_type=None, d_method=None))]
     #[must_use]
-    pub fn py_new(period_k: usize, period_d: usize) -> Self {
-        Self::new(period_k, period_d)
+    pub fn py_new(
+        period_k: usize,
+        period_d: usize,
+        slowing: Option<usize>,
+        ma_type: Option<MovingAverageType>,
+        d_method: Option<StochasticsDMethod>,
+    ) -> Self {
+        Self::new_with_params(
+            period_k,
+            period_d,
+            slowing.unwrap_or(1),
+            ma_type.unwrap_or(MovingAverageType::Exponential),
+            d_method.unwrap_or(StochasticsDMethod::Ratio),
+        )
     }
 
     fn __repr__(&self) -> String {
-        format!("Stochastics({},{})", self.period_k, self.period_d)
+        format!(
+            "Stochastics({},{},{},{:?},{:?})",
+            self.period_k, self.period_d, self.slowing, self.ma_type, self.d_method
+        )
     }
 
     #[getter]
@@ -46,6 +74,24 @@ impl Stochastics {
     #[pyo3(name = "period_d")]
     const fn py_period_d(&self) -> usize {
         self.period_d
+    }
+
+    #[getter]
+    #[pyo3(name = "slowing")]
+    const fn py_slowing(&self) -> usize {
+        self.slowing
+    }
+
+    #[getter]
+    #[pyo3(name = "ma_type")]
+    const fn py_ma_type(&self) -> MovingAverageType {
+        self.ma_type
+    }
+
+    #[getter]
+    #[pyo3(name = "d_method")]
+    const fn py_d_method(&self) -> StochasticsDMethod {
+        self.d_method
     }
 
     #[getter]
@@ -72,6 +118,13 @@ impl Stochastics {
         self.initialized
     }
 
+    /// Updates the indicator with raw price values.
+    ///
+    /// # Parameters
+    ///
+    /// - `high`: The high price for the period.
+    /// - `low`: The low price for the period.
+    /// - `close`: The close price for the period.
     #[pyo3(name = "update_raw")]
     fn py_update_raw(&mut self, high: f64, low: f64, close: f64) {
         self.update_raw(high, low, close);

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,9 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::HashMap, sync::Arc, vec::IntoIter};
+use std::{sync::Arc, vec::IntoIter};
 
-use compare::Compare;
+use ahash::{AHashMap, AHashSet};
 use datafusion::{
     error::Result, logical_expr::expr::Sort, physical_plan::SendableRecordBatchStream, prelude::*,
 };
@@ -28,7 +28,10 @@ use nautilus_serialization::arrow::{
 use object_store::ObjectStore;
 use url::Url;
 
-use super::kmerge_batch::{EagerStream, ElementBatchIter, KMerge};
+use super::{
+    compare::Compare,
+    kmerge_batch::{EagerStream, ElementBatchIter, KMerge},
+};
 
 #[derive(Debug, Default)]
 pub struct TsInitComparator;
@@ -56,13 +59,18 @@ pub type QueryResult = KMerge<EagerStream<std::vec::IntoIter<Data>>, Data, TsIni
 /// a Vec of data by types that implement [`DecodeDataFromRecordBatch`].
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.persistence")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.persistence", unsendable)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")
 )]
 pub struct DataBackendSession {
     pub chunk_size: usize,
     pub runtime: Arc<tokio::runtime::Runtime>,
     session_ctx: SessionContext,
     batch_streams: Vec<EagerStream<IntoIter<Data>>>,
+    registered_tables: AHashSet<String>,
 }
 
 impl DataBackendSession {
@@ -82,6 +90,7 @@ impl DataBackendSession {
             batch_streams: Vec::default(),
             chunk_size,
             runtime: Arc::new(runtime),
+            registered_tables: AHashSet::new(),
         }
     }
 
@@ -94,7 +103,7 @@ impl DataBackendSession {
     pub fn register_object_store_from_uri(
         &mut self,
         uri: &str,
-        storage_options: Option<std::collections::HashMap<String, String>>,
+        storage_options: Option<AHashMap<String, String>>,
     ) -> anyhow::Result<()> {
         // Create object store from URI using the Rust implementation
         let (object_store, _, _) =
@@ -106,7 +115,7 @@ impl DataBackendSession {
         // Register the object store with the session
         if matches!(
             parsed_uri.scheme(),
-            "s3" | "gs" | "gcs" | "azure" | "abfs" | "http" | "https"
+            "s3" | "gs" | "gcs" | "az" | "abfs" | "http" | "https"
         ) {
             // For cloud storage, register with the base URL (scheme + netloc)
             let base_url = format!(
@@ -123,24 +132,28 @@ impl DataBackendSession {
 
     pub fn write_data<T: EncodeToRecordBatch>(
         data: &[T],
-        metadata: &HashMap<String, String>,
+        metadata: &AHashMap<String, String>,
         stream: &mut dyn WriteStream,
     ) -> Result<(), DataStreamingError> {
-        let record_batch = T::encode_batch(metadata, data)?;
+        // Convert AHashMap to HashMap for Arrow compatibility
+        let metadata: std::collections::HashMap<String, String> = metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let record_batch = T::encode_batch(&metadata, data)?;
         stream.write(&record_batch)?;
         Ok(())
     }
 
-    /// Query a file for its records. the caller must specify `T` to indicate
-    /// the kind of data expected from this query.
+    /// Registers a Parquet file and adds a batch stream for decoding.
     ///
-    /// `table_name`: Logical `table_name` assigned to this file. Queries to this file should address the
-    /// file by its table name.
-    /// `file_path`: Path to file
-    /// `sql_query`: A custom sql query to retrieve records from file. If no query is provided a default
-    /// query "SELECT * FROM <`table_name`>" is run.
+    /// The caller must specify `T` to indicate the kind of data expected. `table_name` is
+    /// the logical name for queries; `file_path` is the Parquet path; `sql_query` defaults
+    /// to `SELECT * FROM {table_name} ORDER BY ts_init` if `None`.
     ///
-    /// # Safety
+    /// When `custom_type_name` is `Some`, it is merged into each batch's schema metadata
+    /// before decoding (as `type_name`). Use this for custom data when Parquet/DataFusion
+    /// does not preserve schema metadata so the decoder can look up the type in the registry.
     ///
     /// The file data must be ordered by the `ts_init` in ascending order for this
     /// to work correctly.
@@ -149,43 +162,61 @@ impl DataBackendSession {
         table_name: &str,
         file_path: &str,
         sql_query: Option<&str>,
+        custom_type_name: Option<&str>,
     ) -> Result<()>
     where
-        T: DecodeDataFromRecordBatch + Into<Data>,
+        T: DecodeDataFromRecordBatch,
     {
-        let parquet_options = ParquetReadOptions::<'_> {
-            skip_metadata: Some(false),
-            file_sort_order: vec![vec![Sort {
-                expr: col("ts_init"),
-                asc: true,
-                nulls_first: false,
-            }]],
-            ..Default::default()
-        };
-        self.runtime.block_on(self.session_ctx.register_parquet(
-            table_name,
-            file_path,
-            parquet_options,
-        ))?;
+        // Check if table is already registered to avoid duplicates
+        let is_new_table = !self.registered_tables.contains(table_name);
 
-        let default_query = format!("SELECT * FROM {} ORDER BY ts_init", &table_name);
-        let sql_query = sql_query.unwrap_or(&default_query);
-        let query = self.runtime.block_on(self.session_ctx.sql(sql_query))?;
+        if is_new_table {
+            // Register the table only if it doesn't exist
+            let parquet_options = ParquetReadOptions::<'_> {
+                skip_metadata: Some(false),
+                file_sort_order: vec![vec![Sort {
+                    expr: col("ts_init"),
+                    asc: true,
+                    nulls_first: false,
+                }]],
+                ..Default::default()
+            };
+            self.runtime.block_on(self.session_ctx.register_parquet(
+                table_name,
+                file_path,
+                parquet_options,
+            ))?;
 
-        let batch_stream = self.runtime.block_on(query.execute_stream())?;
+            self.registered_tables.insert(table_name.to_string());
 
-        self.add_batch_stream::<T>(batch_stream);
+            // Only add batch stream for newly registered tables to avoid duplicates
+            let default_query = format!("SELECT * FROM {} ORDER BY ts_init", &table_name);
+            let sql_query = sql_query.unwrap_or(&default_query);
+            let query = self.runtime.block_on(self.session_ctx.sql(sql_query))?;
+            let batch_stream = self.runtime.block_on(query.execute_stream())?;
+            self.add_batch_stream::<T>(batch_stream, custom_type_name.map(String::from));
+        }
+
         Ok(())
     }
 
-    fn add_batch_stream<T>(&mut self, stream: SendableRecordBatchStream)
-    where
-        T: DecodeDataFromRecordBatch + Into<Data>,
+    fn add_batch_stream<T>(
+        &mut self,
+        stream: SendableRecordBatchStream,
+        custom_type_name: Option<String>,
+    ) where
+        T: DecodeDataFromRecordBatch,
     {
-        let transform = stream.map(|result| match result {
-            Ok(batch) => T::decode_data_batch(batch.schema().metadata(), batch)
-                .unwrap()
-                .into_iter(),
+        let transform = stream.map(move |result| match result {
+            Ok(batch) => {
+                let mut metadata: std::collections::HashMap<String, String> =
+                    batch.schema().metadata().clone();
+
+                if let Some(ref tn) = custom_type_name {
+                    metadata.insert("type_name".to_string(), tn.clone());
+                }
+                T::decode_data_batch(&metadata, batch).unwrap().into_iter()
+            }
             Err(e) => panic!("Error getting next batch from RecordBatchStream: {e}"),
         });
 
@@ -209,10 +240,22 @@ impl DataBackendSession {
 
         kmerge
     }
-}
 
-// Note: Intended to be used on a single Python thread
-unsafe impl Send for DataBackendSession {}
+    /// Clears all registered tables and batch streams.
+    ///
+    /// This is useful when the underlying files have changed and we need to
+    /// re-register tables with updated data.
+    pub fn clear_registered_tables(&mut self) {
+        self.registered_tables.clear();
+        self.batch_streams.clear();
+
+        // Create a new session context to completely reset the DataFusion state
+        let session_cfg = SessionConfig::new()
+            .set_str("datafusion.optimizer.repartition_file_scans", "false")
+            .set_str("datafusion.optimizer.prefer_existing_sort", "true");
+        self.session_ctx = SessionContext::new_with_config(session_cfg);
+    }
+}
 
 #[must_use]
 pub fn build_query(
@@ -257,6 +300,10 @@ pub fn build_query(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.persistence", unsendable)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")
+)]
 pub struct DataQueryResult {
     pub chunk: Option<CVec>,
     pub result: QueryResult,
@@ -292,8 +339,18 @@ impl DataQueryResult {
     /// drop if exists and reset the field.
     pub fn drop_chunk(&mut self) {
         if let Some(CVec { ptr, len, cap }) = self.chunk.take() {
-            let data: Vec<Data> =
-                unsafe { Vec::from_raw_parts(ptr.cast::<nautilus_model::data::Data>(), len, cap) };
+            assert!(
+                len <= cap,
+                "drop_chunk: len ({len}) > cap ({cap}) - memory corruption or wrong chunk type"
+            );
+            assert!(
+                len == 0 || !ptr.is_null(),
+                "drop_chunk: null ptr with non-zero len ({len}) - memory corruption"
+            );
+
+            // SAFETY: `ptr`, `len`, and `cap` originate from a valid `CVec` and the
+            // assertions above verify the invariants required by `Vec::from_raw_parts`.
+            let data: Vec<Data> = unsafe { Vec::from_raw_parts(ptr.cast::<Data>(), len, cap) };
             drop(data);
         }
     }
@@ -324,6 +381,3 @@ impl Drop for DataQueryResult {
         self.result.clear();
     }
 }
-
-// Note: Intended to be used on a single Python thread
-unsafe impl Send for DataQueryResult {}

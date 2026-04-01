@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,6 +17,7 @@ import asyncio
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from nautilus_trader.common.component import LiveClock
@@ -35,7 +36,6 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.portfolio.portfolio import Portfolio
-from nautilus_trader.test_kit.functions import ensure_all_tasks_completed
 from nautilus_trader.test_kit.functions import eventually
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
@@ -51,10 +51,10 @@ ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
 
 
 class TestLiveDataEngine:
-    def setup(self):
-        # Fixture Setup
-        self.loop = asyncio.get_event_loop()
-        asyncio.set_event_loop(self.loop)
+    @pytest.fixture(autouse=True)
+    def setup(self, request):
+        # Fixture Setup - get the event loop that pytest-asyncio will use for tests
+        self.loop = request.getfixturevalue("event_loop")
         self.loop.set_debug(True)
 
         self.clock = LiveClock()
@@ -81,8 +81,9 @@ class TestLiveDataEngine:
             clock=self.clock,
         )
 
-    def teardown(self):
-        ensure_all_tasks_completed()
+        yield
+
+        # Teardown - only dispose, ensure_all_tasks_completed() will fail with closed loop
         self.engine.dispose()
 
     @pytest.mark.asyncio
@@ -101,6 +102,10 @@ class TestLiveDataEngine:
         self.msgbus.deregister(endpoint="DataEngine.process", handler=self.engine.process)
         self.msgbus.deregister(endpoint="DataEngine.request", handler=self.engine.request)
         self.msgbus.deregister(endpoint="DataEngine.response", handler=self.engine.response)
+        self.msgbus.deregister(
+            endpoint="DataEngine.process_historical",
+            handler=self.engine.process_historical,
+        )
 
         self.engine = LiveDataEngine(
             loop=self.loop,
@@ -134,6 +139,10 @@ class TestLiveDataEngine:
         self.msgbus.deregister(endpoint="DataEngine.process", handler=self.engine.process)
         self.msgbus.deregister(endpoint="DataEngine.request", handler=self.engine.request)
         self.msgbus.deregister(endpoint="DataEngine.response", handler=self.engine.response)
+        self.msgbus.deregister(
+            endpoint="DataEngine.process_historical",
+            handler=self.engine.process_historical,
+        )
 
         self.engine = LiveDataEngine(
             loop=self.loop,
@@ -144,7 +153,7 @@ class TestLiveDataEngine:
         )
 
         handler = []
-        request = request = RequestQuoteTicks(
+        request = RequestQuoteTicks(
             instrument_id=InstrumentId(Symbol("SOMETHING"), Venue("RANDOM")),
             start=None,
             end=None,
@@ -172,6 +181,10 @@ class TestLiveDataEngine:
         self.msgbus.deregister(endpoint="DataEngine.process", handler=self.engine.process)
         self.msgbus.deregister(endpoint="DataEngine.request", handler=self.engine.request)
         self.msgbus.deregister(endpoint="DataEngine.response", handler=self.engine.response)
+        self.msgbus.deregister(
+            endpoint="DataEngine.process_historical",
+            handler=self.engine.process_historical,
+        )
 
         self.engine = LiveDataEngine(
             loop=self.loop,
@@ -189,6 +202,8 @@ class TestLiveDataEngine:
             correlation_id=UUID4(),
             response_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
+            start=pd.Timestamp("2023-01-01"),
+            end=pd.Timestamp("2023-01-02"),
         )
 
         # Act
@@ -206,6 +221,10 @@ class TestLiveDataEngine:
         self.msgbus.deregister(endpoint="DataEngine.process", handler=self.engine.process)
         self.msgbus.deregister(endpoint="DataEngine.request", handler=self.engine.request)
         self.msgbus.deregister(endpoint="DataEngine.response", handler=self.engine.response)
+        self.msgbus.deregister(
+            endpoint="DataEngine.process_historical",
+            handler=self.engine.process_historical,
+        )
 
         self.engine = LiveDataEngine(
             loop=self.loop,
@@ -240,7 +259,7 @@ class TestLiveDataEngine:
     async def test_kill_when_running_and_no_messages_on_queues(self):
         # Arrange, Act
         self.engine.start()
-        await asyncio.sleep(0)
+        await eventually(lambda: self.engine.is_running)
         self.engine.kill()
 
         # Assert
@@ -320,6 +339,8 @@ class TestLiveDataEngine:
             correlation_id=UUID4(),
             response_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
+            start=pd.Timestamp("2023-01-01"),
+            end=pd.Timestamp("2023-01-02"),
         )
 
         # Act
@@ -651,6 +672,8 @@ class TestLiveDataEngine:
                 correlation_id=UUID4(),
                 response_id=UUID4(),
                 ts_init=self.clock.timestamp_ns(),
+                start=pd.Timestamp("2023-01-01"),
+                end=pd.Timestamp("2023-01-02"),
             )
             engine.response(response)
 

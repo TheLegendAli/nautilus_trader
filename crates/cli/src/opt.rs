@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,10 +15,7 @@
 
 use clap::Parser;
 
-/// Main CLI structure for parsing command-line arguments and options.
-///
-/// This is the entry point for the NautilusTrader command-line interface,
-/// providing access to various system management and operational commands.
+/// Command-line interface for NautilusTrader.
 #[derive(Debug, Parser)]
 #[clap(version, about, author)]
 pub struct NautilusCli {
@@ -30,6 +27,8 @@ pub struct NautilusCli {
 #[derive(Parser, Debug)]
 pub enum Commands {
     Database(DatabaseOpt),
+    #[cfg(feature = "defi")]
+    Blockchain(BlockchainOpt),
 }
 
 /// Database management options and subcommands.
@@ -71,4 +70,86 @@ pub enum DatabaseCommand {
     Init(DatabaseConfig),
     /// Drops roles, privileges and deletes all data from the database.
     Drop(DatabaseConfig),
+}
+
+#[cfg(feature = "defi")]
+/// Blockchain management options and subcommands.
+#[derive(Parser, Debug)]
+#[command(about = "Blockchain operations", long_about = None)]
+pub struct BlockchainOpt {
+    #[clap(subcommand)]
+    pub command: BlockchainCommand,
+}
+
+#[cfg(feature = "defi")]
+/// Available blockchain management commands.
+#[derive(Parser, Debug, Clone)]
+#[command(about = "Blockchain operations", long_about = None)]
+pub enum BlockchainCommand {
+    /// Syncs blockchain blocks.
+    SyncBlocks {
+        /// The blockchain chain name (case-insensitive). Examples: ethereum, arbitrum, base, polygon, bsc
+        #[arg(long)]
+        chain: String,
+        /// Starting block number to sync from (optional)
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Ending block number to sync to (optional, defaults to current chain head)
+        #[arg(long)]
+        to_block: Option<u64>,
+        /// Database configuration options
+        #[clap(flatten)]
+        database: DatabaseConfig,
+    },
+    /// Sync DEX pools.
+    SyncDex {
+        /// The blockchain chain name (case-insensitive). Examples: ethereum, arbitrum, base, polygon, bsc
+        #[arg(long)]
+        chain: String,
+        /// The DEX name (case-insensitive). Examples: `UniswapV3`, uniswapv3, `SushiSwapV2`, `PancakeSwapV3`
+        #[arg(long)]
+        dex: String,
+        /// RPC HTTP URL for blockchain calls (optional, falls back to `RPC_HTTP_URL` env var)
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Reset sync progress and start from the beginning, ignoring last synced block
+        #[arg(long)]
+        reset: bool,
+        /// Maximum number of Multicall calls per RPC request (optional, defaults to 100)
+        #[arg(long)]
+        multicall_calls_per_rpc_request: Option<u32>,
+        /// Database configuration options
+        #[clap(flatten)]
+        database: DatabaseConfig,
+    },
+    /// Analyze a specific DEX pool.
+    AnalyzePool {
+        /// The blockchain chain name (case-insensitive). Examples: ethereum, arbitrum, base, polygon, bsc
+        #[arg(long)]
+        chain: String,
+        /// The DEX name (case-insensitive). Examples: UniswapV3, uniswapv3, SushiSwapV2, PancakeSwapV3
+        #[arg(long)]
+        dex: String,
+        /// The pool contract address
+        #[arg(long)]
+        address: String,
+        /// Starting block number to sync from (optional)
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Ending block number to sync to (optional, defaults to current chain head)
+        #[arg(long)]
+        to_block: Option<u64>,
+        /// RPC HTTP URL for blockchain calls (optional, falls back to RPC_HTTP_URL env var)
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Reset sync progress and start from the beginning, ignoring last synced block
+        #[arg(long)]
+        reset: bool,
+        /// Maximum number of Multicall calls per RPC request (optional, defaults to 100)
+        #[arg(long)]
+        multicall_calls_per_rpc_request: Option<u32>,
+        /// Database configuration options
+        #[clap(flatten)]
+        database: DatabaseConfig,
+    },
 }

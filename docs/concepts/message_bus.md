@@ -1,8 +1,8 @@
 # Message Bus
 
-The `MessageBus` is a fundamental part of the platform, enabling communication between system components
-through message passing. This design creates a loosely coupled architecture where components can interact
-without direct dependencies.
+The `MessageBus` enables communication between system components through message passing.
+This design creates a loosely coupled architecture where components interact without
+direct dependencies.
 
 The *messaging patterns* include:
 
@@ -23,7 +23,7 @@ While the `MessageBus` is a lower-level component that users typically interact 
 
 ```python
 def publish_data(self, data_type: DataType, data: Data) -> None:
-def publish_signal(self, name: str, value, ts_event: int | None = None) -> None:
+def publish_signal(self, name: str, value, ts_event: int = 0) -> None:
 ```
 
 These methods allow you to publish custom data and signals efficiently without needing to work directly with the `MessageBus` interface.
@@ -36,25 +36,23 @@ classes through the `self.msgbus` reference, which provides the full message bus
 To publish a custom message directly, you can specify a topic as a `str` and any Python `object` as the message payload, for example:
 
 ```python
-
 self.msgbus.publish("MyTopic", "MyMessage")
 ```
 
 ## Messaging styles
 
 NautilusTrader is an **event-driven** framework where components communicate by sending and receiving messages.
-Understanding the different messaging styles is crucial for building effective trading systems.
+Understanding the different messaging styles helps when building trading systems.
 
 This guide explains the three primary messaging patterns available in NautilusTrader:
 
 | **Messaging Style**                          | **Purpose**                                 | **Best For**                                          |
 |:---------------------------------------------|:--------------------------------------------|:------------------------------------------------------|
-| **MessageBus - Publish/Subscribe to topics** | Low-level, direct access to the message bus | Custom events, system-level communication             |
-| **Actor-Based - Publish/Subscribe Data**     | Structured trading data exchange            | Trading metrics, indicators, data needing persistence |
-| **Actor-Based - Publish/Subscribe Signal**   | Lightweight notifications                   | Simple alerts, flags, status updates                  |
+| **MessageBus - Publish/Subscribe to topics** | Low‑level, direct access to the message bus | Custom events, system‑level communication             |
+| **Actor‑Based - Publish/Subscribe Data**     | Structured trading data exchange            | Trading metrics, indicators, data needing persistence |
+| **Actor‑Based - Publish/Subscribe Signal**   | Lightweight notifications                   | Simple alerts, flags, status updates                  |
 
-Each approach serves different purposes and offers unique advantages. This guide will help you decide which messaging
-pattern to use in your NautilusTrader applications.
+Each approach serves different purposes. This section helps you decide which pattern to use.
 
 ### MessageBus publish/subscribe to topics
 
@@ -115,13 +113,13 @@ This approach provides a way to exchange trading specific data between `Actor`s 
 (note: each `Strategy` inherits from `Actor`). It inherits from `Data`, which ensures proper timestamping
 and ordering of events - crucial for correct backtest processing.
 
-#### Key Benefits and Use Cases
+#### Key benefits and use cases
 
-The Data publish/subscribe approach excels when you need:
+The Data publish/subscribe approach works well when you need:
 
 - **Exchange of structured trading data** like market data, indicators, custom metrics, or option greeks.
 - **Proper event ordering** via built-in timestamps (`ts_event`, `ts_init`) crucial for backtest accuracy.
-- **Data persistence and serialization** through the `@customdataclass` decorator, integrating seamlessly with NautilusTrader's data catalog system.
+- **Data persistence and serialization** through the `@customdataclass` decorator, integrating with NautilusTrader's data catalog system.
 - **Standardized trading data exchange** between system components.
 
 #### Considerations
@@ -175,9 +173,9 @@ def on_data(self, data: Data):
 **Signals** are a lightweight way to publish and subscribe to simple notifications within the actor framework.
 This is the simplest messaging approach, requiring no custom class definitions.
 
-#### Key Benefits and Use Cases
+#### Key benefits and use cases
 
-The Signal messaging approach shines when you need:
+The Signal messaging approach works well when you need:
 
 - **Simple, lightweight notifications/alerts** like "RiskThresholdExceeded" or "TrendUp".
 - **Quick, on-the-fly messaging** without defining custom classes.
@@ -246,9 +244,9 @@ Here's a quick reference to help you decide which messaging style to use:
 
 | **Use Case**                                | **Recommended Approach**                                                        | **Setup required** |
 |:--------------------------------------------|:--------------------------------------------------------------------------------|:-------------------|
-| Custom events or system-level communication | `MessageBus` + Pub/Sub to topic                                                 | Topic + Handler management |
+| Custom events or system‑level communication | `MessageBus` + Pub/Sub to topic                                                 | Topic + Handler management |
 | Structured trading data                     | `Actor` + Pub/Sub Data + optional `@customdataclass` if serialization is needed | New class definition inheriting from `Data` (handler `on_data` is predefined) |
-| Simple alerts/notifications                 | `Actor` + Pub/Sub Signal                                                        | Just signal name |
+| Simple alerts/notifications                 | `Actor` + Pub/Sub Signal                                                        | Signal name only |
 
 ## External publishing
 
@@ -264,9 +262,7 @@ Under the hood, when a backing database (or any other compatible technology) is 
 all outgoing messages are first serialized, then transmitted via a Multiple-Producer Single-Consumer (MPSC) channel to a separate thread (implemented in Rust).
 In this separate thread, the message is written to its final destination, which is presently Redis streams.
 
-This design is primarily driven by performance considerations. By offloading the I/O operations to a separate thread,
-we ensure that the main thread remains unblocked and can continue its tasks without being hindered by the potentially
-time-consuming operations involved in interacting with a database or client.
+Offloading I/O to a separate thread keeps the main thread unblocked.
 
 ### Serialization
 
@@ -388,14 +384,13 @@ specifying which types of messages should be excluded from external publication.
 
 ```python
 from nautilus_trader.config import MessageBusConfig
-from nautilus_trader.data import TradeTick
-from nautilus_trader.data import QuoteTick
+from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.data import TradeTick
 
 # Create a MessageBusConfig instance with types filtering
 message_bus = MessageBusConfig(
     types_filter=[QuoteTick, TradeTick]
 )
-
 ```
 
 ### Stream auto-trimming
@@ -414,40 +409,16 @@ The message bus within a `TradingNode` (node) is referred to as the "internal me
 A producer node is one which publishes messages onto an external stream (see [external publishing](#external-publishing)).
 The consumer node listens to external streams to receive and publish deserialized message payloads on its internal message bus.
 
-```
-                  ┌───────────────────────────┐
-                  │                           │
-                  │                           │
-                  │                           │
-                  │      Producer Node        │
-                  │                           │
-                  │                           │
-                  │                           │
-                  │                           │
-                  │                           │
-                  │                           │
-                  └─────────────┬─────────────┘
-                                │
-                                │
-┌───────────────────────────────▼──────────────────────────────┐
-│                                                              │
-│                            Stream                            │
-│                                                              │
-└─────────────┬────────────────────────────────────┬───────────┘
-              │                                    │
-              │                                    │
-┌─────────────▼───────────┐          ┌─────────────▼───────────┐
-│                         │          │                         │
-│                         │          │                         │
-│     Consumer Node 1     │          │     Consumer Node 2     │
-│                         │          │                         │
-│                         │          │                         │
-│                         │          │                         │
-│                         │          │                         │
-│                         │          │                         │
-│                         │          │                         │
-│                         │          │                         │
-└─────────────────────────┘          └─────────────────────────┘
+```mermaid
+flowchart TB
+    producer[Producer Node]
+    stream[Stream]
+    consumer1[Consumer Node 1]
+    consumer2[Consumer Node 2]
+
+    producer --> stream
+    stream --> consumer1
+    stream --> consumer2
 ```
 
 :::tip
@@ -495,3 +466,8 @@ message_bus=MessageBusConfig(
     external_streams=["binance"],  # <---
 ),
 ```
+
+## Related guides
+
+- [Actors](actors.md) - Actors use the message bus for event handling.
+- [Architecture](architecture.md) - Message bus role in system architecture.

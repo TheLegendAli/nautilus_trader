@@ -1,9 +1,9 @@
 # Cache
 
-The `Cache` is a central in-memory database that automatically stores and manages all trading-related data.
-Think of it as your trading system’s memory – storing everything from market data to order history to custom calculations.
+The `Cache` is a central in-memory database that stores and manages all trading-related data,
+from market data to order history to custom calculations.
 
-The Cache serves multiple key purposes:
+The Cache serves multiple purposes:
 
 1. **Stores market data**:
    - Stores recent market history (e.g., order books, quotes, trades, bars).
@@ -15,33 +15,36 @@ The Cache serves multiple key purposes:
    - Stores `Instrument` definitions and `Currency` information.
 
 3. **Stores custom data**:
-   - Any user-defined objects or data can be stored in the `Cache` for later use.
+   - You can store any user-defined objects or data in the `Cache` for later use.
    - Enables data sharing between different strategies.
 
-## How Cache works
+## How caching works
 
 **Built-in types**:
 
-- Data is automatically added to the `Cache` as it flows through the system.
-- In live contexts, updates happen asynchronously - which means there might be a small delay between an event occurring and it appearing in the `Cache`.
-- All data flows through the `Cache` before reaching your strategy’s callbacks – see the diagram below:
+- The system automatically adds data to the `Cache` as it flows through.
+- In live contexts, the engine applies updates asynchronously, so you might see a brief delay between an event and its appearance in the `Cache`.
+- For quotes, trades, and bars the `DataEngine` writes to the `Cache` before publishing to subscribers, so the latest value is available in the cache by the time your handler runs. Order book deltas and depth snapshots are published directly without a cache write; book state is maintained separately through `BookUpdater` subscriptions:
 
+```mermaid
+flowchart LR
+    data[Data]
+    engine[DataEngine]
+    cache[Cache]
+    callback["Strategy callback:<br/>on_quote_tick(...)"]
+
+    data --> engine --> cache --> callback
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌───────────────────────┐
-│                 │     │                 │     │                 │     │                       │
-│                 │     │                 │     │                 │     │   Strategy callback:  │
-│      Data       ├─────►   DataEngine    ├─────►     Cache       ├─────►                       │
-│                 │     │                 │     │                 │     │   on_data(...)        │
-│                 │     │                 │     │                 │     │                       │
-└─────────────────┘     └─────────────────┘     └─────────────────┘     └───────────────────────┘
-```
+
+For the full step-by-step trace, see
+[Data flow: life of a quote tick](architecture.md#data-flow-life-of-a-quote-tick).
 
 ### Basic example
 
 Within a strategy, you can access the `Cache` through `self.cache`. Here’s a typical example:
 
 :::note
-Anywhere you find `self`, it refers mostly to the `Strategy` itself.
+Within a `Strategy` class, `self` refers to the strategy instance.
 :::
 
 ```python
@@ -66,7 +69,7 @@ def on_bar(self, bar: Bar) -> None:
 
 ## Configuration
 
-The `Cache`’s behavior and capacity can be configured through the `CacheConfig` class.
+Use the `CacheConfig` class to configure the `Cache` behavior and capacity.
 You can provide this configuration either to a `BacktestEngine` or a `TradingNode`, depending on your [environment context](architecture.md#environment-contexts).
 
 Here's a basic example of configuring the `Cache`:
@@ -96,7 +99,7 @@ By default, the `Cache` keeps the last 10,000 bars for each bar type and 10,000 
 These limits provide a good balance between memory usage and data availability. Increase them if your strategy needs more historical data.
 :::
 
-### Configuration Options
+### Configuration options
 
 The `CacheConfig` class supports these parameters:
 
@@ -108,6 +111,7 @@ cache_config = CacheConfig(
     encoding: str = "msgpack",               # Data encoding format ('msgpack' or 'json')
     timestamps_as_iso8601: bool = False,     # Store timestamps as ISO8601 strings
     buffer_interval_ms: int | None = None,   # Buffer interval for batch operations
+    bulk_read_batch_size: int | None = None, # Batch size for bulk reads (e.g., MGET)
     use_trader_prefix: bool = True,          # Use trader prefix in keys
     use_instance_id: bool = False,           # Include instance ID in keys
     flush_on_start: bool = False,            # Clear database on startup
@@ -118,11 +122,11 @@ cache_config = CacheConfig(
 ```
 
 :::note
-Each bar type maintains its own separate capacity. For example, if you're using both 1-minute and 5-minute bars, each will store up to `bar_capacity` bars.
-When `bar_capacity` is reached, the oldest data is automatically removed from the `Cache`.
+Each bar type maintains its own separate capacity. For example, if you're using both 1-minute and 5-minute bars, each stores up to `bar_capacity` bars.
+When `bar_capacity` is reached, the `Cache` automatically removes the oldest data.
 :::
 
-### Database Configuration
+### Database configuration
 
 For persistence between system restarts, you can configure a database backend.
 
@@ -145,18 +149,18 @@ config = CacheConfig(
 )
 ```
 
-## Using the Cache
+## Using the cache
 
-### Accessing Market data
+### Accessing market data
 
-The `Cache` provides a comprehensive interface for accessing different types of market data, including order books, quotes, trades, bars.
-All market data in the cache are stored with reverse indexing — meaning the most recent data is at index 0.
+The `Cache` provides a full interface for accessing order books, quotes, trades, and bars.
+All market data in the cache uses reverse indexing, so the most recent entry sits at index 0.
 
-#### Bar(s) access
+#### Bar access
 
 ```python
 # Get a list of all cached bars for a bar type
-bars = self.cache.bars(bar_type)  # Returns List[Bar] or an empty list if no bars found
+bars = self.cache.bars(bar_type)  # Returns list[Bar] or an empty list if no bars found
 
 # Get the most recent bar
 latest_bar = self.cache.bar(bar_type)  # Returns Bar or None if no such object exists
@@ -173,7 +177,7 @@ has_bars = self.cache.has_bars(bar_type)    # Returns bool indicating if any bar
 
 ```python
 # Get quotes
-quotes = self.cache.quote_ticks(instrument_id)                     # Returns List[QuoteTick] or an empty list if no quotes found
+quotes = self.cache.quote_ticks(instrument_id)                     # Returns list[QuoteTick] or an empty list if no quotes found
 latest_quote = self.cache.quote_tick(instrument_id)                # Returns QuoteTick or None if no such object exists
 second_last_quote = self.cache.quote_tick(instrument_id, index=1)  # Returns QuoteTick or None if no such object exists
 
@@ -186,7 +190,7 @@ has_quotes = self.cache.has_quote_ticks(instrument_id)    # Returns bool indicat
 
 ```python
 # Get trades
-trades = self.cache.trade_ticks(instrument_id)         # Returns List[TradeTick] or an empty list if no trades found
+trades = self.cache.trade_ticks(instrument_id)         # Returns list[TradeTick] or an empty list if no trades found
 latest_trade = self.cache.trade_tick(instrument_id)    # Returns TradeTick or None if no such object exists
 second_last_trade = self.cache.trade_tick(instrument_id, index=1)  # Returns TradeTick or None if no such object exists
 
@@ -195,7 +199,7 @@ trade_count = self.cache.trade_tick_count(instrument_id)  # Returns the number o
 has_trades = self.cache.has_trade_ticks(instrument_id)    # Returns bool indicating if any trades exist
 ```
 
-#### Order Book
+#### Order book
 
 ```python
 # Get current order book
@@ -225,7 +229,7 @@ price = self.cache.price(
 ```python
 from nautilus_trader.core.rust.model import PriceType, AggregationSource
 
-# Get all available bar types for an instrument; Returns List[BarType].
+# Get all available bar types for an instrument; Returns list[BarType].
 bar_types = self.cache.bar_types(
     instrument_id=instrument_id,
     price_type=PriceType.LAST,  # Options: BID, ASK, MID, LAST
@@ -261,9 +265,9 @@ class MarketDataStrategy(Strategy):
             self.log.info(f"Current spread: {current_spread}")
 ```
 
-### Trading Objects
+### Trading objects
 
-The `Cache` provides comprehensive access to all trading objects within the system, including:
+The `Cache` provides access to all trading objects within the system, including:
 
 - Orders
 - Positions
@@ -272,9 +276,9 @@ The `Cache` provides comprehensive access to all trading objects within the syst
 
 #### Orders
 
-Orders can be accessed and queried through multiple methods, with flexible filtering options by venue, strategy, instrument, and order side.
+You can access and query orders through multiple methods, with flexible filtering options by venue, strategy, instrument, and order side.
 
-##### Basic Order Access
+##### Basic order access
 
 ```python
 # Get a specific order by its client order ID
@@ -289,14 +293,15 @@ orders_for_strategy = self.cache.orders(strategy_id=strategy_id)        # All or
 orders_for_instrument = self.cache.orders(instrument_id=instrument_id)  # All orders for an instrument
 ```
 
-##### Order State Queries
+##### Order state queries
 
 ```python
 # Get orders by their current state
-open_orders = self.cache.orders_open()          # Orders currently active at the venue
-closed_orders = self.cache.orders_closed()      # Orders that have completed their lifecycle
-emulated_orders = self.cache.orders_emulated()  # Orders being simulated locally by the system
-inflight_orders = self.cache.orders_inflight()  # Orders submitted (or modified) to venue, but not yet confirmed
+open_orders = self.cache.orders_open()                       # Orders currently active at the venue
+closed_orders = self.cache.orders_closed()                   # Orders that have completed their lifecycle
+emulated_orders = self.cache.orders_emulated()               # Orders being simulated locally by the system
+inflight_orders = self.cache.orders_inflight()               # Orders submitted (or modified) to venue, but not yet confirmed
+local_active_orders = self.cache.orders_active_local()       # Orders still managed locally (initialized, emulated, or released)
 
 # Check specific order states
 exists = self.cache.order_exists(client_order_id)            # Checks if an order with the given ID exists in the cache
@@ -304,17 +309,19 @@ is_open = self.cache.is_order_open(client_order_id)          # Checks if an orde
 is_closed = self.cache.is_order_closed(client_order_id)      # Checks if an order is closed
 is_emulated = self.cache.is_order_emulated(client_order_id)  # Checks if an order is being simulated locally
 is_inflight = self.cache.is_order_inflight(client_order_id)  # Checks if an order is submitted or modified, but not yet confirmed
+is_active_local = self.cache.is_order_active_local(client_order_id)  # Checks if an order is still managed locally
 ```
 
-##### Order Statistics
+##### Order statistics
 
 ```python
 # Get counts of orders in different states
-open_count = self.cache.orders_open_count()          # Number of open orders
-closed_count = self.cache.orders_closed_count()      # Number of closed orders
-emulated_count = self.cache.orders_emulated_count()  # Number of emulated orders
-inflight_count = self.cache.orders_inflight_count()  # Number of inflight orders
-total_count = self.cache.orders_total_count()        # Total number of orders in the system
+open_count = self.cache.orders_open_count()                  # Number of open orders
+closed_count = self.cache.orders_closed_count()              # Number of closed orders
+emulated_count = self.cache.orders_emulated_count()          # Number of emulated orders
+inflight_count = self.cache.orders_inflight_count()          # Number of inflight orders
+local_active_count = self.cache.orders_active_local_count()  # Number of locally active orders (initialized, emulated, or released)
+total_count = self.cache.orders_total_count()                # Total number of orders in the system
 
 # Get filtered order counts
 buy_orders_count = self.cache.orders_open_count(side=OrderSide.BUY)  # Number of currently open BUY orders
@@ -325,7 +332,7 @@ venue_orders_count = self.cache.orders_total_count(venue=venue)      # Total num
 
 The `Cache` maintains a record of all positions and offers several ways to query them.
 
-##### Position Access
+##### Position access
 
 ```python
 # Get a specific position by its ID
@@ -343,7 +350,7 @@ strategy_positions = self.cache.positions(strategy_id=strategy_id)        # Posi
 long_positions = self.cache.positions(side=PositionSide.LONG)             # All long positions
 ```
 
-##### Position State Queries
+##### Position state queries
 
 ```python
 # Check position states
@@ -356,7 +363,7 @@ orders = self.cache.orders_for_position(position_id)       # All orders related 
 position = self.cache.position_for_order(client_order_id)  # Find the position associated with a specific order
 ```
 
-##### Position Statistics
+##### Position statistics
 
 ```python
 # Get position counts in different states
@@ -376,10 +383,9 @@ instrument_positions_count = self.cache.positions_total_count(instrument_id=inst
 account = self.cache.account(account_id)       # Retrieve account by ID
 account = self.cache.account_for_venue(venue)  # Retrieve account for a specific venue
 account_id = self.cache.account_id(venue)      # Retrieve account ID for a venue
-accounts = self.cache.accounts()               # Retrieve all accounts in the cache
 ```
 
-#### Instruments and Currencies
+#### Instruments and currencies
 
 ##### Instruments
 
@@ -397,21 +403,14 @@ instrument_ids = self.cache.instrument_ids()                   # Get all instrum
 venue_instrument_ids = self.cache.instrument_ids(venue=venue)  # Get instrument IDs for a specific venue
 ```
 
-##### Currencies
-
-```python
-# Get currency information
-currency = self.cache.load_currency("USD")  # Loads currency data for USD
-```
-
 ---
 
-### Custom Data
+### Custom data
 
 The `Cache` can also store and retrieve custom data types in addition to built-in market data and trading objects.
-You can keep any user-defined data you want to share between system components (mostly Actors / Strategies).
+Use it to share any user-defined data between system components, primarily actors and strategies.
 
-#### Basic Storage and Retrieval
+#### Basic storage and retrieval
 
 ```python
 # Call this code inside Strategy methods (`self` refers to Strategy)
@@ -429,23 +428,23 @@ For more complex use cases, the `Cache` can store custom data objects that inher
 The `Cache` is not designed to be a full database replacement. For large datasets or complex querying needs, consider using a dedicated database system.
 :::
 
-## Best Practices and Common Questions
+## Best practices and common questions
 
-### Cache vs. Portfolio Usage
+### Cache vs. portfolio usage
 
 The `Cache` and `Portfolio` components serve different but complementary purposes in NautilusTrader:
 
 **Cache**:
 
 - Maintains the historical knowledge and current state of the trading system.
-- Updates immediately for local state changes (initializing an order to be submitted)
-- Updates asynchronously as external events occur (order is filled).
-- Provides complete history of trading activity and market data.
-- All data a strategy has received (events/updates) is stored in Cache.
+- Updates immediately when local state changes (for example, initializing an order before submission).
+- Updates asynchronously as external events occur (for example, when an order fills).
+- Provides a complete history of trading activity and market data.
+- Keeps every event the strategy receives in the cache.
 
 **Portfolio**:
 
-- Aggregated position/exposure and account information.
+- Aggregates position, exposure, and account information.
 - Provides current state without history.
 
 **Example**:
@@ -460,18 +459,18 @@ class MyStrategy(Strategy):
         current_exposure = self.portfolio.net_exposure(event.instrument_id)
 ```
 
-### Cache vs. Strategy variables
+### Cache vs. strategy variables
 
 Choosing between storing data in the `Cache` versus strategy variables depends on your specific needs:
 
-**Cache Storage**:
+**Cache storage**:
 
 - Use for data that needs to be shared between strategies.
 - Best for data that needs to persist between system restarts.
 - Acts as a central database accessible to all components.
 - Ideal for state that needs to survive strategy resets.
 
-**Strategy Variables**:
+**Strategy variables**:
 
 - Use for strategy-specific calculations.
 - Better for temporary values and intermediate results.
@@ -480,7 +479,7 @@ Choosing between storing data in the `Cache` versus strategy variables depends o
 
 **Example**:
 
-Example that clarifies how you might store data in the `Cache` so multiple strategies can access the same information.
+The following example shows how you might store data in the `Cache` so multiple strategies can access the same information.
 
 ```python
 import pickle
@@ -498,10 +497,9 @@ class MyStrategy(Strategy):
         # This way, multiple strategies can call self.cache.get("shared_strategy_info")
         # to retrieve the same data
         self.cache.add("shared_strategy_info", pickle.dumps(shared_data))
-
 ```
 
-How another strategy (running in parallel) can retrieve cached data above:
+Another strategy can retrieve the cached data as follows:
 
 ```python
 import pickle
@@ -514,3 +512,9 @@ class AnotherStrategy(Strategy):
             shared_data = pickle.loads(data_bytes)
             self.log.info(f"Shared data retrieved: {shared_data}")
 ```
+
+## Related guides
+
+- [Data](data.md) - Data types stored in the cache.
+- [Strategies](strategies.md) - Strategies access cache for market data and state.
+- [Reports](reports.md) - Generate reports from cached data.

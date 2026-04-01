@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -16,11 +16,12 @@
 from nautilus_trader.cache.base cimport CacheFacade
 from nautilus_trader.common.component cimport Clock
 from nautilus_trader.common.component cimport Logger
-from nautilus_trader.common.component cimport MessageBus
+from nautilus_trader.model.identifiers cimport InstrumentId
+from nautilus_trader.model.objects cimport Price
 
 
 cdef class GreeksCalculator:
     cdef Clock _clock
     cdef Logger _log
-    cdef MessageBus _msgbus
     cdef CacheFacade _cache
+    cdef object _get_price(self, InstrumentId instrument_id)

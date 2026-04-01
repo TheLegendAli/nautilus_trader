@@ -9,6 +9,10 @@ For development we recommend using the PyCharm *Professional* edition IDE, as it
 NautilusTrader uses increasingly more [Rust](https://www.rust-lang.org), so Rust should be installed on your system as well
 ([installation guide](https://www.rust-lang.org/tools/install)).
 
+[Cap'n Proto](https://capnproto.org/) is required for serialization schema compilation. The required
+version is specified in the `capnp-version` file in the repository root. Ubuntu's default package
+is typically too old, so you may need to install from source (see below).
+
 :::info
 NautilusTrader *must* compile and run on **Linux, macOS, and Windows**. Please keep portability in
 mind (use `std::path::Path`, avoid Bash-isms in shell scripts, etc.).
@@ -18,15 +22,15 @@ mind (use `std::path::Path`, avoid Bash-isms in shell scripts, etc.).
 
 The following steps are for UNIX-like systems, and only need to be completed once.
 
-1. Follow the [installation guide](../getting_started/installation.md) to set up the project with a modification to the final command to install development and test dependencies:
+### 1. Install dependencies
 
-```bash
+Follow the [installation guide](../getting_started/installation.md) to set up the project with a modification to the final command to install development and test dependencies:
+
+```bash tab="uv"
 uv sync --active --all-groups --all-extras
 ```
 
-or
-
-```bash
+```bash tab="make"
 make install
 ```
 
@@ -37,7 +41,9 @@ To install in debug mode, use:
 make install-debug
 ```
 
-2. Set up the pre-commit hook which will then run automatically at commit:
+### 2. Set up pre-commit
+
+Set up the pre-commit hook which will then run automatically at commit:
 
 ```bash
 pre-commit install
@@ -51,34 +57,83 @@ make format
 make pre-commit
 ```
 
-Make sure the Rust compiler reports **zero errors** – broken builds slow everyone down.
+Make sure the Rust compiler reports **zero errors** -- broken builds slow everyone down.
 
-3. **Optional**: For frequent Rust development, configure the `PYO3_PYTHON` variable in `.cargo/config.toml` with the path to the Python interpreter. This helps reduce recompilation times for IDE/rust-analyzer based `cargo check`:
+### 3. Configure environment variables
 
-```bash
-PYTHON_PATH=$(which python)
-echo -e "\n[env]\nPYO3_PYTHON = \"$PYTHON_PATH\"" >> .cargo/config.toml
-```
-
-Since `.cargo/config.toml` is tracked, configure git to skip any local modifications:
+**Required for Rust/PyO3 (Linux and macOS)**: When using Python installed via `uv` on Linux or macOS, set the following environment variables:
 
 ```bash
-git update-index --skip-worktree .cargo/config.toml
+# Add to your shell configuration (e.g., ~/.zshrc or ~/.bashrc)
+
+# Linux only: Set the library path for the Python interpreter
+export LD_LIBRARY_PATH="$(python -c 'import sys; print(sys.base_prefix)')/lib:$LD_LIBRARY_PATH"
+
+# Set the Python executable path for PyO3
+export PYO3_PYTHON=$(pwd)/.venv/bin/python
+
+# Set the Python home path (required for Rust tests)
+export PYTHONHOME=$(python -c "import sys; print(sys.base_prefix)")
 ```
 
-To restore tracking: `git update-index --no-skip-worktree .cargo/config.toml`
+:::note
+The `LD_LIBRARY_PATH` export is Linux-specific and not needed on macOS or Windows.
+
+- `PYO3_PYTHON` tells PyO3 which Python interpreter to use, reducing unnecessary recompilation.
+- `PYTHONHOME` is required when running `make cargo-test` with a `uv`-installed Python.
+  Without it, tests that depend on PyO3 may fail to locate the Python runtime.
+
+:::
+
+To verify your environment is configured correctly:
+
+```bash
+python -c "import sys; print('Python:', sys.executable, sys.version)"
+echo "PYO3_PYTHON: $PYO3_PYTHON"
+echo "PYTHONHOME: $PYTHONHOME"
+```
+
+## Dependency management
+
+Python dependencies are managed by [uv](https://docs.astral.sh/uv). The `[tool.uv]` section in
+`pyproject.toml` enforces two supply chain safety settings:
+
+- **`required-version = "==0.11.2"`**: all developers and CI use the same uv version. The version
+  is extracted by `scripts/uv-version.sh` for Makefile, CI, and Docker builds.
+- **`exclude-newer = "3 days"`**: `uv lock` ignores package versions published within the last
+  3 days. This gives the community time to detect and quarantine compromised releases before they
+  enter the lockfile.
+
+### Bypassing the cooldown
+
+When a security patch or critical bug fix must be pulled in immediately, override `exclude-newer`
+on the command line:
+
+```bash
+# Disable the cooldown for a single package
+uv lock --exclude-newer-package "somepackage=2026-03-30T00:00:00Z"
+
+# Disable the cooldown entirely for this resolution
+uv lock --exclude-newer "0 seconds"
+```
+
+The CLI flag overrides the `pyproject.toml` value for that invocation only. The config remains
+unchanged for subsequent runs.
+
+### Updating uv
+
+To update the pinned uv version, change `required-version` in both `pyproject.toml` and
+`python/pyproject.toml`, then update the `rev` in `.pre-commit-config.yaml` to match.
 
 ## Builds
 
 Following any changes to `.rs`, `.pyx` or `.pxd` files, you can re-compile by running:
 
-```bash
+```bash tab="uv"
 uv run --no-sync python build.py
 ```
 
-or
-
-```bash
+```bash tab="make"
 make build
 ```
 
@@ -88,6 +143,47 @@ To compile in debug mode, use:
 ```bash
 make build-debug
 ```
+
+## Cap'n Proto
+
+[Cap'n Proto](https://capnproto.org/) is required for serialization schema compilation.
+The required version is defined in the `capnp-version` file in the repository root.
+
+Install the correct version for your platform:
+
+```bash tab="Script (Linux/macOS)"
+./scripts/install-capnp.sh
+```
+
+```bash tab="macOS (Homebrew)"
+brew install capnp
+```
+
+```bash tab="Linux (source)"
+CAPNP_VERSION=$(cat capnp-version)
+cd ~
+wget https://capnproto.org/capnproto-c++-${CAPNP_VERSION}.tar.gz
+tar xzf capnproto-c++-${CAPNP_VERSION}.tar.gz
+cd capnproto-c++-${CAPNP_VERSION}
+./configure
+make -j$(nproc)
+sudo make install
+sudo ldconfig
+```
+
+```bash tab="Windows (Chocolatey)"
+choco install capnproto
+```
+
+Verify the installed version matches `capnp-version`:
+
+```bash
+capnp --version
+```
+
+The install script ensures the pinned version is installed. If Homebrew or Chocolatey provides
+an older version, install from source or see the
+[Cap'n Proto installation guide](https://capnproto.org/install.html).
 
 ## Faster builds
 
@@ -101,6 +197,10 @@ rustup override set stable # reset to stable
 ```
 
 Activate the nightly feature and use "cranelift" backend for dev and testing profiles in workspace `Cargo.toml`. You can apply the below patch using `git apply <patch>`. You can remove it using `git apply -R <patch>` before pushing changes.
+
+:::warning
+Do not commit these changes. The cranelift patch is for local development only and will break CI if pushed.
+:::
 
 ```
 diff --git a/Cargo.toml b/Cargo.toml
@@ -138,7 +238,7 @@ index 62b78cd8d0..beb0800211 100644
  opt-level = 3
 ```
 
-Pass `RUSTUP_TOOLCHAIN=nightly` when running `make build-debug` like commands and include it in in all [rust analyzer settings](#rust-analyzer-settings) for faster builds and IDE checks.
+Pass `RUSTUP_TOOLCHAIN=nightly` when running `make build-debug` like commands and include it in all [rust analyzer settings](#rust-analyzer-settings) for faster builds and IDE checks.
 
 ## Services
 
@@ -157,7 +257,7 @@ docker-compose up -d postgres
 
 Used services are:
 
-- `postgres`: Postgres database with root user `POSTRES_USER` which defaults to `postgres`, `POSTGRES_PASSWORD` which defaults to `pass` and `POSTGRES_DB` which defaults to `postgres`.
+- `postgres`: Postgres database with root user `POSTGRES_USER` which defaults to `postgres`, `POSTGRES_PASSWORD` which defaults to `pass` and `POSTGRES_DB` which defaults to `postgres`.
 - `redis`: Redis server.
 - `pgadmin`: PgAdmin4 for database management and administration.
 
@@ -190,13 +290,23 @@ CREATE DATABASE
 The Nautilus CLI is a command-line interface tool for interacting with the NautilusTrader ecosystem.
 It offers commands for managing the PostgreSQL database and handling various trading operations.
 
+:::warning
+On Linux systems with GNOME desktop, the `nautilus` command typically refers to the GNOME file manager (`/usr/bin/nautilus`).
+After installing the NautilusTrader CLI, you may need to ensure the Cargo binary takes precedence by either:
+
+- Adding an alias to your shell config: `alias nautilus="$HOME/.cargo/bin/nautilus"`
+- Using the full path: `~/.cargo/bin/nautilus`
+- Ensuring `~/.cargo/bin` appears before `/usr/bin` in your `PATH`
+
+:::
+
 :::note
 The Nautilus CLI command is only supported on UNIX-like systems.
 :::
 
 ## Install
 
-You can install the Nautilus CLI using the below Makefile target, which leverages `cargo install` under the hood.
+You can install the Nautilus CLI using the below Makefile target, which uses `cargo install` under the hood.
 This will place the nautilus binary in your system's PATH, assuming Rust's `cargo` is properly configured.
 
 ```bash
@@ -215,7 +325,7 @@ either through command-line arguments or a `.env` file located in the root direc
 
 - `--host` or `POSTGRES_HOST` for the database host
 - `--port` or `POSTGRES_PORT` for the database port
-- `--user` or `POSTGRES_USER` for the root administrator (typically the postgres user)
+- `--user` or `POSTGRES_USERNAME` for the root administrator (typically the postgres user)
 - `--password` or `POSTGRES_PASSWORD` for the root administrator's password
 - `--database` or `POSTGRES_DATABASE` for both the database **name and the new user** with privileges to that database
     (e.g., if you provide `nautilus` as the value, a new user named nautilus will be created with the password from `POSTGRES_PASSWORD`, and the `nautilus` database will be bootstrapped with this user as the owner).
@@ -239,11 +349,8 @@ List of commands are:
 
 Rust analyzer is a popular language server for Rust and has integrations for many IDEs. It is recommended to configure rust analyzer to have same environment variables as `make build-debug` for faster compile times. Below tested configurations for VSCode and Astro Nvim are provided. For more information see [PR](https://github.com/nautechsystems/nautilus_trader/pull/2524) or rust analyzer [config docs](https://rust-analyzer.github.io/book/configuration.html).
 
-### VSCode
-
-You can add the following settings to your VSCode `settings.json` file:
-
-```
+```json tab="VSCode"
+{
     "rust-analyzer.restartServerOnConfigChange": true,
     "rust-analyzer.linkedProjects": [
         "Cargo.toml"
@@ -267,46 +374,44 @@ You can add the following settings to your VSCode `settings.json` file:
     },
     "rust-analyzer.check.features": "all",
     "rust-analyzer.testExplorer": true
+}
 ```
 
-### Astro Nvim (Neovim + AstroLSP)
-
-You can add the following to your astro lsp config file:
-
-```
-    config = {
-      rust_analyzer = {
-        settings = {
-          ["rust-analyzer"] = {
-            restartServerOnConfigChange = true,
-            linkedProjects = { "Cargo.toml" },
-            cargo = {
-              features = "all",
-              extraEnv = {
-                VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
-                CC = "clang",
-                CXX = "clang++",
-              },
-            },
-            check = {
-              workspace = false,
-              command = "check",
-              features = "all",
-              extraEnv = {
-                VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
-                CC = "clang",
-                CXX = "clang++",
-              },
-            },
-            runnables = {
-              extraEnv = {
-                VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
-                CC = "clang",
-                CXX = "clang++",
-              },
-            },
-            testExplorer = true,
+```lua tab="Neovim (AstroLSP)"
+config = {
+  rust_analyzer = {
+    settings = {
+      ["rust-analyzer"] = {
+        restartServerOnConfigChange = true,
+        linkedProjects = { "Cargo.toml" },
+        cargo = {
+          features = "all",
+          extraEnv = {
+            VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
+            CC = "clang",
+            CXX = "clang++",
           },
         },
+        check = {
+          workspace = false,
+          command = "check",
+          features = "all",
+          extraEnv = {
+            VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
+            CC = "clang",
+            CXX = "clang++",
+          },
+        },
+        runnables = {
+          extraEnv = {
+            VIRTUAL_ENV = "<path-to-your-virtual-environment>/.venv",
+            CC = "clang",
+            CXX = "clang++",
+          },
+        },
+        testExplorer = true,
       },
+    },
+  },
+}
 ```

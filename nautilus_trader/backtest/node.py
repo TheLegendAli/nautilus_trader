@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -24,6 +24,7 @@ from nautilus_trader.backtest.config import BacktestVenueConfig
 from nautilus_trader.backtest.config import FeeModelFactory
 from nautilus_trader.backtest.config import FillModelFactory
 from nautilus_trader.backtest.config import LatencyModelFactory
+from nautilus_trader.backtest.config import MarginModelFactory
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.engine import BacktestEngineConfig
 from nautilus_trader.backtest.models import FeeModel
@@ -57,7 +58,11 @@ from nautilus_trader.model.data import capsule_to_list
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.enums import OtoTriggerMode
+from nautilus_trader.model.enums import account_type_from_str
 from nautilus_trader.model.enums import book_type_from_str
+from nautilus_trader.model.enums import oms_type_from_str
+from nautilus_trader.model.enums import oto_trigger_mode_from_str
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
@@ -326,10 +331,12 @@ class BacktestNode:
             "request_bars",
             "request_quote_ticks",
             "request_trade_ticks",
+            "request_order_book_depth",
+            "request_order_book_deltas",
         ]
 
         if request_function not in compatible_request_functions:
-            self._engines["download"].logger.error(
+            raise ValueError(
                 f"{request_function} not supported by BacktestNode.download_data. "
                 f"Please use one of {compatible_request_functions}.",
             )
@@ -377,13 +384,14 @@ class BacktestNode:
         for venue_config in venue_configs:
             engine.add_venue(
                 venue=Venue(venue_config.name),
-                oms_type=OmsType[venue_config.oms_type],
-                account_type=AccountType[venue_config.account_type],
+                oms_type=get_oms_type(venue_config),
+                account_type=get_account_type(venue_config),
                 base_currency=get_base_currency(venue_config),
                 starting_balances=get_starting_balances(venue_config),
                 default_leverage=Decimal(venue_config.default_leverage),
                 leverages=get_leverages(venue_config),
-                book_type=book_type_from_str(venue_config.book_type),
+                margin_model=get_margin_model(venue_config),
+                book_type=get_book_type(venue_config),
                 routing=venue_config.routing,
                 modules=[ActorFactory.create(module) for module in (venue_config.modules or [])],
                 fill_model=get_fill_model(venue_config),
@@ -393,12 +401,19 @@ class BacktestNode:
                 reject_stop_orders=venue_config.reject_stop_orders,
                 support_gtd_orders=venue_config.support_gtd_orders,
                 support_contingent_orders=venue_config.support_contingent_orders,
+                oto_trigger_mode=get_oto_trigger_mode(venue_config),
                 use_position_ids=venue_config.use_position_ids,
                 use_random_ids=venue_config.use_random_ids,
                 use_reduce_only=venue_config.use_reduce_only,
+                use_market_order_acks=venue_config.use_market_order_acks,
                 bar_execution=venue_config.bar_execution,
                 bar_adaptive_high_low_ordering=venue_config.bar_adaptive_high_low_ordering,
                 trade_execution=venue_config.trade_execution,
+                liquidity_consumption=venue_config.liquidity_consumption,
+                queue_position=venue_config.queue_position,
+                allow_cash_borrowing=venue_config.allow_cash_borrowing,
+                price_protection_points=get_price_protection_points(venue_config),
+                settlement_prices=venue_config.settlement_prices,
             )
 
         # Add instruments
@@ -434,7 +449,9 @@ class BacktestNode:
                 builder.add_data_client_factory(name, factory)
 
             builder.build_data_clients(config.data_clients)
-            engine.set_default_market_data_client()
+
+        # We always want a default client so the data engine can know if it is in a backtest
+        engine.set_default_market_data_client()
 
     def run(self) -> list[BacktestResult]:
         """
@@ -520,6 +537,9 @@ class BacktestNode:
         # Create session for entire stream
         session = DataBackendSession(chunk_size=chunk_size)
 
+        # Cache file lists per catalog and data type to avoid repeated filesystem operations
+        cached_file_lists: dict[tuple[str, str | None, type], list[str]] = {}
+
         # Add query for all data configs
         for config in data_configs:
             catalog = self.load_catalog(config)
@@ -551,12 +571,27 @@ class BacktestNode:
                     for instrument_id in config.instrument_ids:
                         used_bar_types.append(f"{instrument_id}-{config.bar_spec}-EXTERNAL")
 
+            # Cache file list for this catalog/data type pair if not already cached
+            cache_key = (config.catalog_path, config.catalog_fs_protocol, config.data_type)
+            if cache_key not in cached_file_lists:
+                cached_file_lists[cache_key] = catalog.get_file_list_from_data_cls(config.data_type)
+
+            filter_files = catalog.filter_files(
+                data_cls=config.data_type,
+                file_paths=cached_file_lists[cache_key],
+                identifiers=(used_bar_types or used_instrument_ids),
+                start=used_start,
+                end=used_end,
+            )
+
             session = catalog.backend_session(
                 data_cls=config.data_type,
                 identifiers=(used_bar_types or used_instrument_ids),
                 start=used_start,
                 end=used_end,
                 session=session,
+                files=filter_files,
+                optimize_file_loading=config.optimize_file_loading,
             )
 
         # Stream data
@@ -584,7 +619,7 @@ class BacktestNode:
         start: str | int | None = None,
         end: str | int | None = None,
     ) -> None:
-        # Load data
+        # Load data - defer sorting until all data is loaded for better performance
         for config in data_configs:
             t0 = pd.Timestamp.now()
             used_instrument_ids = get_instrument_ids(config)
@@ -608,11 +643,12 @@ class BacktestNode:
                 f"Read {len(result.data):,} events from parquet in {pd.Timedelta(t1 - t0)}s",
             )
 
-            self._load_engine_data(engine=engine, result=result)
+            self._load_engine_data(engine=engine, result=result, sort=False)  # sort before run
 
             t2 = pd.Timestamp.now()
             engine.logger.info(f"Engine load took {pd.Timedelta(t2 - t1)}s")
 
+        engine.sort_data()
         engine.run(start=start, end=end, run_config_id=run_config_id)
 
     @classmethod
@@ -658,13 +694,19 @@ class BacktestNode:
             path=config.catalog_path,
             fs_protocol=config.catalog_fs_protocol,
             fs_storage_options=config.catalog_fs_storage_options,
+            fs_rust_storage_options=config.catalog_fs_rust_storage_options,
         )
 
-    def _load_engine_data(self, engine: BacktestEngine, result: CatalogDataResult) -> None:
+    def _load_engine_data(
+        self,
+        engine: BacktestEngine,
+        result: CatalogDataResult,
+        sort: bool = True,
+    ) -> None:
         if is_nautilus_class(result.data_cls):
             engine.add_data(
                 data=result.data,
-                sort=True,  # Already sorted from backend
+                sort=sort,
             )
         else:
             if not result.client_id:
@@ -675,7 +717,7 @@ class BacktestNode:
             engine.add_data(
                 data=result.data,
                 client_id=result.client_id,
-                sort=True,  # Already sorted from backend
+                sort=sort,
             )
 
     def log_backtest_exception(self, e: Exception, config: BacktestRunConfig) -> None:
@@ -727,6 +769,34 @@ def get_instrument_ids(config: BacktestDataConfig) -> list[InstrumentId]:
     return instrument_ids
 
 
+def get_oms_type(config: BacktestVenueConfig) -> OmsType:
+    oms_type = config.oms_type
+
+    return oms_type_from_str(oms_type) if type(oms_type) is str else oms_type
+
+
+def get_account_type(config: BacktestVenueConfig) -> AccountType:
+    account_type = config.account_type
+
+    return account_type_from_str(account_type) if type(account_type) is str else account_type
+
+
+def get_book_type(config: BacktestVenueConfig) -> BookType | None:
+    book_type = config.book_type
+
+    return book_type_from_str(book_type) if type(book_type) is str else book_type
+
+
+def get_oto_trigger_mode(config: BacktestVenueConfig) -> OtoTriggerMode:
+    oto_trigger_mode = config.oto_trigger_mode
+
+    return (
+        oto_trigger_mode_from_str(oto_trigger_mode)
+        if type(oto_trigger_mode) is str
+        else oto_trigger_mode
+    )
+
+
 def get_starting_balances(config: BacktestVenueConfig) -> list[Money]:
     starting_balances = []
 
@@ -748,6 +818,15 @@ def get_leverages(config: BacktestVenueConfig) -> dict[InstrumentId, Decimal]:
         if config.leverages
         else {}
     )
+
+
+def get_price_protection_points(config: BacktestVenueConfig) -> int | None:
+    value = config.price_protection_points
+
+    if value is None:
+        return None
+
+    return value
 
 
 def get_fill_model(config: BacktestVenueConfig) -> FillModel | None:
@@ -778,3 +857,13 @@ def get_fee_model(config: BacktestVenueConfig) -> FeeModel | None:
         return None
 
     return FeeModelFactory.create(config.fee_model)
+
+
+def get_margin_model(config: BacktestVenueConfig):
+    """
+    Create a MarginModel from the venue configuration.
+    """
+    if config.margin_model is None:
+        return None
+
+    return MarginModelFactory.create(config.margin_model)

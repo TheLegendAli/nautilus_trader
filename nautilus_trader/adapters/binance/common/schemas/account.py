@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,9 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from datetime import datetime
 from decimal import Decimal
 
 import msgspec
+import pandas as pd
 
 from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
@@ -23,6 +25,7 @@ from nautilus_trader.adapters.binance.common.enums import BinanceOrderStatus
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
 from nautilus_trader.core.datetime import millis_to_nanos
+from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
@@ -30,6 +33,8 @@ from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderStatus
+from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.identifiers import AccountId
@@ -94,6 +99,7 @@ class BinanceUserTrade(msgspec.Struct, frozen=True):
         use_position_ids: bool = True,
     ) -> FillReport:
         venue_position_id: PositionId | None = None
+
         if self.positionSide is not None and use_position_ids:
             venue_position_id = PositionId(f"{instrument_id}-{self.positionSide}")
 
@@ -143,7 +149,7 @@ class BinanceOrder(msgspec.Struct, frozen=True):
 
     # Parameters in SPOT/MARGIN only:
     orderListId: int | None = None  # Unless OCO, the value will always be -1
-    cumulativeQuoteQty: str | None = None  # cumulative quote qty
+    cummulativeQuoteQty: str | None = None  # Binance uses double 'm' (their typo)
     icebergQty: str | None = None
     isWorking: bool | None = None
     workingTime: int | None = None
@@ -165,6 +171,36 @@ class BinanceOrder(msgspec.Struct, frozen=True):
     cumQuote: str | None = None  # USD-M FUTURES only
     cumBase: str | None = None  # COIN-M FUTURES only
     pair: str | None = None  # COIN-M FUTURES only
+
+    def _parse_time_in_force_and_expire(
+        self,
+        order_type: OrderType,
+        enum_parser: BinanceEnumParser,
+    ) -> tuple[TimeInForce | None, datetime | None]:
+        time_in_force = (
+            enum_parser.parse_binance_time_in_force(self.timeInForce) if self.timeInForce else None
+        )
+        expire_time: datetime | None = None
+
+        # GTD requires expire_time. Convert to GTC if goodTillDate is missing or for MARKET
+        # orders (which don't support GTD).
+        if time_in_force == TimeInForce.GTD:
+            if order_type == OrderType.MARKET or self.goodTillDate is None:
+                time_in_force = TimeInForce.GTC
+            else:
+                expire_ts: pd.Timestamp = unix_nanos_to_dt(millis_to_nanos(self.goodTillDate))
+                expire_time = expire_ts.to_pydatetime()
+
+        return time_in_force, expire_time
+
+    def _parse_avg_px(self) -> Decimal | None:
+        # Futures provides avgPrice, Spot requires calculation from cumulative fields
+        if self.avgPrice is not None:
+            return Decimal(self.avgPrice)
+        elif self.cummulativeQuoteQty is not None and self.executedQty is not None:
+            executed_qty = Decimal(self.executedQty)
+            return Decimal(self.cummulativeQuoteQty) / executed_qty if executed_qty > 0 else None
+        return None
 
     def parse_to_order_status_report(
         self,
@@ -190,6 +226,7 @@ class BinanceOrder(msgspec.Struct, frozen=True):
 
         trigger_price = Decimal(self.stopPrice) if self.stopPrice is not None else Decimal()
         trigger_type = TriggerType.NO_TRIGGER
+
         if self.workingType is not None:
             trigger_type = enum_parser.parse_binance_trigger_type(self.workingType)
         elif trigger_price > 0:
@@ -197,14 +234,16 @@ class BinanceOrder(msgspec.Struct, frozen=True):
 
         trailing_offset = None
         trailing_offset_type = TrailingOffsetType.NO_TRAILING_OFFSET
+
         if self.priceRate is not None:
             trailing_offset = Decimal(self.priceRate)
             trailing_offset_type = TrailingOffsetType.BASIS_POINTS
 
-        avg_px = Decimal(self.avgPrice) if self.avgPrice is not None else None
+        avg_px = self._parse_avg_px()
         post_only = (
             self.type == BinanceOrderType.LIMIT_MAKER or self.timeInForce == BinanceTimeInForce.GTX
         )
+
         reduce_only = self.reduceOnly if self.reduceOnly is not None else False
 
         if self.side is None:
@@ -220,6 +259,12 @@ class BinanceOrder(msgspec.Struct, frozen=True):
         if treat_expired_as_canceled and order_status == OrderStatus.EXPIRED:
             order_status = OrderStatus.CANCELED
 
+        order_type = enum_parser.parse_binance_order_type(self.type)
+        time_in_force, expire_time = self._parse_time_in_force_and_expire(
+            order_type,
+            enum_parser,
+        )
+
         return OrderStatusReport(
             account_id=account_id,
             instrument_id=instrument_id,
@@ -227,13 +272,10 @@ class BinanceOrder(msgspec.Struct, frozen=True):
             order_list_id=order_list_id,
             venue_order_id=VenueOrderId(str(self.orderId)),
             order_side=enum_parser.parse_binance_order_side(self.side),
-            order_type=enum_parser.parse_binance_order_type(self.type),
+            order_type=order_type,
             contingency_type=contingency_type,
-            time_in_force=(
-                enum_parser.parse_binance_time_in_force(self.timeInForce)
-                if self.timeInForce
-                else None
-            ),
+            time_in_force=time_in_force,
+            expire_time=expire_time,
             order_status=order_status,
             price=Price.from_str(self.price),
             trigger_price=Price.from_str(str(trigger_price)),  # `decimal.Decimal`

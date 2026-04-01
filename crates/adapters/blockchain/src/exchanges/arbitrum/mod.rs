@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,9 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
-use alloy::primitives::Address;
+use nautilus_model::defi::DexType;
 
 use crate::exchanges::extended::DexExtended;
 
@@ -25,6 +25,7 @@ mod fluid;
 mod pancakeswap_v3;
 mod sushiswap_v2;
 mod sushiswap_v3;
+mod uniswap_v2;
 mod uniswap_v3;
 mod uniswap_v4;
 
@@ -34,73 +35,22 @@ pub use fluid::FLUID_DEX;
 pub use pancakeswap_v3::PANCAKESWAP_V3;
 pub use sushiswap_v2::SUSHISWAP_V2;
 pub use sushiswap_v3::SUSHISWAP_V3;
+pub use uniswap_v2::UNISWAP_V2;
 pub use uniswap_v3::UNISWAP_V3;
 pub use uniswap_v4::UNISWAP_V4;
 
-/// Returns a vector of references to all Arbitrum Dexes.
-#[must_use]
-pub fn all() -> Vec<&'static DexExtended> {
-    vec![
-        &*CAMELOT_V3,
-        &*CURVE_FINANCE,
-        &*FLUID_DEX,
-        &*PANCAKESWAP_V3,
-        &*SUSHISWAP_V2,
-        &*SUSHISWAP_V3,
-        &*UNISWAP_V3,
-        &*UNISWAP_V4,
-    ]
-}
+pub static ARBITRUM_DEX_EXTENDED_MAP: LazyLock<HashMap<DexType, &'static DexExtended>> =
+    LazyLock::new(|| {
+        let mut map = HashMap::new();
+        map.insert(CAMELOT_V3.dex.name, &*CAMELOT_V3);
+        map.insert(CURVE_FINANCE.dex.name, &*CURVE_FINANCE);
+        map.insert(FLUID_DEX.dex.name, &*FLUID_DEX);
+        map.insert(PANCAKESWAP_V3.name, &*PANCAKESWAP_V3);
+        map.insert(SUSHISWAP_V2.dex.name, &*SUSHISWAP_V2);
+        map.insert(SUSHISWAP_V3.dex.name, &*SUSHISWAP_V3);
+        map.insert(UNISWAP_V2.dex.name, &*UNISWAP_V2);
+        map.insert(UNISWAP_V3.dex.name, &*UNISWAP_V3);
+        map.insert(UNISWAP_V4.dex.name, &*UNISWAP_V4);
 
-/// Returns a map of Arbitrum DEX name to Dex reference for easy lookup.
-#[must_use]
-pub fn dex_map() -> HashMap<&'static str, &'static DexExtended> {
-    let mut map = HashMap::new();
-    map.insert("camelot_v3", &*CAMELOT_V3);
-    map.insert("curve_finance", &*CURVE_FINANCE);
-    map.insert("fluid_dex", &*FLUID_DEX);
-    map.insert("pancakeswap_v3", &*PANCAKESWAP_V3);
-    map.insert("sushiswap_v2", &*SUSHISWAP_V2);
-    map.insert("sushiswap_v3", &*SUSHISWAP_V3);
-    map.insert("uniswap_v3", &*UNISWAP_V3);
-    map.insert("uniswap_v4", &*UNISWAP_V4);
-    map
-}
-
-/// Returns the token symbol for a given Arbitrum token address.
-/// Falls back to address-based naming for unknown tokens.
-#[must_use]
-pub fn get_token_symbol(token_address: Address) -> String {
-    match token_address.to_string().to_lowercase().as_str() {
-        "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" => "WETH".to_string(),
-        "0xaf88d065e77c8cc2239327c5edb3a432268e5831" => "USDC".to_string(),
-        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9" => "USDT".to_string(),
-        "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1" => "DAI".to_string(),
-        "0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f" => "WBTC".to_string(),
-        "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8" => "USDC.e".to_string(),
-        "0x912ce59144191c1204e64559fe8253a0e49e6548" => "ARB".to_string(),
-        "0xf97f4df75117a78c1a5a0dbb814af92458539fb4" => "LINK".to_string(),
-        "0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0" => "UNI".to_string(),
-        _ => format!(
-            "TOKEN_{addr}",
-            addr = &token_address.to_string()[2..8].to_uppercase()
-        ),
-    }
-}
-
-/// Returns the token address for a given Arbitrum token symbol.
-#[must_use]
-pub fn get_token_symbol_reverse(symbol: &str) -> anyhow::Result<Address> {
-    match symbol {
-        "WETH" => Ok("0x82af49447d8a07e3bd95bd0d56f35241523fbab1".parse()?),
-        "USDC" => Ok("0xaf88d065e77c8cc2239327c5edb3a432268e5831".parse()?),
-        "USDT" => Ok("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9".parse()?),
-        "DAI" => Ok("0xda10009cbd5d07dd0cecc66161fc93d7c9000da1".parse()?),
-        "WBTC" => Ok("0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f".parse()?),
-        "USDC.e" => Ok("0xff970a61a04b1ca14834a43f5de4533ebddb5cc8".parse()?),
-        "ARB" => Ok("0x912ce59144191c1204e64559fe8253a0e49e6548".parse()?),
-        "LINK" => Ok("0xf97f4df75117a78c1a5a0dbb814af92458539fb4".parse()?),
-        "UNI" => Ok("0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0".parse()?),
-        _ => anyhow::bail!("Unknown token symbol for Arbitrum: {symbol}"),
-    }
-}
+        map
+    });

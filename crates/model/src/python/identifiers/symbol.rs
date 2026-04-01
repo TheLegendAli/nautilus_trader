@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -29,7 +29,9 @@ use pyo3::{
 use crate::identifiers::symbol::Symbol;
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Symbol {
+    /// Represents a valid ticker symbol ID for a tradable instrument.
     #[new]
     fn py_new(value: &str) -> PyResult<Self> {
         Self::new_checked(value).map_err(to_pyvalue_err)
@@ -41,24 +43,25 @@ impl Symbol {
     }
 
     fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
+        let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
         let binding = py_tuple.get_item(0)?;
-        let value = binding.downcast::<PyString>()?.extract::<&str>()?;
+        let value = binding.cast::<PyString>()?.extract::<&str>()?;
         self.set_inner(value);
         Ok(())
     }
 
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
         (self.to_string(),).into_py_any(py)
     }
 
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
         let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
         let state = self.__getstate__(py)?;
         (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
     }
 
-    fn __richcmp__(&self, other: PyObject, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
+    #[allow(clippy::needless_pass_by_value)]
+    fn __richcmp__(&self, other: Py<PyAny>, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
         if let Ok(other) = other.extract::<Self>(py) {
             match op {
                 CompareOp::Eq => self.eq(&other).into_py_any_unwrap(py),
@@ -99,18 +102,29 @@ impl Symbol {
         self.to_string()
     }
 
+    /// Returns true if the symbol string contains a period (`.`).
     #[getter]
     #[pyo3(name = "is_composite")]
     fn py_is_composite(&self) -> bool {
         self.is_composite()
     }
 
+    /// Returns the symbol root.
+    ///
+    /// The symbol root is the substring that appears before the first period (`.`)
+    /// in the full symbol string. It typically represents the underlying asset for
+    /// futures and options contracts. If no period is found, the entire symbol
+    /// string is considered the root.
     #[getter]
     #[pyo3(name = "root")]
     fn py_root(&self) -> &str {
         self.root()
     }
 
+    /// Returns the symbol topic.
+    ///
+    /// The symbol topic is the root symbol with a wildcard (`*`) appended if the symbol has a root,
+    /// otherwise returns the full symbol string.
     #[getter]
     #[pyo3(name = "topic")]
     fn py_topic(&self) -> String {

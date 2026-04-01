@@ -2,7 +2,7 @@
 
 Interactive Brokers (IB) is a trading platform providing market access across a wide range of financial instruments, including stocks, options, futures, currencies, bonds, funds, and cryptocurrencies. NautilusTrader offers an adapter to integrate with IB using their [Trader Workstation (TWS) API](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/) through their Python library, [ibapi](https://github.com/nautechsystems/ibapi).
 
-The TWS API serves as an interface to IB's standalone trading applications: TWS and IB Gateway. Both can be downloaded from the IB website. If you haven't installed TWS or IB Gateway yet, refer to the [Initial Setup](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#tws-download) guide. In NautilusTrader, you'll establish a connection to one of these applications via the `InteractiveBrokersClient`.
+The TWS API is an interface to IB's standalone trading applications: TWS and IB Gateway. Both can be downloaded from the IB website. If you haven't installed TWS or IB Gateway yet, refer to the [Initial Setup](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#tws-download) guide. In NautilusTrader, you'll establish a connection to one of these applications via the `InteractiveBrokersClient`.
 
 Alternatively, you can start with a [dockerized version](https://github.com/gnzsnz/ib-gateway-docker) of the IB Gateway, which is particularly useful when deploying trading strategies on a hosted cloud platform. This requires having [Docker](https://www.docker.com/) installed on your machine, along with the [docker](https://pypi.org/project/docker/) Python package, which NautilusTrader conveniently includes as an extra package.
 
@@ -15,7 +15,7 @@ The standalone TWS and IB Gateway applications require manually inputting userna
 To install NautilusTrader with Interactive Brokers (and Docker) support:
 
 ```bash
-pip install --upgrade "nautilus_trader[ib,docker]"
+uv pip install "nautilus_trader[ib,docker]"
 ```
 
 To build from source with all extras (including IB and Docker):
@@ -32,18 +32,18 @@ Because IB does not provide wheels for `ibapi`, NautilusTrader [repackages](http
 
 You can find live example scripts [here](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/interactive_brokers/).
 
-## Getting Started
+## Getting started
 
-Before implementing your trading strategies, please ensure that either TWS (Trader Workstation) or IB Gateway is currently running. You have the option to log in to one of these standalone applications using your personal credentials or alternatively, via `DockerizedIBGateway`.
+Before implementing your trading strategies, make sure that either TWS (Trader Workstation) or IB Gateway is running. You can log in to one of these standalone applications with your credentials, or connect programmatically via `DockerizedIBGateway`.
 
-### Connection Methods
+### Connection methods
 
 There are two primary ways to connect to Interactive Brokers:
 
 1. **Connect to an existing TWS or IB Gateway instance**
 2. **Use the dockerized IB Gateway (recommended for automated deployments)**
 
-### Default Ports
+### Default ports
 
 Interactive Brokers uses different default ports depending on the application and trading mode:
 
@@ -52,9 +52,9 @@ Interactive Brokers uses different default ports depending on the application an
 | TWS         | 7497          | 7496         |
 | IB Gateway  | 4002          | 4001         |
 
-### Establish Connection to an Existing Gateway or TWS
+### Establish connection to an existing gateway or TWS
 
-When connecting to a pre-existing Gateway or TWS, specify the `ibg_host` and `ibg_port` parameters in both the `InteractiveBrokersDataClientConfig` and `InteractiveBrokersExecClientConfig`:
+When connecting to a pre-existing gateway or TWS, specify the `ibg_host` and `ibg_port` parameters in both the `InteractiveBrokersDataClientConfig` and `InteractiveBrokersExecClientConfig`:
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersDataClientConfig
@@ -75,7 +75,7 @@ exec_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
-### Establish Connection to DockerizedIBGateway
+### Establish connection to Dockerized IB Gateway
 
 For automated deployments, the dockerized gateway is recommended. Supply `dockerized_gateway` with an instance of `DockerizedIBGatewayConfig` in both client configurations. The `ibg_host` and `ibg_port` parameters are not needed as they're managed automatically.
 
@@ -102,28 +102,28 @@ print(gateway.is_logged_in(gateway.container))
 print(gateway.container.logs())
 ```
 
-### Environment Variables
+### Environment variables
 
 To supply credentials to the Interactive Brokers Gateway, either pass the `username` and `password` to the `DockerizedIBGatewayConfig`, or set the following environment variables:
 
-- `TWS_USERNAME` - Your IB account username
-- `TWS_PASSWORD` - Your IB account password
-- `TWS_ACCOUNT` - Your IB account ID (used as fallback for `account_id`)
+- `TWS_USERNAME`: Your IB account username.
+- `TWS_PASSWORD`: Your IB account password.
+- `TWS_ACCOUNT`: Your IB account ID (used as the fallback for `account_id`).
 
-### Connection Management
+### Connection management
 
-The adapter includes robust connection management features:
+The adapter includes connection management features:
 
-- **Automatic reconnection**: Configurable via `IB_MAX_CONNECTION_ATTEMPTS` environment variable
-- **Connection timeout**: Configurable via `connection_timeout` parameter (default: 300 seconds)
-- **Connection watchdog**: Monitors connection health and triggers reconnection if needed
-- **Graceful error handling**: Comprehensive error handling for various connection scenarios
+- **Automatic reconnection**: Configure retries with the `IB_MAX_CONNECTION_ATTEMPTS` environment variable.
+- **Connection timeout**: Adjust the timeout with the `connection_timeout` parameter (default: 300 seconds).
+- **Connection watchdog**: Monitor connection health and trigger reconnection automatically when required.
+- **Graceful error handling**: Handle diverse connection scenarios with error classification.
 
 ## Overview
 
-The Interactive Brokers adapter provides a comprehensive integration with IB's TWS API. The adapter includes several major components:
+The Interactive Brokers adapter provides an integration with IB's TWS API. The adapter includes several major components:
 
-### Core Components
+### Core components
 
 - **`InteractiveBrokersClient`**: The central client that executes TWS API requests using `ibapi`. Manages connections, handles errors, and coordinates all API interactions.
 - **`InteractiveBrokersDataClient`**: Connects to the Gateway for streaming market data including quotes, trades, and bars.
@@ -131,83 +131,83 @@ The Interactive Brokers adapter provides a comprehensive integration with IB's T
 - **`InteractiveBrokersInstrumentProvider`**: Retrieves and manages instrument definitions, including support for options and futures chains.
 - **`HistoricInteractiveBrokersClient`**: Provides methods for retrieving instruments and historical data, useful for backtesting and research.
 
-### Supporting Components
+### Supporting components
 
 - **`DockerizedIBGateway`**: Manages dockerized IB Gateway instances for automated deployments.
-- **Configuration Classes**: Comprehensive configuration options for all components.
-- **Factory Classes**: Create and configure client instances with proper dependencies.
+- **Configuration classes**: Provide configuration options for all components.
+- **Factory classes**: Create and configure client instances with the necessary dependencies.
 
-### Supported Asset Classes
+### Supported asset classes
 
 The adapter supports trading across all major asset classes available through Interactive Brokers:
 
-- **Equities**: Stocks, ETFs, and equity options
-- **Fixed Income**: Bonds and bond funds
-- **Derivatives**: Futures, options, and warrants
-- **Foreign Exchange**: Spot FX and FX forwards
-- **Cryptocurrencies**: Bitcoin, Ethereum, and other digital assets
-- **Commodities**: Physical commodities and commodity futures
-- **Indices**: Index products and index options
+- **Equities**: Stocks, ETFs, and equity options.
+- **Fixed income**: Bonds and bond funds.
+- **Derivatives**: Futures, options, and warrants.
+- **Foreign exchange**: Spot FX and FX forwards.
+- **Cryptocurrencies**: Bitcoin, Ethereum, and other digital assets.
+- **Commodities**: Physical commodities and commodity futures.
+- **Indices**: Index products and index options.
 
-## The Interactive Brokers Client
+## The Interactive Brokers client
 
-The `InteractiveBrokersClient` serves as the central component of the IB adapter, overseeing a range of critical functions. These include establishing and maintaining connections, handling API errors, executing trades, and gathering various types of data such as market data, contract/instrument data, and account details.
+The `InteractiveBrokersClient` is the central component of the IB adapter, overseeing a range of functions. These include establishing and maintaining connections, handling API errors, executing trades, and gathering various types of data such as market data, contract/instrument data, and account details.
 
-To ensure efficient management of these diverse responsibilities, the `InteractiveBrokersClient` is divided into several specialized mixin classes. This modular approach enhances manageability and clarity.
+The `InteractiveBrokersClient` is divided into specialized mixin classes, each handling a specific responsibility.
 
-### Client Architecture
+### Client architecture
 
 The client uses a mixin-based architecture where each mixin handles a specific aspect of the IB API:
 
-#### Connection Management (`InteractiveBrokersClientConnectionMixin`)
+#### Connection management (`InteractiveBrokersClientConnectionMixin`)
 
-- Establishes and maintains socket connections to TWS/Gateway
-- Handles connection timeouts and reconnection logic
-- Manages connection state and health monitoring
-- Supports configurable reconnection attempts via `IB_MAX_CONNECTION_ATTEMPTS` environment variable
+- Establishes and maintains socket connections to TWS/Gateway.
+- Handles connection timeouts and reconnection logic.
+- Manages connection state and health monitoring.
+- Supports configurable reconnection attempts via `IB_MAX_CONNECTION_ATTEMPTS` environment variable.
 
-#### Error Handling (`InteractiveBrokersClientErrorMixin`)
+#### Error handling (`InteractiveBrokersClientErrorMixin`)
 
-- Processes all API errors and warnings
-- Categorizes errors by type (client errors, connectivity issues, request errors)
-- Handles subscription and request-specific error scenarios
-- Provides comprehensive error logging and debugging information
+- Processes all API errors and warnings.
+- Categorizes errors by type (client errors, connectivity issues, request errors).
+- Handles subscription and request-specific error scenarios.
+- Provides error logging and debugging information.
 
-#### Account Management (`InteractiveBrokersClientAccountMixin`)
+#### Account management (`InteractiveBrokersClientAccountMixin`)
 
-- Retrieves account information and balances
-- Manages position data and portfolio updates
-- Handles multi-account scenarios
-- Processes account-related notifications
+- Retrieves account information and balances.
+- Manages position data and portfolio updates.
+- Handles multi-account scenarios.
+- Processes account-related notifications.
 
-#### Contract/Instrument Management (`InteractiveBrokersClientContractMixin`)
+#### Contract/instrument management (`InteractiveBrokersClientContractMixin`)
 
-- Retrieves contract details and specifications
-- Handles instrument searches and lookups
-- Manages contract validation and verification
-- Supports complex instrument types (options chains, futures chains)
+- Retrieves contract details and specifications.
+- Handles instrument searches and lookups.
+- Manages contract validation and verification.
+- Supports complex instrument types (options chains, futures chains).
 
-#### Market Data Management (`InteractiveBrokersClientMarketDataMixin`)
+#### Market data management (`InteractiveBrokersClientMarketDataMixin`)
 
-- Handles real-time and historical market data subscriptions
-- Processes quotes, trades, and bar data
-- Manages market data type settings (real-time, delayed, frozen)
-- Handles tick-by-tick data and market depth
+- Handles real-time and historical market data subscriptions.
+- Processes quotes, trades, and bar data.
+- Manages market data type settings (real-time, delayed, frozen).
+- Handles tick-by-tick data and market depth.
 
-#### Order Management (`InteractiveBrokersClientOrderMixin`)
+#### Order management (`InteractiveBrokersClientOrderMixin`)
 
-- Processes order placement, modification, and cancellation
-- Handles order status updates and execution reports
-- Manages order validation and error handling
-- Supports complex order types and conditions
+- Processes order placement, modification, and cancellation.
+- Handles order status updates and execution reports.
+- Manages order validation and error handling.
+- Supports complex order types and conditions.
 
-### Key Features
+### Key features
 
-- **Asynchronous Operation**: All operations are fully asynchronous using Python's asyncio
-- **Robust Error Handling**: Comprehensive error categorization and handling
-- **Connection Resilience**: Automatic reconnection with configurable retry logic
-- **Message Processing**: Efficient message queue processing for high-throughput scenarios
-- **State Management**: Proper state tracking for connections, subscriptions, and requests
+- **Asynchronous operation**: All operations are fully asynchronous using Python's asyncio.
+- **Error handling**: Error categorization and handling.
+- **Connection resilience**: Automatic reconnection with configurable retry logic.
+- **Message processing**: Efficient message queue processing for high-throughput scenarios.
+- **State management**: Proper state tracking for connections, subscriptions, and requests.
 
 :::tip
 To troubleshoot TWS API incoming message issues, consider starting at the `InteractiveBrokersClient._process_message` method, which acts as the primary gateway for processing all messages received from the API.
@@ -217,9 +217,9 @@ To troubleshoot TWS API incoming message issues, consider starting at the `Inter
 
 The `InteractiveBrokersInstrumentProvider` supports three methods for constructing `InstrumentId` instances, which can be configured via the `symbology_method` enum in `InteractiveBrokersInstrumentProviderConfig`.
 
-### Symbology Methods
+### Symbology methods
 
-#### 1. Simplified Symbology (`IB_SIMPLIFIED`) - Default
+#### 1. Simplified symbology (`IB_SIMPLIFIED`) - default
 
 When `symbology_method` is set to `IB_SIMPLIFIED` (the default setting), the system uses intuitive, human-readable symbology rules:
 
@@ -249,7 +249,7 @@ When `symbology_method` is set to `IB_SIMPLIFIED` (the default setting), the sys
 - **Cryptocurrencies**: `{symbol}/{currency}.{exchange}`
   - Example: `BTC/USD.PAXOS`, `ETH/USD.PAXOS`
 
-#### 2. Raw Symbology (`IB_RAW`)
+#### 2. Raw symbology (`IB_RAW`)
 
 Setting `symbology_method` to `IB_RAW` enforces stricter parsing rules that align directly with the fields defined in the IB API. This method provides maximum compatibility across all regions and instrument types:
 
@@ -267,7 +267,7 @@ Setting `symbology_method` to `IB_RAW` enforces stricter parsing rules that alig
 
 This configuration ensures explicit instrument identification and supports instruments from any region, especially those with non-standard symbology where simplified parsing may fail.
 
-### MIC Venue Conversion
+### MIC venue conversion
 
 The adapter supports converting Interactive Brokers exchange codes to Market Identifier Codes (MIC) for standardized venue identification:
 
@@ -291,29 +291,34 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 
 #### `symbol_to_mic_venue`
 
-For custom venue mapping, use the `symbol_to_mic_venue` dictionary to override default conversions:
+Symbol-prefix to MIC venue overrides. Applied **first** in venue resolution, independent of `convert_exchange_to_mic_venue`. When a contract's symbol matches a configured prefix, that MIC venue is used; otherwise resolution uses exchange (and optionally MIC conversion if `convert_exchange_to_mic_venue` is True). Useful for OPT contracts with exchange SMART (e.g. SPX -> XCBO) and for aligning with databento-style instrument IDs.
 
 ```python
 instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
-    convert_exchange_to_mic_venue=True,
     symbol_to_mic_venue={
-        "ES": "XCME",  # All ES futures/options use CME MIC
-        "SPY": "ARCX", # SPY specifically uses ARCA
+        "SPX": "XCBO",  # OPT with exchange SMART -> XCBO
+        "ES": "XCME",   # All ES futures/options use CME MIC
+        "SPY": "ARCX",  # SPY specifically uses ARCA
     },
 )
+# convert_exchange_to_mic_venue can be True or False; symbol_to_mic_venue is applied first
 ```
 
-### Supported Instrument Formats
+#### Venue resolution and `_process_contract_details`
+
+When loading instruments via `IBContract`, the provider passes `venue=None` into `_process_contract_details`, so each contract detail gets its own venue (via `symbol_to_mic_venue`, validExchanges, and MIC conversion). Callers that pass a single venue string still get one venue for all details. To get per-detail resolution when you have mixed or SMART-routed results, pass `venue=None`.
+
+### Supported instrument formats
 
 The adapter supports various instrument formats based on Interactive Brokers' contract specifications:
 
-#### Futures Month Codes
+#### Futures month codes
 
 - **F** = January, **G** = February, **H** = March, **J** = April
 - **K** = May, **M** = June, **N** = July, **Q** = August
 - **U** = September, **V** = October, **X** = November, **Z** = December
 
-#### Supported Exchanges by Asset Class
+#### Supported exchanges by asset class
 
 **Futures Exchanges:**
 
@@ -335,27 +340,27 @@ The adapter supports various instrument formats based on Interactive Brokers' co
 
 - `IBCFD`, `IBCMDTY` (IB's internal routing)
 
-### Choosing the Right Symbology Method
+### Choosing the right symbology method
 
 - **Use `IB_SIMPLIFIED`** (default) for most use cases - provides clean, readable instrument IDs
 - **Use `IB_RAW`** when dealing with complex international instruments or when simplified parsing fails
 - **Enable `convert_exchange_to_mic_venue`** when you need standardized MIC venue codes for compliance or data consistency
 
-## Instruments & Contracts
+## Instruments and contracts
 
 In Interactive Brokers, a NautilusTrader `Instrument` corresponds to an IB [Contract](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#contracts). The adapter handles two types of contract representations:
 
-### Contract Types
+### Contract types
 
-#### Basic Contract (`IBContract`)
+#### Basic contract (`IBContract`)
 
 - Contains essential contract identification fields
 - Used for contract searches and basic operations
 - Cannot be directly converted to a NautilusTrader `Instrument`
 
-#### Contract Details (`IBContractDetails`)
+#### Contract details (`IBContractDetails`)
 
-- Contains comprehensive contract information including:
+- Contains contract information including:
   - Order types supported
   - Trading hours and calendar
   - Margin requirements
@@ -364,15 +369,16 @@ In Interactive Brokers, a NautilusTrader `Instrument` corresponds to an IB [Cont
 - Can be converted to a NautilusTrader `Instrument`
 - Required for trading operations
 
-### Contract Discovery
+### Contract discovery
 
 To search for contract information, use the [IB Contract Information Center](https://pennies.interactivebrokers.com/cstools/contract_info/).
 
-### Loading Instruments
+### Loading instruments
 
 There are two primary methods for loading instruments:
 
-#### 1. Using `load_ids` (Recommended)
+#### 1. Using `load_ids` (recommended)
+
 Use `symbology_method=SymbologyMethod.IB_SIMPLIFIED` (default) with `load_ids` for clean, intuitive instrument identification:
 
 ```python
@@ -391,7 +397,8 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 )
 ```
 
-#### 2. Using `load_contracts` (For Complex Instruments)
+#### 2. Using `load_contracts` (for complex instruments)
+
 Use `load_contracts` with `IBContract` instances for complex scenarios like options/futures chains:
 
 ```python
@@ -433,7 +440,7 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 )
 ```
 
-### IBContract Examples by Asset Class
+### IBContract examples by asset class
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
@@ -489,7 +496,7 @@ IBContract(secType='IND', symbol='NDX', exchange='NASDAQ')
 IBContract(secType='CMDTY', symbol='XAUUSD', exchange='SMART')
 ```
 
-### Advanced Configuration Options
+### Advanced configuration options
 
 ```python
 # Options chain with custom exchange
@@ -515,7 +522,7 @@ IBContract(
 )
 ```
 
-### Continuous Futures
+### Continuous futures
 
 For continuous futures contracts (using `secType='CONTFUT'`), the adapter creates instrument IDs using just the symbol and venue:
 
@@ -542,17 +549,79 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 When using `build_options_chain=True` or `build_futures_chain=True`, the `secType` and `symbol` should be specified for the underlying contract. The adapter will automatically discover and load all related derivative contracts within the specified expiry range.
 :::
 
-## Historical Data & Backtesting
+## Option spreads
 
-The `HistoricInteractiveBrokersClient` provides comprehensive methods for retrieving historical data from Interactive Brokers for backtesting and research purposes.
+Interactive Brokers supports option spreads through BAG contracts, which combine multiple option legs into a single tradeable instrument. NautilusTrader provides support for creating, loading, and trading option spreads.
 
-### Supported Data Types
+### Creating option spread instrument IDs
 
-- **Bar Data**: OHLCV bars with various aggregations (time-based, tick-based, volume-based)
-- **Tick Data**: Trade ticks and quote ticks with microsecond precision
-- **Instrument Data**: Complete contract specifications and trading rules
+Option spreads are created using the `new_generic_spread_id()` function, which combines individual option legs with their respective ratios:
 
-### Historical Data Client
+```python
+from nautilus_trader.model.identifiers import InstrumentId, new_generic_spread_id
+
+# Create individual option instrument IDs
+call_leg = InstrumentId.from_str("SPY C400.SMART")
+put_leg = InstrumentId.from_str("SPY P390.SMART")
+
+# Create a 1:1 call spread (long call, short call)
+call_spread_id = new_generic_spread_id([
+    (call_leg, 1),   # Long 1 contract
+    (put_leg, -1),   # Short 1 contract
+])
+
+# Create a 1:2 ratio spread
+ratio_spread_id = new_generic_spread_id([
+    (call_leg, 1),   # Long 1 contract
+    (put_leg, 2),    # Long 2 contracts
+])
+```
+
+### Dynamic spread loading
+
+Option spreads must be requested before they can be traded or subscribed to for market data. Use the `request_instrument()` method to dynamically load spread instruments:
+
+```python
+# In your strategy's on_start method
+def on_start(self):
+    # Request the spread instrument
+    self.request_instrument(spread_id)
+
+def on_instrument(self, instrument):
+    # Handle the loaded spread instrument
+    self.log.info(f"Loaded spread: {instrument.id}")
+
+    # Now you can subscribe to market data
+    self.subscribe_quote_ticks(instrument.id)
+
+    # And place orders
+    order = self.order_factory.market(
+        instrument_id=instrument.id,
+        order_side=OrderSide.BUY,
+        quantity=instrument.make_qty(1),
+        time_in_force=TimeInForce.DAY,
+    )
+    self.submit_order(order)
+```
+
+### Spread trading requirements
+
+1. **Load individual legs first**: Ensure the individual option legs are available before creating spreads.
+2. **Request the spread instrument**: Use `request_instrument()` to load the spread before trading.
+3. **Subscribe to market data**: Request quote ticks after the spread is loaded.
+4. **Place orders**: Any order type can be used once the spread is available.
+
+## Historical data and backtesting
+
+The `HistoricInteractiveBrokersClient` provides methods for retrieving historical data from Interactive Brokers for backtesting and research purposes.
+
+### Supported data types
+
+- **Bar data**: OHLCV bars with time, tick, and volume aggregations.
+- **Tick data**: Trade ticks and quote ticks with microsecond precision.
+- **Instrument data**: Complete contract specifications and trading rules.
+
+### Historical data client
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.historical.client import HistoricInteractiveBrokersClient
@@ -571,7 +640,9 @@ client = HistoricInteractiveBrokersClient(
 await client.connect()
 ```
 
-### Retrieving Instruments
+### Retrieving instruments
+
+#### Basic instrument retrieval
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
@@ -587,7 +658,81 @@ contracts = [
 instruments = await client.request_instruments(contracts=contracts)
 ```
 
-### Retrieving Historical Bars
+#### Option chain retrieval with catalog storage
+
+You can download entire option chains using `request_instruments` in your strategy, with the added benefit of saving the data to the catalog using `update_catalog=True`:
+
+```python
+# In your strategy's on_start method
+def on_start(self):
+    self.request_instruments(
+        venue=IB_VENUE,
+        update_catalog=True,
+        params={
+            "ib_contracts": (
+                # SPY options
+                {
+                    "secType": "STK",
+                    "symbol": "SPY",
+                    "exchange": "SMART",
+                    "primaryExchange": "ARCA",
+                    "build_options_chain": True,
+                    "min_expiry_days": 7,
+                    "max_expiry_days": 30,
+                },
+                # QQQ options
+                {
+                    "secType": "STK",
+                    "symbol": "QQQ",
+                    "exchange": "SMART",
+                    "primaryExchange": "NASDAQ",
+                    "build_options_chain": True,
+                    "min_expiry_days": 7,
+                    "max_expiry_days": 30,
+                },
+                # ES futures options
+                {
+                    "secType": "CONTFUT",
+                    "exchange": "CME",
+                    "symbol": "ES",
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 60,
+                },
+                # SPX index options
+                {
+                    "secType": "IND",
+                    "symbol": "SPX",
+                    "exchange": "CBOE",
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 5,
+                },
+                # ES futures chain and futures options
+                {
+                    "secType": "CONTFUT",
+                    "exchange": "CME",
+                    "symbol": "ES",
+                    "build_futures_chain": True,
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 2,
+                },
+                # ESTX50 index options (Eurex)
+                {
+                    "secType": "IND",
+                    "exchange": "EUREX",
+                    "symbol": "ESTX50",
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 2,
+                },
+            ),
+        },
+    )
+```
+
+### Retrieving historical bars
 
 ```python
 import datetime
@@ -609,12 +754,12 @@ bars = await client.request_bars(
 )
 ```
 
-### Retrieving Historical Ticks
+### Retrieving historical ticks
 
 ```python
-# Request historical tick data
+# Request historical tick data (use tick_type="TRADES" or "BID_ASK" for quote ticks)
 ticks = await client.request_ticks(
-    tick_types=["TRADES", "BID_ASK"],  # Trade ticks and quote ticks
+    tick_type="TRADES",
     start_date_time=datetime.datetime(2023, 11, 6, 9, 30),
     end_date_time=datetime.datetime(2023, 11, 6, 16, 30),
     tz_name="America/New_York",
@@ -624,25 +769,25 @@ ticks = await client.request_ticks(
 )
 ```
 
-### Bar Specifications
+### Bar specifications
 
 The adapter supports various bar specifications:
 
-#### Time-Based Bars
+#### Time-based bars
 
 - `"1-SECOND-LAST"`, `"5-SECOND-LAST"`, `"10-SECOND-LAST"`, `"15-SECOND-LAST"`, `"30-SECOND-LAST"`
 - `"1-MINUTE-LAST"`, `"2-MINUTE-LAST"`, `"3-MINUTE-LAST"`, `"5-MINUTE-LAST"`, `"10-MINUTE-LAST"`, `"15-MINUTE-LAST"`, `"20-MINUTE-LAST"`, `"30-MINUTE-LAST"`
 - `"1-HOUR-LAST"`, `"2-HOUR-LAST"`, `"3-HOUR-LAST"`, `"4-HOUR-LAST"`, `"8-HOUR-LAST"`
 - `"1-DAY-LAST"`, `"1-WEEK-LAST"`, `"1-MONTH-LAST"`
 
-#### Price Types
+#### Price types
 
 - `LAST` - Last traded price
 - `MID` - Midpoint of bid/ask
 - `BID` - Bid price
 - `ASK` - Ask price
 
-### Complete Example
+### Complete example
 
 ```python
 import asyncio
@@ -685,7 +830,7 @@ async def download_historical_data():
 
     # Request tick data
     ticks = await client.request_ticks(
-        tick_types=["TRADES"],
+        tick_type="TRADES",
         start_date_time=datetime.datetime(2023, 11, 6, 14, 0),
         end_date_time=datetime.datetime(2023, 11, 6, 15, 0),
         tz_name="America/New_York",
@@ -710,7 +855,7 @@ if __name__ == "__main__":
     asyncio.run(download_historical_data())
 ```
 
-### Data Limitations
+### Data limitations
 
 Be aware of Interactive Brokers' historical data limitations:
 
@@ -719,7 +864,7 @@ Be aware of Interactive Brokers' historical data limitations:
 - **Market Data Permissions**: Some data requires specific market data subscriptions
 - **Time Ranges**: Maximum lookback periods vary by bar size and instrument type
 
-### Best Practices
+### Best practices
 
 1. **Use Delayed Data**: For backtesting, `MarketDataTypeEnum.DELAYED_FROZEN` is often sufficient
 2. **Batch Requests**: Group multiple instruments in single requests when possible
@@ -727,11 +872,15 @@ Be aware of Interactive Brokers' historical data limitations:
 4. **Respect Rate Limits**: Add delays between requests to avoid hitting rate limits
 5. **Validate Data**: Always check data quality and completeness before backtesting
 
-## Live Trading
+:::warning
+Interactive Brokers enforces pacing limits; excessive historical-data or order requests trigger pacing violations and IB can disable the API session for several minutes.
+:::
+
+## Live trading
 
 Live trading with Interactive Brokers requires setting up a `TradingNode` that incorporates both `InteractiveBrokersDataClient` and `InteractiveBrokersExecutionClient`. These clients depend on the `InteractiveBrokersInstrumentProvider` for instrument management.
 
-### Architecture Overview
+### Architecture overview
 
 The live trading setup consists of three main components:
 
@@ -739,11 +888,11 @@ The live trading setup consists of three main components:
 2. **DataClient**: Handles real-time market data subscriptions
 3. **ExecutionClient**: Manages orders, positions, and account information
 
-### InstrumentProvider Configuration
+### InstrumentProvider configuration
 
-The `InteractiveBrokersInstrumentProvider` serves as the bridge for accessing financial instrument data from IB. It supports loading individual instruments, options chains, and futures chains.
+The `InteractiveBrokersInstrumentProvider` provides access to financial instrument data from IB. It supports loading individual instruments, options chains, and futures chains.
 
-#### Basic Configuration
+#### Basic configuration
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersInstrumentProviderConfig
@@ -775,7 +924,7 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 )
 ```
 
-#### Advanced Configuration for Derivatives
+#### Advanced configuration for derivatives
 
 ```python
 # Configuration for options and futures chains
@@ -805,7 +954,18 @@ advanced_config = InteractiveBrokersInstrumentProviderConfig(
 )
 ```
 
-### Integration with External Data Providers
+#### Filtering security types
+
+Use `filter_sec_types` to ignore specific IB `secType` values. Any contract whose `secType` matches an entry in this frozenset is skipped with a warning (for example unsupported types such as `WAR` or `IOPT`):
+
+```python
+instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
+    load_ids=frozenset(["SPY.ARCA"]),
+    filter_sec_types=frozenset({"WAR", "IOPT"}),  # Opt out from unsupported asset types
+)
+```
+
+### Integration with external data providers
 
 The Interactive Brokers adapter can be used alongside other data providers for enhanced market data coverage. When using multiple data sources:
 
@@ -813,18 +973,18 @@ The Interactive Brokers adapter can be used alongside other data providers for e
 - Consider using `convert_exchange_to_mic_venue=True` for standardized venue identification
 - Ensure instrument cache management is handled properly to avoid conflicts
 
-### Data Client Configuration
+### Data client configuration
 
 The `InteractiveBrokersDataClient` interfaces with IB for streaming and retrieving real-time market data. Upon connection, it configures the [market data type](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#delayed-market-data) and loads instruments based on the `InteractiveBrokersInstrumentProviderConfig` settings.
 
-#### Supported Data Types
+#### Supported data types
 
 - **Quote Ticks**: Real-time bid/ask prices and sizes
 - **Trade Ticks**: Real-time trade prices and volumes
 - **Bar Data**: Real-time OHLCV bars (1-second to 1-day intervals)
 - **Market Depth**: Level 2 order book data (where available)
 
-#### Market Data Types
+#### Market data types
 
 Interactive Brokers supports several market data types:
 
@@ -833,7 +993,7 @@ Interactive Brokers supports several market data types:
 - `DELAYED_FROZEN`: Delayed data that doesn't update (useful for testing)
 - `FROZEN`: Last known real-time data (when market is closed)
 
-#### Basic Data Client Configuration
+#### Basic data client configuration
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import IBMarketDataTypeEnum
@@ -848,11 +1008,11 @@ data_client_config = InteractiveBrokersDataClientConfig(
     ignore_quote_tick_size_updates=False,  # Include size-only updates
     instrument_provider=instrument_provider_config,
     connection_timeout=300,  # 5 minutes
-    request_timeout=60,      # 1 minute
+    request_timeout_secs=60,      # 1 minute
 )
 ```
 
-#### Advanced Data Client Configuration
+#### Advanced data client configuration
 
 ```python
 # Configuration for production with real-time data
@@ -867,23 +1027,54 @@ production_data_config = InteractiveBrokersDataClientConfig(
     instrument_provider=instrument_provider_config,
     dockerized_gateway=dockerized_gateway_config,  # If using Docker
     connection_timeout=300,
-    request_timeout=60,
+    request_timeout_secs=60,
 )
 ```
 
-#### Configuration Options Explained
+### Data client configuration options
+
+| Option                          | Default                                         | Description |
+|---------------------------------|-------------------------------------------------|-------------|
+| `instrument_provider`           | `InteractiveBrokersInstrumentProviderConfig()`  | Instrument provider settings controlling which contracts load at startup. |
+| `ibg_host`                      | `127.0.0.1`                                     | Hostname or IP for TWS/IB Gateway. |
+| `ibg_port`                      | `None`                                          | Port for TWS/IB Gateway (`7497`/`7496` for TWS, `4002`/`4001` for IBG). |
+| `ibg_client_id`                 | `1`                                             | Unique client identifier used when connecting to TWS/IB Gateway. |
+| `use_regular_trading_hours`     | `True`                                          | Request bars limited to regular trading hours when `True`. |
+| `market_data_type`              | `REALTIME`                                      | Market data feed type (`REALTIME`, `DELAYED`, `DELAYED_FROZEN`, etc.). |
+| `ignore_quote_tick_size_updates`| `False`                                         | Suppress quote ticks where only size changes when `True`. |
+| `handle_revised_bars`           | `False`                                         | When `True`, processes bar revisions from IB (bars can be updated after initial publication). |
+| `dockerized_gateway`            | `None`                                          | Optional `DockerizedIBGatewayConfig` for containerized setups. |
+| `connection_timeout`            | `300`                                           | Seconds to wait for the initial API connection. |
+| `request_timeout_secs`          | `60`                                            | Seconds to wait for historical data requests before timing out. |
+
+#### Notes
 
 - **`use_regular_trading_hours`**: When `True`, only requests data during regular trading hours. Primarily affects bar data for stocks.
 - **`ignore_quote_tick_size_updates`**: When `True`, filters out quote ticks where only the size changed (not price), reducing data volume.
 - **`handle_revised_bars`**: When `True`, processes bar revisions from IB (bars can be updated after initial publication).
 - **`connection_timeout`**: Maximum time to wait for initial connection establishment.
-- **`request_timeout`**: Maximum time to wait for historical data requests.
+- **`request_timeout_secs`**: Maximum time to wait for historical data requests.
 
-### Execution Client Configuration
+### Execution client configuration options
 
-The `InteractiveBrokersExecutionClient` handles trade execution, order management, account information, and position tracking. It provides comprehensive order lifecycle management and real-time account updates.
+| Option                                  | Default                                         | Description |
+|-----------------------------------------|-------------------------------------------------|-------------|
+| `instrument_provider`                   | `InteractiveBrokersInstrumentProviderConfig()`  | Instrument provider settings controlling which contracts load at startup. |
+| `ibg_host`                              | `127.0.0.1`                                     | Hostname or IP for TWS/IB Gateway. |
+| `ibg_port`                              | `None`                                          | Port for TWS/IB Gateway (`7497`/`7496` for TWS, `4002`/`4001` for IBG). |
+| `ibg_client_id`                         | `1`                                             | Unique client identifier used when connecting to TWS/IB Gateway. |
+| `account_id`                            | `None`                                          | Interactive Brokers account identifier (falls back to `TWS_ACCOUNT` env var). |
+| `dockerized_gateway`                    | `None`                                          | Optional `DockerizedIBGatewayConfig` for containerized setups. |
+| `connection_timeout`                    | `300`                                           | Seconds to wait for the initial API connection. |
+| `request_timeout_secs`                  | `60`                                            | Seconds to wait for request responses (contract details, etc.). |
+| `fetch_all_open_orders`                 | `False`                                         | When `True`, pulls open orders for every API client ID (not just this session). |
+| `track_option_exercise_from_position_update` | `False`                                    | Subscribe to real‑time position updates to detect option exercises when `True`. |
 
-#### Supported Functionality
+### Execution client configuration
+
+The `InteractiveBrokersExecutionClient` handles trade execution, order management, account information, and position tracking. It provides order lifecycle management and real-time account updates.
+
+#### Supported functionality
 
 - **Order Management**: Place, modify, and cancel orders
 - **Order Types**: Market, limit, stop, stop-limit, trailing stop, and more
@@ -892,7 +1083,7 @@ The `InteractiveBrokersExecutionClient` handles trade execution, order managemen
 - **Trade Reporting**: Execution reports and fill notifications
 - **Risk Management**: Pre-trade risk checks and position limits
 
-#### Supported Order Types
+#### Supported order types
 
 The adapter supports most Interactive Brokers order types:
 
@@ -907,7 +1098,7 @@ The adapter supports most Interactive Brokers order types:
 - **Market-on-Close**: `OrderType.MARKET` with `TimeInForce.AT_THE_CLOSE`
 - **Limit-on-Close**: `OrderType.LIMIT` with `TimeInForce.AT_THE_CLOSE`
 
-#### Time-in-Force Options
+#### Time in force options
 
 - **Day Orders**: `TimeInForce.DAY`
 - **Good-Till-Canceled**: `TimeInForce.GTC`
@@ -917,7 +1108,42 @@ The adapter supports most Interactive Brokers order types:
 - **At-the-Open**: `TimeInForce.AT_THE_OPEN`
 - **At-the-Close**: `TimeInForce.AT_THE_CLOSE`
 
-#### Basic Execution Client Configuration
+#### Batch operations
+
+| Operation          | Supported | Notes                                        |
+|--------------------|-----------|----------------------------------------------|
+| Batch Submit       | ✓         | Submit multiple orders in single request.    |
+| Batch Modify       | ✓         | Modify multiple orders in single request.    |
+| Batch Cancel       | ✓         | Cancel multiple orders in single request.    |
+
+#### Position management
+
+| Feature              | Supported | Notes                                        |
+|--------------------|-----------|----------------------------------------------|
+| Query positions     | ✓         | Real‑time position updates.                  |
+| Position mode       | ✓         | Net vs separate long/short positions.       |
+| Leverage control    | ✓         | Account‑level margin requirements.          |
+| Margin mode         | ✓         | Portfolio vs individual margin.             |
+
+#### Order querying
+
+| Feature              | Supported | Notes                                        |
+|--------------------|-----------|----------------------------------------------|
+| Query open orders   | ✓         | List all active orders.                      |
+| Query order history | ✓         | Historical order data.                       |
+| Order status updates| ✓         | Real‑time order state changes.              |
+| Trade history       | ✓         | Execution and fill reports.                 |
+
+#### Contingent orders
+
+| Feature              | Supported | Notes                                        |
+|--------------------|-----------|----------------------------------------------|
+| Order lists         | ✓         | Atomic multi‑order submission.               |
+| OCO orders          | ✓         | One‑Cancels‑Other with customizable OCA types (1, 2, 3). |
+| Bracket orders      | ✓         | Parent‑child order relationships. |
+| Conditional orders  | ✓         | Advanced order conditions and triggers.     |
+
+#### Basic execution client configuration
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersExecClientConfig
@@ -934,7 +1160,7 @@ exec_client_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
-#### Advanced Execution Client Configuration
+#### Advanced execution client configuration
 
 ```python
 # Production configuration with dockerized gateway
@@ -950,7 +1176,7 @@ production_exec_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
-#### Account ID Configuration
+#### Account ID configuration
 
 The `account_id` parameter is crucial and must match the account logged into TWS/Gateway:
 
@@ -970,7 +1196,7 @@ exec_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
-#### Order Tags and Advanced Features
+#### Order tags and advanced features
 
 The adapter supports IB-specific order parameters through order tags:
 
@@ -987,14 +1213,321 @@ order_tags = IBOrderTags(
     goodAfterTime="20240315 09:35:00 EST",    # Good after time
 )
 
-# Apply tags to order (implementation depends on your strategy code)
+# Apply tags to an order
+order = order_factory.limit(
+    instrument_id=instrument.id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(100),
+    price=instrument.make_price(100.0),
+    tags=[order_tags.value],
+)
 ```
 
-### Complete Trading Node Configuration
+#### OCA (one-cancels-all) orders
 
-Setting up a complete trading environment involves configuring a `TradingNodeConfig` with all necessary components. Here are comprehensive examples for different scenarios.
+The adapter provides support for OCA orders through explicit configuration using `IBOrderTags`:
 
-#### Paper Trading Configuration
+### Basic OCA configuration
+
+All OCA functionality must be explicitly configured using `IBOrderTags`:
+
+```python
+from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
+
+# Create OCA configuration
+oca_tags = IBOrderTags(
+    ocaGroup="MY_OCA_GROUP",
+    ocaType=1,  # Type 1: Cancel All with Block (recommended)
+)
+
+# Apply to bracket orders
+bracket_order = order_factory.bracket(
+    instrument_id=instrument.id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(100),
+    tp_price=instrument.make_price(110.0),
+    sl_trigger_price=instrument.make_price(90.0),
+    tp_tags=[oca_tags.value],  # Must explicitly add OCA tags
+    sl_tags=[oca_tags.value],  # Must explicitly add OCA tags
+)
+```
+
+### Advanced OCA configuration
+
+You can specify different OCA types and behaviors using `IBOrderTags`:
+
+```python
+from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
+
+# Create custom OCA configuration
+custom_oca_tags = IBOrderTags(
+    ocaGroup="MY_CUSTOM_GROUP",
+    ocaType=2,  # Use Type 2: Reduce with Block
+)
+
+# Apply to individual orders
+order = order_factory.limit(
+    instrument_id=instrument.id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(100),
+    price=instrument.make_price(100.0),
+    tags=[custom_oca_tags.value],
+)
+```
+
+### OCA types
+
+Interactive Brokers supports three OCA types:
+
+| Type | Name | Behavior | Use Case |
+|------|------|----------|----------|
+| **1** | Cancel All with Block | Cancel all remaining orders with block protection | **Default** - Safest option, prevents overfills |
+| **2** | Reduce with Block | Proportionally reduce remaining orders with block protection | Partial fills with overfill protection |
+| **3** | Reduce without Block | Proportionally reduce remaining orders without block protection | Fastest execution, higher overfill risk |
+
+#### Multiple orders in same OCA group
+
+```python
+# Create multiple orders with the same OCA group
+oca_tags = IBOrderTags(
+    ocaGroup="MULTI_ORDER_GROUP",
+    ocaType=3,  # Use Type 3: Reduce without Block
+)
+
+order1 = order_factory.limit(
+    instrument_id=instrument.id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(50),
+    price=instrument.make_price(99.0),
+    tags=[oca_tags.value],
+)
+
+order2 = order_factory.limit(
+    instrument_id=instrument.id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(50),
+    price=instrument.make_price(101.0),
+    tags=[oca_tags.value],
+)
+```
+
+### OCA configuration requirements
+
+OCA functionality is **only** available through explicit configuration:
+
+1. **IBOrderTags Required** - OCA settings must be explicitly specified in order tags
+2. **No Automatic Detection** - `ContingencyType.OCO` and `ContingencyType.OUO` do not automatically create OCA groups
+3. **Manual Configuration** - All OCA groups and types must be manually specified
+
+### Conditional orders
+
+The adapter supports Interactive Brokers conditional orders through the `conditions` parameter in `IBOrderTags`. Conditional orders allow you to specify criteria that must be met before an order is transmitted or cancelled.
+
+#### Supported condition types
+
+- **Price Conditions**: Trigger based on price movements of a specific instrument
+- **Time Conditions**: Trigger at a specific date and time
+- **Volume Conditions**: Trigger based on trading volume thresholds
+- **Execution Conditions**: Trigger when trades occur for a specific instrument
+- **Margin Conditions**: Trigger based on account margin levels
+- **Percent Change Conditions**: Trigger based on percentage price changes
+
+#### Basic conditional order example
+
+```python
+from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
+
+# Create a price condition: trigger when SPY goes above $250
+price_condition = {
+    "type": "price",
+    "conId": 265598,  # SPY contract ID
+    "exchange": "SMART",
+    "isMore": True,  # Trigger when price is greater than threshold
+    "price": 250.00,
+    "triggerMethod": 0,  # Default trigger method
+    "conjunction": "and",
+}
+
+# Create order tags with condition
+order_tags = IBOrderTags(
+    conditions=[price_condition],
+    conditionsCancelOrder=False,  # Transmit order when condition is met
+)
+
+# Apply to order
+order = order_factory.limit(
+    instrument_id=instrument.id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(100),
+    price=instrument.make_price(251.00),
+    tags=[order_tags.value],
+)
+```
+
+#### Multiple conditions with logic
+
+```python
+# Create multiple conditions with AND/OR logic
+conditions = [
+    {
+        "type": "price",
+        "conId": 265598,
+        "exchange": "SMART",
+        "isMore": True,
+        "price": 250.00,
+        "triggerMethod": 0,
+        "conjunction": "and",  # AND with next condition
+    },
+    {
+        "type": "time",
+        "time": "20250315-09:30:00",
+        "isMore": True,
+        "conjunction": "or",  # OR with next condition
+    },
+    {
+        "type": "volume",
+        "conId": 265598,
+        "exchange": "SMART",
+        "isMore": True,
+        "volume": 10000000,
+        "conjunction": "and",
+    },
+]
+
+order_tags = IBOrderTags(
+    conditions=conditions,
+    conditionsCancelOrder=False,
+)
+```
+
+#### Condition parameters
+
+**Price Condition:**
+
+- `conId`: Contract ID of the instrument to monitor
+- `exchange`: Exchange to monitor (e.g., "SMART", "NASDAQ")
+- `isMore`: True for >=, False for <=
+- `price`: Price threshold
+- `triggerMethod`: 0=Default, 1=DoubleBidAsk, 2=Last, 3=DoubleLast, 4=BidAsk, 7=LastBidAsk, 8=MidPoint
+
+**Time Condition:**
+
+- `time`: Time string in UTC format "YYYYMMDD-HH:MM:SS" (e.g., "20250315-09:30:00")
+- `isMore`: True for after time, False for before time
+
+**Volume Condition:**
+
+- `conId`: Contract ID of the instrument to monitor
+- `exchange`: Exchange to monitor
+- `isMore`: True for >=, False for <=
+- `volume`: Volume threshold
+
+**Execution Condition:**
+
+- `symbol`: Symbol to monitor for trades
+- `secType`: Security type (e.g., "STK", "OPT", "FUT")
+- `exchange`: Exchange to monitor
+
+**Margin Condition:**
+
+- `percent`: Margin cushion percentage threshold
+- `isMore`: True for >=, False for <=
+
+**Percent Change Condition:**
+
+- `conId`: Contract ID of the instrument to monitor
+- `exchange`: Exchange to monitor
+- `isMore`: True for >=, False for <=
+- `changePercent`: Percentage change threshold
+
+#### Complete example: all condition types
+
+```python
+# Example showing all 6 supported condition types
+from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
+
+# 1. Price Condition - trigger when ES futures > 6000
+price_condition = {
+    "type": "price",
+    "conId": 495512563,  # ES futures contract ID
+    "exchange": "CME",
+    "isMore": True,
+    "price": 6000.0,
+    "triggerMethod": 0,
+    "conjunction": "and",
+}
+
+# 2. Time Condition - trigger at specific time
+time_condition = {
+    "type": "time",
+    "time": "20250315-09:30:00",  # UTC format
+    "isMore": True,
+    "conjunction": "and",
+}
+
+# 3. Volume Condition - trigger when volume > 100,000
+volume_condition = {
+    "type": "volume",
+    "conId": 495512563,
+    "exchange": "CME",
+    "isMore": True,
+    "volume": 100000,
+    "conjunction": "and",
+}
+
+# 4. Execution Condition - trigger when SPY trades
+execution_condition = {
+    "type": "execution",
+    "symbol": "SPY",
+    "secType": "STK",
+    "exchange": "SMART",
+    "conjunction": "and",
+}
+
+# 5. Margin Condition - trigger when margin cushion > 75%
+margin_condition = {
+    "type": "margin",
+    "percent": 75,
+    "isMore": True,
+    "conjunction": "and",
+}
+
+# 6. Percent Change Condition - trigger when price changes > 5%
+percent_change_condition = {
+    "type": "percent_change",
+    "conId": 495512563,
+    "exchange": "CME",
+    "changePercent": 5.0,
+    "isMore": True,
+    "conjunction": "and",
+}
+
+# Use any combination of conditions
+order_tags = IBOrderTags(
+    conditions=[price_condition, time_condition],  # Multiple conditions
+    conditionsCancelOrder=False,  # Transmit when conditions met
+)
+```
+
+#### Order behavior
+
+Set `conditionsCancelOrder` to control what happens when conditions are met:
+
+- `False`: Transmit the order when conditions are satisfied
+- `True`: Cancel the order when conditions are satisfied
+
+#### Implementation notes
+
+- **All 6 condition types are fully supported** and tested with live Interactive Brokers orders
+- **Price conditions** work correctly despite a known bug in the ibapi library where `PriceCondition.__str__` is incorrectly decorated as a property
+- **Time conditions** use UTC format with dash separator (`YYYYMMDD-HH:MM:SS`) for reliable parsing
+- **Conjunction logic** allows complex condition combinations using "and"/"or" operators
+
+### Complete trading node configuration
+
+Setting up a complete trading environment involves configuring a `TradingNodeConfig` with all necessary components. Here are examples for different scenarios.
+
+#### Paper trading configuration
 
 ```python
 import os
@@ -1068,7 +1601,6 @@ node = TradingNode(config=config_node)
 node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
 node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
 node.build()
-node.portfolio.set_specific_venue(IB_VENUE)
 
 if __name__ == "__main__":
     try:
@@ -1077,7 +1609,7 @@ if __name__ == "__main__":
         node.dispose()
 ```
 
-#### Live Trading with Dockerized Gateway
+## Live trading with Dockerized gateway
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import DockerizedIBGatewayConfig
@@ -1122,7 +1654,7 @@ config_node = TradingNodeConfig(
 )
 ```
 
-#### Multi-Client Configuration
+### Multi-client configuration
 
 For advanced setups, you can configure multiple clients with different purposes:
 
@@ -1146,7 +1678,186 @@ exec_client_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
-### Running the Trading Node
+### Multiple IB execution clients for different accounts
+
+NautilusTrader supports using multiple Interactive Brokers execution clients simultaneously, each connected to a different IB account. This is useful when you need to trade with multiple accounts, such as:
+
+- Separate accounts for different strategies
+- Paper trading and live trading accounts running simultaneously
+- Multiple managed accounts under the same IB login
+
+To configure multiple IB execution clients, provide multiple entries in the `exec_clients` dictionary with unique keys. Each entry specifies a different `account_id`:
+
+```python
+from nautilus_trader.adapters.interactive_brokers.config import (
+    InteractiveBrokersDataClientConfig,
+    InteractiveBrokersExecClientConfig,
+    InteractiveBrokersInstrumentProviderConfig,
+    SymbologyMethod,
+    IBMarketDataTypeEnum,
+)
+from nautilus_trader.live.config import TradingNodeConfig, RoutingConfig, LoggingConfig
+from nautilus_trader.model.identifiers import AccountId, Venue, ClientId
+
+# Shared instrument provider configuration
+instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
+    symbology_method=SymbologyMethod.IB_SIMPLIFIED,
+)
+
+# Data client (shared across all accounts)
+data_client_config = InteractiveBrokersDataClientConfig(
+    ibg_host="127.0.0.1",
+    ibg_port=7497,
+    ibg_client_id=1,
+    market_data_type=IBMarketDataTypeEnum.REALTIME,
+    instrument_provider=instrument_provider_config,
+)
+
+# Configuration for multiple IB execution clients
+config_node = TradingNodeConfig(
+    trader_id="MULTI-ACCOUNT-001",
+    logging=LoggingConfig(log_level="INFO"),
+
+    # Single data client shared across accounts
+    data_clients={
+        "IB": data_client_config,
+    },
+
+    # Multiple execution clients, one per account
+    exec_clients={
+        # First account: Paper trading account
+        "IB-PAPER": InteractiveBrokersExecClientConfig(
+            ibg_host="127.0.0.1",
+            ibg_port=7497,
+            ibg_client_id=2,  # Unique IB API client ID
+            account_id="DU123456",  # Paper trading account ID
+            instrument_provider=instrument_provider_config,
+            routing=RoutingConfig(default=False),  # Not default
+        ),
+
+        # Second account: Live trading account
+        "IB-LIVE": InteractiveBrokersExecClientConfig(
+            ibg_host="127.0.0.1",
+            ibg_port=7497,
+            ibg_client_id=3,  # Unique IB API client ID
+            account_id="U987654",  # Live account ID
+            instrument_provider=instrument_provider_config,
+            routing=RoutingConfig(default=True),  # Set as default
+        ),
+
+        # Third account: Another managed account
+        "IB-ACCOUNT3": InteractiveBrokersExecClientConfig(
+            ibg_host="127.0.0.1",
+            ibg_port=7497,
+            ibg_client_id=4,  # Unique IB API client ID
+            account_id="U456789",  # Another account ID
+            instrument_provider=instrument_provider_config,
+            routing=RoutingConfig(default=False),
+        ),
+    },
+)
+```
+
+**Key points for multiple IB execution clients:**
+
+1. **Unique keys**: Each entry in `exec_clients` must have a unique key (e.g., `"IB-PAPER"`, `"IB-LIVE"`). This key becomes the `account_issuer` for that client.
+
+2. **Unique client IDs**: Each execution client must use a different `ibg_client_id` (2, 3, 4, etc.). IB Gateway/TWS requires each API connection to use a unique client ID.
+
+3. **Account ID**: Each execution client must specify a different `account_id` matching the account logged into IB Gateway/TWS.
+
+4. **Account identifiers**: The system creates `AccountId` instances like:
+   - `AccountId("IB-PAPER-DU123456")`
+   - `AccountId("IB-LIVE-U987654")`
+   - `AccountId("IB-ACCOUNT3-U456789")`
+
+5. **Routing**: Orders and queries are automatically routed to the correct execution client based on:
+   - Explicit `client_id` in the command
+   - `account_id` issuer (for `QueryAccount` commands or orders with account_id set)
+   - Default client (if one is marked with `routing=RoutingConfig(default=True)`)
+
+6. **Portfolio queries**: When querying portfolio properties, you can specify either:
+   - `account_id` for account-specific queries: `portfolio.realized_pnls(account_id=AccountId("IB-PAPER-DU123456"))`
+   - `venue` for aggregated queries across all accounts with that venue: `portfolio.realized_pnls(venue=Venue("IB-PAPER"))`
+
+**Example: Using multiple IB execution clients in a strategy:**
+
+```python
+from nautilus_trader.model.identifiers import AccountId, ClientId
+from nautilus_trader.trading.strategy import Strategy
+
+class MultiAccountStrategy(Strategy):
+    """Example strategy using multiple IB accounts."""
+
+    def on_start(self):
+        # Define account IDs for easy reference
+        self.paper_account = AccountId("IB-PAPER-DU123456")
+        self.live_account = AccountId("IB-LIVE-U987654")
+
+        # Query paper account balance
+        paper_account_state = self.cache.account(self.paper_account)
+        if paper_account_state:
+            self.log.info(f"Paper account balance: {paper_account_state.balance_total()}")
+
+        # Query live account balance
+        live_account_state = self.cache.account(self.live_account)
+        if live_account_state:
+            self.log.info(f"Live account balance: {live_account_state.balance_total()}")
+
+    def submit_order_to_paper(self, order):
+        """Submit order to paper trading account."""
+        self.submit_order(order, client_id=ClientId("IB-PAPER"))
+
+    def submit_order_to_live(self, order):
+        """Submit order to live trading account."""
+        self.submit_order(order, client_id=ClientId("IB-LIVE"))
+
+    def check_paper_pnl(self, instrument_id):
+        """Check realized PnL for paper account."""
+        pnl = self.portfolio.realized_pnl(
+            instrument_id=instrument_id,
+            account_id=self.paper_account
+        )
+        return pnl
+
+    def check_live_pnl(self, instrument_id):
+        """Check realized PnL for live account."""
+        pnl = self.portfolio.realized_pnl(
+            instrument_id=instrument_id,
+            account_id=self.live_account
+        )
+        return pnl
+```
+
+**Example: Querying account information with multiple IB clients:**
+
+```python
+from nautilus_trader.model.identifiers import AccountId
+
+# Query specific account
+paper_account = cache.account(AccountId("IB-PAPER-DU123456"))
+live_account = cache.account(AccountId("IB-LIVE-U987654"))
+
+# Query account using account_id (preferred method)
+paper_account_by_id = cache.account(AccountId("IB-PAPER-DU123456"))
+
+# Alternative: Query account using account_id parameter (also works)
+paper_account_via_account_id = cache.account_for_venue(
+    account_id=AccountId("IB-PAPER-DU123456")
+)
+
+# Query portfolio properties by account
+paper_realized_pnl = portfolio.realized_pnl(
+    instrument_id=instrument_id,
+    account_id=AccountId("IB-PAPER-DU123456")
+)
+
+# Query portfolio properties aggregated across all IB accounts
+# Note: This aggregates across all accounts with the same venue
+all_ib_realized_pnl = portfolio.realized_pnls(venue=Venue("IB"))
+```
+
+### Running the trading node
 
 ```python
 def run_trading_node():
@@ -1158,9 +1869,6 @@ def run_trading_node():
         node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
         node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
         node.build()
-
-        # Set venue for portfolio
-        node.portfolio.set_specific_venue(IB_VENUE)
 
         # Add your strategies here
         # node.trader.add_strategy(YourStrategy())
@@ -1180,9 +1888,9 @@ if __name__ == "__main__":
     run_trading_node()
 ```
 
-### Additional Configuration Options
+### Additional configuration options
 
-#### Environment Variables
+#### Environment variables
 
 Set these environment variables for easier configuration:
 
@@ -1193,7 +1901,7 @@ export TWS_ACCOUNT="your_account_id"
 export IB_MAX_CONNECTION_ATTEMPTS="5"  # Optional: limit reconnection attempts
 ```
 
-#### Logging Configuration
+#### Logging configuration
 
 ```python
 # Enhanced logging configuration
@@ -1213,30 +1921,30 @@ You can find additional examples here: <https://github.com/nautechsystems/nautil
 
 ## Troubleshooting
 
-### Common Connection Issues
+### Common connection issues
 
-#### Connection Refused
+#### Connection refused
 
 - **Cause**: TWS/Gateway not running or wrong port
 - **Solution**: Verify TWS/Gateway is running and check port configuration
 - **Default Ports**: TWS (7497/7496), IB Gateway (4002/4001)
 
-#### Authentication Errors
+#### Authentication errors
 
 - **Cause**: Incorrect credentials or account not logged in
 - **Solution**: Verify username/password and ensure account is logged into TWS/Gateway
 
-#### Client ID Conflicts
+#### Client ID conflicts
 
 - **Cause**: Multiple clients using the same client ID
 - **Solution**: Use unique client IDs for each connection
 
-#### Market Data Permissions
+#### Market data permissions
 
 - **Cause**: Insufficient market data subscriptions
 - **Solution**: Use `IBMarketDataTypeEnum.DELAYED_FROZEN` for testing or subscribe to required data feeds
 
-### Error Codes
+### Error codes
 
 Interactive Brokers uses specific error codes. Common ones include:
 
@@ -1248,9 +1956,9 @@ Interactive Brokers uses specific error codes. Common ones include:
 - **2104**: Market data farm connection is OK
 - **2106**: HMDS data farm connection is OK
 
-### Performance Optimization
+### Performance optimization
 
-#### Reduce Data Volume
+#### Reduce data volume
 
 ```python
 # Reduce quote tick volume by ignoring size-only updates
@@ -1260,24 +1968,24 @@ data_config = InteractiveBrokersDataClientConfig(
 )
 ```
 
-#### Connection Management
+#### Connection management
 
 ```python
 # Set reasonable timeouts
 config = InteractiveBrokersDataClientConfig(
     connection_timeout=300,  # 5 minutes
-    request_timeout=60,      # 1 minute
+    request_timeout_secs=60,      # 1 minute
     # ... other config
 )
 ```
 
-#### Memory Management
+#### Memory management
 
 - Use appropriate bar sizes for your strategy
 - Limit the number of simultaneous subscriptions
 - Consider using historical data for backtesting instead of live data
 
-### Best Practices
+### Best practices
 
 #### Security
 
@@ -1286,7 +1994,7 @@ config = InteractiveBrokersDataClientConfig(
 - Use paper trading for development and testing
 - Set `read_only_api=True` for data-only applications
 
-#### Development Workflow
+#### Development workflow
 
 1. **Start with Paper Trading**: Always test with paper trading first
 2. **Use Delayed Data**: Use `DELAYED_FROZEN` market data for development
@@ -1294,7 +2002,7 @@ config = InteractiveBrokersDataClientConfig(
 4. **Monitor Logs**: Enable appropriate logging levels for debugging
 5. **Test Reconnection**: Test your strategy's behavior during connection interruptions
 
-#### Production Deployment
+#### Production deployment
 
 - Use dockerized gateway for automated deployments
 - Implement proper monitoring and alerting
@@ -1302,7 +2010,7 @@ config = InteractiveBrokersDataClientConfig(
 - Use real-time data subscriptions only when necessary
 - Implement circuit breakers and position limits
 
-#### Order Management
+#### Order management
 
 - Always validate orders before submission
 - Implement proper position sizing
@@ -1310,9 +2018,9 @@ config = InteractiveBrokersDataClientConfig(
 - Monitor order status and handle rejections
 - Implement timeout handling for order operations
 
-### Debugging Tips
+### Debugging tips
 
-#### Enable Debug Logging
+#### Enable debug logging
 
 ```python
 logging_config = LoggingConfig(
@@ -1323,7 +2031,7 @@ logging_config = LoggingConfig(
 )
 ```
 
-#### Monitor Connection Status
+#### Monitor connection status
 
 ```python
 # Check connection status in your strategy
@@ -1331,7 +2039,7 @@ if not self.data_client.is_connected:
     self.log.warning("Data client disconnected")
 ```
 
-#### Validate Instruments
+#### Validate instruments
 
 ```python
 # Ensure instruments are loaded before trading
@@ -1340,9 +2048,16 @@ if not instruments:
     self.log.error("No instruments loaded")
 ```
 
-### Support and Resources
+### Support and resources
 
 - **IB API Documentation**: [TWS API Guide](https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/)
 - **NautilusTrader Examples**: [GitHub Examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/interactive_brokers)
 - **IB Contract Search**: [Contract Information Center](https://pennies.interactivebrokers.com/cstools/contract_info/)
-- **Market Data Subscriptions**: [IB Market Data](https://www.interactivebrokers.com/en/trading/market-data.php)
+- **Market Data Subscriptions**: [IB Market Data](https://www.interactivebrokers.com/en/pricing/market-data-pricing.php)
+
+## Contributing
+
+:::info
+For additional features or to contribute to the Interactive Brokers adapter, please see our
+[contributing guide](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md).
+:::

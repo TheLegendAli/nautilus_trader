@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,13 +14,18 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 
-from nautilus_trader.backtest.exchange import SimulatedExchange
+from nautilus_trader.backtest.engine import SimulatedExchange
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.model.data import InstrumentClose
+from nautilus_trader.model.data import InstrumentStatus
 from nautilus_trader.model.data import QuoteTick
+from nautilus_trader.model.enums import InstrumentCloseType
+from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderCanceled
 from nautilus_trader.model.events import OrderFilled
@@ -29,13 +34,13 @@ from nautilus_trader.model.events import OrderPendingUpdate
 from nautilus_trader.model.events import OrderSubmitted
 from nautilus_trader.model.events import OrderUpdated
 from nautilus_trader.model.identifiers import ClientOrderId
-from nautilus_trader.model.identifiers import StrategyId
-from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.orders.list import OrderList
 from nautilus_trader.test_kit.stubs.commands import TestCommandStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 
 def _make_quote_tick(instrument):
@@ -50,7 +55,30 @@ def _make_quote_tick(instrument):
     )
 
 
-@pytest.mark.asyncio()
+def _make_equity_with_increment(instrument: Equity, price_increment: str) -> Equity:
+    info = instrument.info.copy() if isinstance(instrument.info, dict) else instrument.info
+    return Equity(
+        instrument_id=instrument.id,
+        raw_symbol=instrument.raw_symbol,
+        currency=instrument.quote_currency,
+        price_precision=instrument.price_precision,
+        price_increment=Price.from_str(price_increment),
+        lot_size=instrument.lot_size,
+        ts_event=instrument.ts_event + 1,
+        ts_init=instrument.ts_init + 1,
+        max_quantity=instrument.max_quantity,
+        min_quantity=instrument.min_quantity,
+        margin_init=instrument.margin_init,
+        margin_maint=instrument.margin_maint,
+        maker_fee=instrument.maker_fee,
+        taker_fee=instrument.taker_fee,
+        isin=instrument.isin,
+        tick_scheme_name=instrument.tick_scheme_name,
+        info=info,
+    )
+
+
+@pytest.mark.asyncio
 async def test_connect(exec_client):
     exec_client.connect()
     await asyncio.sleep(0)
@@ -58,7 +86,23 @@ async def test_connect(exec_client):
     assert exec_client.is_connected
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
+async def test_generate_mass_status_has_account_id(exec_client):
+    # Arrange
+    exec_client.connect()
+    await asyncio.sleep(0)
+
+    # Act
+    mass_status = await exec_client.generate_mass_status()
+
+    # Assert
+    assert mass_status is not None
+    assert mass_status.account_id is not None
+    assert mass_status.account_id.value == "SANDBOX-001"
+    mass_status.to_pyo3()  # Would raise AttributeError if account_id was None
+
+
+@pytest.mark.asyncio
 async def test_submit_order_success(exec_client, instrument, strategy, events):
     # Arrange
     exec_client.connect()
@@ -70,14 +114,14 @@ async def test_submit_order_success(exec_client, instrument, strategy, events):
 
     # Assert
     print(events)
-    _, submitted, _, accepted, filled, _, _ = events
+    _, submitted, accepted, filled, _ = events
     assert isinstance(submitted, OrderSubmitted)
     assert isinstance(accepted, OrderAccepted)
     assert isinstance(filled, OrderFilled)
     assert accepted.venue_order_id.value.startswith("SANDBOX-")
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 async def test_submit_orders_list_success(
     exec_client,
     instrument,
@@ -87,8 +131,8 @@ async def test_submit_orders_list_success(
     # Arrange
     exec_client.connect()
     factory = OrderFactory(
-        trader_id=TraderId("TESTER-000"),
-        strategy_id=StrategyId("S-001"),
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
         clock=TestClock(),
     )
     first_order = TestExecStubs.limit_order(
@@ -115,15 +159,11 @@ async def test_submit_orders_list_success(
         _,  # second initialized
         first_submitted,
         second_submitted,
-        _,  # account state
         first_accepted,
-        _,  # account state
         second_accepted,
         first_filled,
-        _,  # account state
         _,  # position opened
         second_filled,
-        _,  # account state
         _,  # position changed
     ) = events
     assert isinstance(first_submitted, OrderSubmitted)
@@ -136,7 +176,7 @@ async def test_submit_orders_list_success(
     assert second_accepted.venue_order_id.value.startswith("SANDBOX-")
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 async def test_modify_order_success(exec_client, strategy, instrument, events):
     # Arrange
     exec_client.connect()
@@ -156,13 +196,13 @@ async def test_modify_order_success(exec_client, strategy, instrument, events):
     exec_client.on_data(_make_quote_tick(instrument))
 
     # Assert
-    initialised, submitted, _, accepted, pending_update, _, updated = events
+    initialised, submitted, accepted, pending_update, updated = events
     assert isinstance(pending_update, OrderPendingUpdate)
     assert isinstance(updated, OrderUpdated)
     assert updated.price == Price.from_str("0.01")
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 async def test_modify_order_error_no_venue_id(exec_client, strategy, instrument):
     # Arrange
     exec_client.connect()
@@ -189,7 +229,7 @@ async def test_modify_order_error_no_venue_id(exec_client, strategy, instrument)
     assert client_order_id not in order_client_ids
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 async def test_cancel_order_success(exec_client, cache, strategy, instrument, events):
     # Arrange
     exec_client.connect()
@@ -205,12 +245,12 @@ async def test_cancel_order_success(exec_client, cache, strategy, instrument, ev
     exec_client.on_data(_make_quote_tick(instrument))
 
     # Assert
-    _, _, _, _, pending_cancel, _, cancelled = events
+    _, _, _, pending_cancel, cancelled = events
     assert isinstance(pending_cancel, OrderPendingCancel)
     assert isinstance(cancelled, OrderCanceled)
 
 
-@pytest.mark.asyncio()
+@pytest.mark.asyncio
 async def test_cancel_order_fail(exec_client, cache, strategy, instrument, events):
     # Arrange
     exec_client.connect()
@@ -235,3 +275,66 @@ async def test_cancel_order_fail(exec_client, cache, strategy, instrument, event
     assert client_order_id not in client_order_ids
     venue_order_ids = [o.venue_order_id for o in strategy.cache.orders()]
     assert venue_order_id not in venue_order_ids
+
+
+@pytest.mark.asyncio
+async def test_on_data_updates_exchange_instrument(exec_client, instrument):
+    # Arrange
+    exec_client.connect()
+    matching_engine = exec_client.exchange.get_matching_engine(instrument.id)
+    assert matching_engine is not None
+    updated_instrument = _make_equity_with_increment(instrument, "0.02")
+
+    # Act
+    exec_client.on_data(updated_instrument)
+
+    # Assert
+    assert matching_engine.instrument.price_increment == Price.from_str("0.02")
+    assert matching_engine.instrument.ts_init == updated_instrument.ts_init
+
+
+@pytest.mark.asyncio
+async def test_on_data_forwards_instrument_status(exec_client, instrument):
+    # Arrange
+    exec_client.connect()
+    mock_exchange = MagicMock(spec=SimulatedExchange)
+    mock_exchange.process_instrument_status = MagicMock()
+    mock_exchange.process = MagicMock()
+    exec_client.exchange = mock_exchange
+    status = InstrumentStatus(
+        instrument_id=instrument.id,
+        action=MarketStatusAction.TRADING,
+        ts_event=1,
+        ts_init=1,
+    )
+
+    # Act
+    exec_client.on_data(status)
+
+    # Assert
+    mock_exchange.process_instrument_status.assert_called_once_with(status)
+    mock_exchange.process.assert_called_once_with(status.ts_init)
+
+
+@pytest.mark.asyncio
+async def test_on_data_forwards_instrument_close(exec_client, instrument):
+    # Arrange
+    exec_client.connect()
+    mock_exchange = MagicMock(spec=SimulatedExchange)
+    mock_exchange.process_instrument_close = MagicMock()
+    mock_exchange.process = MagicMock()
+    exec_client.exchange = mock_exchange
+    close = InstrumentClose(
+        instrument_id=instrument.id,
+        close_price=Price.from_str("123.45"),
+        close_type=InstrumentCloseType.CONTRACT_EXPIRED,
+        ts_event=1,
+        ts_init=1,
+    )
+
+    # Act
+    exec_client.on_data(close)
+
+    # Assert
+    mock_exchange.process_instrument_close.assert_called_once_with(close)
+    mock_exchange.process.assert_called_once_with(close.ts_init)

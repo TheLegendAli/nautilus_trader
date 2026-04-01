@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -26,7 +26,10 @@ use nautilus_core::{
         serialization::{from_dict_pyo3, to_dict_pyo3},
         to_pyvalue_err,
     },
-    serialization::Serializable,
+    serialization::{
+        Serializable,
+        msgpack::{FromMsgPack, ToMsgPack},
+    },
 };
 use pyo3::{
     IntoPyObjectExt,
@@ -72,40 +75,26 @@ impl MarkPriceUpdate {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MarkPriceUpdate {
+    /// Represents a mark price update.
     #[new]
-    fn py_new(
-        instrument_id: InstrumentId,
-        value: Price,
-        ts_event: u64,
-        ts_init: u64,
-    ) -> PyResult<Self> {
-        Ok(Self::new(
-            instrument_id,
-            value,
-            ts_event.into(),
-            ts_init.into(),
-        ))
+    fn py_new(instrument_id: InstrumentId, value: Price, ts_event: u64, ts_init: u64) -> Self {
+        Self::new(instrument_id, value, ts_event.into(), ts_init.into())
     }
 
     fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
+        let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
         let binding = py_tuple.get_item(0)?;
-        let instrument_id_str = binding.downcast::<PyString>()?.extract::<&str>()?;
+        let instrument_id_str = binding.cast::<PyString>()?.extract::<&str>()?;
         let value_raw = py_tuple
             .get_item(1)?
-            .downcast::<PyInt>()?
+            .cast::<PyInt>()?
             .extract::<PriceRaw>()?;
-        let value_prec = py_tuple.get_item(2)?.downcast::<PyInt>()?.extract::<u8>()?;
+        let value_prec = py_tuple.get_item(2)?.cast::<PyInt>()?.extract::<u8>()?;
 
-        let ts_event = py_tuple
-            .get_item(7)?
-            .downcast::<PyInt>()?
-            .extract::<u64>()?;
-        let ts_init = py_tuple
-            .get_item(8)?
-            .downcast::<PyInt>()?
-            .extract::<u64>()?;
+        let ts_event = py_tuple.get_item(3)?.cast::<PyInt>()?.extract::<u64>()?;
+        let ts_init = py_tuple.get_item(4)?.cast::<PyInt>()?.extract::<u64>()?;
 
         self.instrument_id = InstrumentId::from_str(instrument_id_str).map_err(to_pyvalue_err)?;
         self.value = Price::from_raw(value_raw, value_prec);
@@ -115,7 +104,7 @@ impl MarkPriceUpdate {
         Ok(())
     }
 
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
         (
             self.instrument_id.to_string(),
             self.value.raw,
@@ -126,7 +115,7 @@ impl MarkPriceUpdate {
             .into_py_any(py)
     }
 
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
         let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
         let state = self.__getstate__(py)?;
         (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
@@ -194,15 +183,17 @@ impl MarkPriceUpdate {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(MarkPriceUpdate))
     }
 
+    /// Returns the metadata for the type, for use with serialization formats.
     #[staticmethod]
     #[pyo3(name = "get_metadata")]
     fn py_get_metadata(
         instrument_id: &InstrumentId,
         price_precision: u8,
-    ) -> PyResult<HashMap<String, String>> {
-        Ok(Self::get_metadata(instrument_id, price_precision))
+    ) -> HashMap<String, String> {
+        Self::get_metadata(instrument_id, price_precision)
     }
 
+    /// Returns the field map for the type, for use with Arrow schemas.
     #[staticmethod]
     #[pyo3(name = "get_fields")]
     fn py_get_fields(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
@@ -221,18 +212,6 @@ impl MarkPriceUpdate {
         from_dict_pyo3(py, values)
     }
 
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_json_bytes(&data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_msgpack_bytes(&data).map_err(to_pyvalue_err)
-    }
-
     /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
     fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -242,15 +221,28 @@ impl MarkPriceUpdate {
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
     fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
     /// Return MsgPack encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    }
+}
+
+#[pymethods]
+impl MarkPriceUpdate {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
     }
 }
 
@@ -284,40 +276,26 @@ impl IndexPriceUpdate {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl IndexPriceUpdate {
+    /// Represents an index price update.
     #[new]
-    fn py_new(
-        instrument_id: InstrumentId,
-        value: Price,
-        ts_event: u64,
-        ts_init: u64,
-    ) -> PyResult<Self> {
-        Ok(Self::new(
-            instrument_id,
-            value,
-            ts_event.into(),
-            ts_init.into(),
-        ))
+    fn py_new(instrument_id: InstrumentId, value: Price, ts_event: u64, ts_init: u64) -> Self {
+        Self::new(instrument_id, value, ts_event.into(), ts_init.into())
     }
 
     fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
+        let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
         let binding = py_tuple.get_item(0)?;
-        let instrument_id_str = binding.downcast::<PyString>()?.extract::<&str>()?;
+        let instrument_id_str = binding.cast::<PyString>()?.extract::<&str>()?;
         let value_raw = py_tuple
             .get_item(1)?
-            .downcast::<PyInt>()?
+            .cast::<PyInt>()?
             .extract::<PriceRaw>()?;
-        let value_prec = py_tuple.get_item(2)?.downcast::<PyInt>()?.extract::<u8>()?;
+        let value_prec = py_tuple.get_item(2)?.cast::<PyInt>()?.extract::<u8>()?;
 
-        let ts_event = py_tuple
-            .get_item(7)?
-            .downcast::<PyInt>()?
-            .extract::<u64>()?;
-        let ts_init = py_tuple
-            .get_item(8)?
-            .downcast::<PyInt>()?
-            .extract::<u64>()?;
+        let ts_event = py_tuple.get_item(3)?.cast::<PyInt>()?.extract::<u64>()?;
+        let ts_init = py_tuple.get_item(4)?.cast::<PyInt>()?.extract::<u64>()?;
 
         self.instrument_id = InstrumentId::from_str(instrument_id_str).map_err(to_pyvalue_err)?;
         self.value = Price::from_raw(value_raw, value_prec);
@@ -327,7 +305,7 @@ impl IndexPriceUpdate {
         Ok(())
     }
 
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
         (
             self.instrument_id.to_string(),
             self.value.raw,
@@ -338,7 +316,7 @@ impl IndexPriceUpdate {
             .into_py_any(py)
     }
 
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
         let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
         let state = self.__getstate__(py)?;
         (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
@@ -406,15 +384,17 @@ impl IndexPriceUpdate {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(IndexPriceUpdate))
     }
 
+    /// Returns the metadata for the type, for use with serialization formats.
     #[staticmethod]
     #[pyo3(name = "get_metadata")]
     fn py_get_metadata(
         instrument_id: &InstrumentId,
         price_precision: u8,
-    ) -> PyResult<HashMap<String, String>> {
-        Ok(Self::get_metadata(instrument_id, price_precision))
+    ) -> HashMap<String, String> {
+        Self::get_metadata(instrument_id, price_precision)
     }
 
+    /// Returns the field map for the type, for use with Arrow schemas.
     #[staticmethod]
     #[pyo3(name = "get_fields")]
     fn py_get_fields(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
@@ -433,18 +413,6 @@ impl IndexPriceUpdate {
         from_dict_pyo3(py, values)
     }
 
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_json_bytes(&data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_msgpack_bytes(&data).map_err(to_pyvalue_err)
-    }
-
     /// Return a dictionary representation of the object.
     #[pyo3(name = "to_dict")]
     fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
@@ -454,21 +422,31 @@ impl IndexPriceUpdate {
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
     fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
     /// Return MsgPack encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
+#[pymethods]
+impl IndexPriceUpdate {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::python::IntoPyObjectNautilusExt;
@@ -500,20 +478,18 @@ mod tests {
 
     #[rstest]
     fn test_mark_price_to_dict(mark_price: MarkPriceUpdate) {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict_string = mark_price.py_to_dict(py).unwrap().to_string();
-            let expected_string = r"{'type': 'MarkPriceUpdate', 'instrument_id': 'BTC-USDT.OKX', 'value': '100000.00', 'ts_event': 1, 'ts_init': 2}";
+            let expected_string = "{'type': 'MarkPriceUpdate', 'instrument_id': 'BTC-USDT.OKX', 'value': '100000.00', 'ts_event': 1, 'ts_init': 2}";
             assert_eq!(dict_string, expected_string);
         });
     }
 
     #[rstest]
     fn test_mark_price_from_dict(mark_price: MarkPriceUpdate) {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict = mark_price.py_to_dict(py).unwrap();
             let parsed = MarkPriceUpdate::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, mark_price);
@@ -522,9 +498,8 @@ mod tests {
 
     #[rstest]
     fn test_mark_price_from_pyobject(mark_price: MarkPriceUpdate) {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let tick_pyobject = mark_price.into_py_any_unwrap(py);
             let parsed_tick = MarkPriceUpdate::from_pyobject(tick_pyobject.bind(py)).unwrap();
             assert_eq!(parsed_tick, mark_price);
@@ -533,20 +508,18 @@ mod tests {
 
     #[rstest]
     fn test_index_price_to_dict(index_price: IndexPriceUpdate) {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict_string = index_price.py_to_dict(py).unwrap().to_string();
-            let expected_string = r"{'type': 'IndexPriceUpdate', 'instrument_id': 'BTC-USDT.OKX', 'value': '100000.00', 'ts_event': 1, 'ts_init': 2}";
+            let expected_string = "{'type': 'IndexPriceUpdate', 'instrument_id': 'BTC-USDT.OKX', 'value': '100000.00', 'ts_event': 1, 'ts_init': 2}";
             assert_eq!(dict_string, expected_string);
         });
     }
 
     #[rstest]
     fn test_index_price_from_dict(index_price: IndexPriceUpdate) {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict = index_price.py_to_dict(py).unwrap();
             let parsed = IndexPriceUpdate::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, index_price);
@@ -555,9 +528,8 @@ mod tests {
 
     #[rstest]
     fn test_index_price_from_pyobject(index_price: IndexPriceUpdate) {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let tick_pyobject = index_price.into_py_any_unwrap(py);
             let parsed_tick = IndexPriceUpdate::from_pyobject(tick_pyobject.bind(py)).unwrap();
             assert_eq!(parsed_tick, index_price);

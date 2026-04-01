@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,15 +13,15 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Common componentry for [NautilusTrader](http://nautilustrader.io).
+//! Common componentry for [NautilusTrader](https://nautilustrader.io).
 //!
-//! The *common* crate provides shared components and utilities that form the system foundation for
+//! The `nautilus-common` crate provides shared components and utilities that form the system foundation for
 //! NautilusTrader applications. This includes the actor system, message bus, caching layer, and other
 //! essential services.
 //!
 //! # Platform
 //!
-//! [NautilusTrader](http://nautilustrader.io) is an open-source, high-performance, production-grade
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
 //! algorithmic trading platform, providing quantitative traders with the ability to backtest
 //! portfolios of automated trading strategies on historical data with an event-driven engine,
 //! and also deploy those same strategies live, with no code changes.
@@ -29,7 +29,7 @@
 //! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
 //! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
 //!
-//! # Feature flags
+//! # Feature Flags
 //!
 //! This crate provides feature flags to control source code inclusion during compilation,
 //! depending on the intended use case, i.e. whether to provide Python bindings
@@ -38,11 +38,16 @@
 //!
 //! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `stubs`: Enables type stubs for use in testing scenarios.
 //! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `indicators`: Includes the `nautilus-indicators` crate and indicator utilities.
+//! - `capnp`: Enables [Cap'n Proto](https://capnproto.org/) serialization support.
+//! - `live`: Enables the Tokio async runtime for live trading.
+//! - `tracing-bridge`: Enables the `tracing` subscriber bridge for log integration.
+//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
 #![deny(missing_debug_implementations)]
 #![deny(clippy::missing_errors_doc)]
@@ -51,6 +56,7 @@
 
 pub mod actor;
 pub mod cache;
+pub mod clients;
 pub mod clock;
 pub mod component;
 pub mod custom;
@@ -59,18 +65,28 @@ pub mod factories;
 pub mod generators;
 pub mod greeks;
 pub mod logging;
+mod macros;
 pub mod messages;
 pub mod msgbus;
+pub mod providers;
 pub mod runner;
-pub mod runtime;
 pub mod signal;
 pub mod testing;
 pub mod throttler;
 pub mod timer;
 pub mod xrate;
 
+#[cfg(feature = "live")]
+pub mod live;
+
+#[cfg(feature = "defi")]
+pub mod defi;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
 #[cfg(feature = "python")]
 pub mod python;
+
+#[cfg(feature = "capnp")]
+pub mod serialization;

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,10 +14,9 @@
 // -------------------------------------------------------------------------------------------------
 
 use indexmap::IndexMap;
-use nautilus_core::python::IntoPyObjectNautilusExt;
+use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use pyo3::{
-    conversion::{IntoPyObject, IntoPyObjectExt},
-    exceptions::PyValueError,
+    conversion::IntoPyObjectExt,
     prelude::*,
     types::{PyDict, PyList, PyNone},
 };
@@ -31,18 +30,20 @@ pub const PY_MODULE_MODEL: &str = "nautilus_trader.core.nautilus_pyo3.model";
 /// Python iterator over the variants of an enum.
 #[allow(missing_debug_implementations)]
 #[pyclass]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")]
 pub struct EnumIterator {
     // Type erasure for code reuse, generic types can't be exposed to Python
-    iter: Box<dyn Iterator<Item = PyObject> + Send + Sync>,
+    iter: Box<dyn Iterator<Item = Py<PyAny>> + Send + Sync>,
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl EnumIterator {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyObject> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<Py<PyAny>> {
         slf.iter.next()
     }
 }
@@ -56,7 +57,7 @@ impl EnumIterator {
     #[must_use]
     pub fn new<'py, E>(py: Python<'py>) -> Self
     where
-        E: strum::IntoEnumIterator + IntoPyObject<'py>,
+        E: strum::IntoEnumIterator + IntoPyObjectExt<'py>,
         <E as IntoEnumIterator>::Iterator: Send,
     {
         Self {
@@ -72,10 +73,6 @@ impl EnumIterator {
 }
 
 /// Converts a JSON `Value::Object` into a Python `dict`.
-///
-/// # Panics
-///
-/// Panics if creating a Python list fails due to an invalid iterator.
 ///
 /// # Errors
 ///
@@ -93,7 +90,7 @@ pub fn value_to_pydict(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
             }
         }
         // This shouldn't be reached in this function, but we include it for completeness
-        _ => return Err(PyValueError::new_err("Expected JSON object")),
+        _ => return Err(to_pyvalue_err("Expected JSON object")),
     }
 
     dict.into_py_any(py)
@@ -110,7 +107,7 @@ pub fn value_to_pydict(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
 /// Returns a `PyErr` if:
 /// - encountering an unsupported JSON number type.
 /// - conversion of nested arrays or objects fails.
-pub fn value_to_pyobject(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
+pub fn value_to_pyobject(py: Python<'_>, val: &Value) -> PyResult<Py<PyAny>> {
     match val {
         Value::Null => Ok(py.None()),
         Value::Bool(b) => b.into_py_any(py),
@@ -118,14 +115,17 @@ pub fn value_to_pyobject(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
         Value::Number(n) => {
             if n.is_i64() {
                 n.as_i64().unwrap().into_py_any(py)
+            } else if n.is_u64() {
+                n.as_u64().unwrap().into_py_any(py)
             } else if n.is_f64() {
                 n.as_f64().unwrap().into_py_any(py)
             } else {
-                Err(PyValueError::new_err("Unsupported JSON number type"))
+                Err(to_pyvalue_err("Unsupported JSON number type"))
             }
         }
         Value::Array(arr) => {
-            let py_list = PyList::new(py, &[] as &[PyObject]).expect("Invalid `ExactSizeIterator`");
+            let py_list =
+                PyList::new(py, &[] as &[Py<PyAny>]).expect("Invalid `ExactSizeIterator`");
             for item in arr {
                 let py_item = value_to_pyobject(py, item)?;
                 py_list.append(py_item)?;
@@ -135,6 +135,12 @@ pub fn value_to_pyobject(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
         Value::Object(_) => value_to_pydict(py, val),
     }
 }
+
+// Re-export centralized Params conversion functions from nautilus_core
+// Backward compatibility: re-export pydict_to_params as an alias
+pub use nautilus_core::{
+    from_pydict as pydict_to_params, from_pydict, python::params::params_to_pydict,
+};
 
 /// Converts a list of `Money` values into a Python list of strings, or `None` if empty.
 ///
@@ -156,8 +162,9 @@ pub fn commissions_from_vec(py: Python<'_>, commissions: Vec<Money>) -> PyResult
         Ok(PyNone::get(py).to_owned().into_any())
     } else {
         values.sort();
-        // SAFETY: Reasonable to expect `ExactSizeIterator` should be correctly implemented
-        Ok(PyList::new(py, &values).unwrap().into_any())
+        Ok(PyList::new(py, &values)
+            .expect("ExactSizeIterator")
+            .into_any())
     }
 }
 
@@ -166,18 +173,17 @@ pub fn commissions_from_vec(py: Python<'_>, commissions: Vec<Money>) -> PyResult
 /// # Errors
 ///
 /// Returns a `PyErr` if Python list creation or conversion fails.
-pub fn commissions_from_indexmap(
-    py: Python<'_>,
-    commissions: IndexMap<Currency, Money>,
-) -> PyResult<Bound<'_, PyAny>> {
-    commissions_from_vec(py, commissions.values().cloned().collect())
+pub fn commissions_from_indexmap<'py>(
+    py: Python<'py>,
+    commissions: &IndexMap<Currency, Money>,
+) -> PyResult<Bound<'py, PyAny>> {
+    commissions_from_vec(py, commissions.values().copied().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use pyo3::{
         prelude::*,
-        prepare_freethreaded_python,
         types::{PyBool, PyInt, PyString},
     };
     use rstest::rstest;
@@ -187,8 +193,8 @@ mod tests {
 
     #[rstest]
     fn test_value_to_pydict() {
-        prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let json_str = r#"
         {
             "type": "OrderAccepted",
@@ -205,7 +211,7 @@ mod tests {
                 py_dict
                     .get_item("type")
                     .unwrap()
-                    .downcast::<PyString>()
+                    .cast::<PyString>()
                     .unwrap()
                     .to_str()
                     .unwrap(),
@@ -215,7 +221,7 @@ mod tests {
                 py_dict
                     .get_item("ts_event")
                     .unwrap()
-                    .downcast::<PyInt>()
+                    .cast::<PyInt>()
                     .unwrap()
                     .extract::<i64>()
                     .unwrap(),
@@ -225,7 +231,7 @@ mod tests {
                 !py_dict
                     .get_item("is_reconciliation")
                     .unwrap()
-                    .downcast::<PyBool>()
+                    .cast::<PyBool>()
                     .unwrap()
                     .is_true()
             );
@@ -234,8 +240,8 @@ mod tests {
 
     #[rstest]
     fn test_value_to_pyobject_string() {
-        prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let val = Value::String("Hello, world!".to_string());
             let py_obj = value_to_pyobject(py, &val).unwrap();
 
@@ -245,8 +251,8 @@ mod tests {
 
     #[rstest]
     fn test_value_to_pyobject_bool() {
-        prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let val = Value::Bool(true);
             let py_obj = value_to_pyobject(py, &val).unwrap();
 
@@ -256,14 +262,14 @@ mod tests {
 
     #[rstest]
     fn test_value_to_pyobject_array() {
-        prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let val = Value::Array(vec![
                 Value::String("item1".to_string()),
                 Value::String("item2".to_string()),
             ]);
             let binding = value_to_pyobject(py, &val).unwrap();
-            let py_list: &Bound<'_, PyList> = binding.bind(py).downcast::<PyList>().unwrap();
+            let py_list: &Bound<'_, PyList> = binding.bind(py).cast::<PyList>().unwrap();
 
             assert_eq!(py_list.len(), 2);
             assert_eq!(

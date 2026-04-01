@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,13 +17,13 @@
 
 use std::{
     ffi::CStr,
-    fmt::{Debug, Display, Formatter},
+    fmt::{Debug, Display},
     hash::Hash,
     io::{Cursor, Write},
     str::FromStr,
 };
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
@@ -36,7 +36,11 @@ pub(crate) const UUID4_LEN: usize = 37;
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.core")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.core", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.core")
 )]
 pub struct UUID4 {
     /// The UUID v4 value as a fixed-length C string byte array (includes null terminator).
@@ -84,9 +88,29 @@ impl UUID4 {
     /// Panics if the internal byte array is not a valid C string (does not end with a null terminator).
     #[must_use]
     pub fn to_cstr(&self) -> &CStr {
-        // SAFETY: We always store valid C strings
+        // We always store valid C strings
         CStr::from_bytes_with_nul(&self.value)
             .expect("UUID byte representation should be a valid C string")
+    }
+
+    /// Returns the UUID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // We always store valid ASCII UUID strings
+        self.to_cstr().to_str().expect("UUID should be valid UTF-8")
+    }
+
+    /// Returns the raw UUID bytes (16 bytes).
+    ///
+    /// This method is optimized for serialization where the UUID bytes
+    /// are needed directly without string conversion overhead.
+    #[must_use]
+    pub fn as_bytes(&self) -> [u8; 16] {
+        // Parse the string representation to extract the raw bytes
+        // This is done once at read time to avoid repeated parsing
+        let uuid_str = self.to_cstr().to_str().expect("Valid UTF-8");
+        let uuid = Uuid::parse_str(uuid_str).expect("Valid UUID4");
+        *uuid.as_bytes()
     }
 
     fn validate_v4(uuid: &Uuid) {
@@ -105,6 +129,17 @@ impl UUID4 {
         );
     }
 
+    fn try_validate_v4(uuid: &Uuid) -> Result<(), String> {
+        if uuid.get_version() != Some(uuid::Version::Random) {
+            return Err("UUID is not version 4".to_string());
+        }
+
+        if uuid.get_variant() != uuid::Variant::RFC4122 {
+            return Err("UUID is not RFC 4122 variant".to_string());
+        }
+        Ok(())
+    }
+
     fn from_validated_uuid(uuid: &Uuid) -> Self {
         let mut value = [0; UUID4_LEN];
         let uuid_str = uuid.to_string();
@@ -115,43 +150,31 @@ impl UUID4 {
 }
 
 impl FromStr for UUID4 {
-    type Err = uuid::Error;
+    type Err = String;
 
     /// Attempts to create a [`UUID4`] from a string representation.
     ///
     /// The string should be a valid UUID in the standard format (e.g., "2d89666b-1a1e-4a75-b193-4eb3b454c757").
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the `value` is not a valid UUID version 4 RFC 4122.
+    /// Returns an error if the `value` is not a valid UUID version 4 RFC 4122.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let uuid = Uuid::try_parse(value)?;
-        Self::validate_v4(&uuid);
+        let uuid = Uuid::try_parse(value).map_err(|e| e.to_string())?;
+        Self::try_validate_v4(&uuid)?;
         Ok(Self::from_validated_uuid(&uuid))
     }
 }
 
 impl From<&str> for UUID4 {
-    /// Creates a [`UUID4`] from a string slice.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `value` string is not a valid UUID version 4 RFC 4122.
     fn from(value: &str) -> Self {
-        value
-            .parse()
-            .expect("`value` should be a valid UUID version 4 (RFC 4122)")
+        Self::from_str(value).expect("Invalid UUID4 string")
     }
 }
 
 impl From<String> for UUID4 {
-    /// Creates a [`UUID4`] from a string.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `value` string is not a valid UUID version 4 RFC 4122.
     fn from(value: String) -> Self {
-        Self::from(value.as_str())
+        Self::from_str(&value).expect("Invalid UUID4 string")
     }
 }
 
@@ -167,6 +190,13 @@ impl From<uuid::Uuid> for UUID4 {
     }
 }
 
+impl From<UUID4> for uuid::Uuid {
+    /// Creates a [`uuid::Uuid`] from a [`UUID4`].
+    fn from(value: UUID4) -> Self {
+        Self::from_bytes(value.as_bytes())
+    }
+}
+
 impl Default for UUID4 {
     /// Creates a new default [`UUID4`] instance.
     ///
@@ -177,13 +207,13 @@ impl Default for UUID4 {
 }
 
 impl Debug for UUID4 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}('{}')", stringify!(UUID4), self)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}({})", stringify!(UUID4), self)
     }
 }
 
 impl Display for UUID4 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_cstr().to_string_lossy())
     }
 }
@@ -203,14 +233,10 @@ impl<'de> Deserialize<'de> for UUID4 {
         D: Deserializer<'de>,
     {
         let uuid4_str: &str = Deserialize::deserialize(deserializer)?;
-        let uuid4: Self = uuid4_str.into();
-        Ok(uuid4)
+        uuid4_str.parse().map_err(serde::de::Error::custom)
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use std::{
@@ -218,6 +244,7 @@ mod tests {
         hash::{Hash, Hasher},
     };
 
+    use proptest::prelude::*;
     use rstest::*;
     use uuid;
 
@@ -342,7 +369,7 @@ mod tests {
     fn test_debug() {
         let uuid_string = "2d89666b-1a1e-4a75-b193-4eb3b454c757";
         let uuid = UUID4::from(uuid_string);
-        assert_eq!(format!("{uuid:?}"), format!("UUID4('{uuid_string}')"));
+        assert_eq!(format!("{uuid:?}"), format!("UUID4({uuid_string})"));
     }
 
     #[rstest]
@@ -359,6 +386,15 @@ mod tests {
 
         assert_eq!(cstr.to_str().unwrap(), uuid.to_string());
         assert_eq!(cstr.to_bytes_with_nul()[36], 0);
+    }
+
+    #[rstest]
+    fn test_as_str() {
+        let uuid = UUID4::new();
+        let s = uuid.as_str();
+
+        assert_eq!(s, uuid.to_string());
+        assert_eq!(s.len(), 36);
     }
 
     #[rstest]
@@ -401,5 +437,121 @@ mod tests {
         let deserialized: UUID4 = serde_json::from_str(&serialized).unwrap();
 
         assert_eq!(uuid, deserialized);
+    }
+
+    #[rstest]
+    fn test_as_bytes() {
+        let uuid_string = "2d89666b-1a1e-4a75-b193-4eb3b454c757";
+        let uuid = UUID4::from(uuid_string);
+
+        let bytes = uuid.as_bytes();
+        assert_eq!(bytes.len(), 16);
+
+        // Reconstruct UUID from bytes and verify it matches
+        let reconstructed = Uuid::from_bytes(bytes);
+        assert_eq!(reconstructed.to_string(), uuid_string);
+
+        // Verify version 4
+        assert_eq!(reconstructed.get_version().unwrap(), uuid::Version::Random);
+    }
+
+    #[rstest]
+    fn test_as_bytes_round_trip() {
+        let uuid1 = UUID4::new();
+        let bytes = uuid1.as_bytes();
+        let uuid2 = UUID4::from(Uuid::from_bytes(bytes));
+
+        assert_eq!(uuid1, uuid2);
+    }
+
+    #[rstest]
+    #[case("\"not-a-uuid\"")] // Invalid format
+    #[case("\"6ba7b810-9dad-11d1-80b4-00c04fd430c8\"")] // v1 UUID (wrong version)
+    #[case("\"\"")] // Empty string
+    fn test_deserialize_invalid_uuid_returns_error(#[case] json: &str) {
+        let result: Result<UUID4, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    fn uuid4_strategy() -> impl Strategy<Value = UUID4> {
+        // Build from proptest-generated bytes for deterministic
+        // reproduction and shrinking on failure
+        any::<[u8; 16]>().prop_map(|mut bytes| {
+            bytes[6] = (bytes[6] & 0x0F) | 0x40; // Version 4
+            bytes[8] = (bytes[8] & 0x3F) | 0x80; // Variant RFC 4122
+            UUID4::from(uuid::Uuid::from_bytes(bytes))
+        })
+    }
+
+    proptest! {
+        #[rstest]
+        fn prop_uuid4_string_roundtrip(uuid in uuid4_strategy()) {
+            let s = uuid.to_string();
+            let parsed = UUID4::from_str(&s);
+            prop_assert!(parsed.is_ok(), "Failed to parse UUID string: {}", s);
+            prop_assert_eq!(parsed.unwrap(), uuid, "String round-trip failed");
+        }
+
+        #[rstest]
+        fn prop_uuid4_serde_roundtrip(uuid in uuid4_strategy()) {
+            let serialized = serde_json::to_string(&uuid).unwrap();
+            let deserialized: UUID4 = serde_json::from_str(&serialized).unwrap();
+            prop_assert_eq!(deserialized, uuid, "Serde JSON round-trip failed");
+        }
+
+        #[rstest]
+        fn prop_uuid4_rfc4122_compliance(uuid in uuid4_strategy()) {
+            let s = uuid.to_string();
+            let bytes = uuid.value;
+
+            // Invariant: Total length is always 36 characters + null terminator
+            prop_assert_eq!(s.len(), 36);
+            prop_assert_eq!(bytes[36], 0, "Missing null terminator at index 36");
+
+            // Invariant: Dash positions per RFC 4122
+            prop_assert_eq!(bytes[8] as char, '-');
+            prop_assert_eq!(bytes[13] as char, '-');
+            prop_assert_eq!(bytes[18] as char, '-');
+            prop_assert_eq!(bytes[23] as char, '-');
+
+            // Invariant: Version digit must be '4' (index 14)
+            prop_assert_eq!(&s[14..15], "4", "Version digit must be 4");
+
+            // Invariant: Variant bits must be RFC 4122 (index 19)
+            // Binary: 10xx -> Hex: 8, 9, a, b
+            let variant_char = s.chars().nth(19).unwrap().to_ascii_lowercase();
+            prop_assert!(
+                matches!(variant_char, '8' | '9' | 'a' | 'b'),
+                "Invalid variant character: {}", variant_char
+            );
+        }
+
+        #[rstest]
+        fn prop_uuid4_as_bytes_consistency(uuid in uuid4_strategy()) {
+            let bytes = uuid.as_bytes();
+            let reconstructed = uuid::Uuid::from_bytes(bytes);
+            prop_assert_eq!(reconstructed.to_string(), uuid.to_string(), "Byte reconstruction mismatch");
+        }
+
+        #[rstest]
+        fn prop_uuid4_equality_and_hashing(uuid1 in uuid4_strategy(), uuid2 in uuid4_strategy()) {
+            // Identity
+            prop_assert_eq!(uuid1, uuid1);
+
+            // Equality implies hash equality
+            if uuid1 == uuid2 {
+                let mut h1 = DefaultHasher::new();
+                let mut h2 = DefaultHasher::new();
+                uuid1.hash(&mut h1);
+                uuid2.hash(&mut h2);
+                prop_assert_eq!(h1.finish(), h2.finish());
+            }
+        }
+
+        #[rstest]
+        fn prop_uuid4_from_str_never_panics(s: String) {
+            // Fuzzing the parser with arbitrary strings
+            let _ = UUID4::from_str(&s);
+        }
     }
 }

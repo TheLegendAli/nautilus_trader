@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -34,7 +34,9 @@ use crate::rpc::{
 pub mod chains;
 pub mod core;
 pub mod error;
+pub mod helpers;
 pub mod http;
+pub mod providers;
 pub mod types;
 pub mod utils;
 

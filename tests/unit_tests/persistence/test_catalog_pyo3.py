@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,14 +14,12 @@
 # -------------------------------------------------------------------------------------------------
 
 import os
-import sys
-
-import pytest
 
 from nautilus_trader.core.nautilus_pyo3 import Bar
 from nautilus_trader.core.nautilus_pyo3 import BarAggregation
 from nautilus_trader.core.nautilus_pyo3 import BarSpecification
 from nautilus_trader.core.nautilus_pyo3 import BarType
+from nautilus_trader.core.nautilus_pyo3 import CurrencyPair
 from nautilus_trader.core.nautilus_pyo3 import IndexPriceUpdate
 from nautilus_trader.core.nautilus_pyo3 import InstrumentId
 from nautilus_trader.core.nautilus_pyo3 import MarkPriceUpdate
@@ -32,11 +30,10 @@ from nautilus_trader.core.nautilus_pyo3 import Quantity
 from nautilus_trader.core.nautilus_pyo3 import Symbol
 from nautilus_trader.core.nautilus_pyo3 import Venue
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.rust.data_pyo3 import TestDataProviderPyo3
 from nautilus_trader.test_kit.rust.identifiers_pyo3 import TestIdProviderPyo3
 
-
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Failing on windows")
 
 AUDUSD_SIM = InstrumentId(Symbol("AUD/USD"), Venue("SIM"))
 ONE_MIN_BID = BarSpecification(1, BarAggregation.MINUTE, PriceType.BID)
@@ -56,6 +53,26 @@ def bar(t):
     )
 
 
+def make_audusd_snapshot(
+    ts_init: int,
+    venue_extra: str,
+    count: int,
+    enabled: bool,
+) -> CurrencyPair:
+    from typing import Any
+
+    from nautilus_trader.model.instruments import CurrencyPair as PyCurrencyPair
+
+    base = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+    payload: dict[str, Any] = {
+        **PyCurrencyPair.to_dict(base),
+        "info": {"venue_extra": venue_extra, "count": count, "enabled": enabled},
+        "ts_event": ts_init,
+        "ts_init": ts_init,
+    }
+    return CurrencyPair.from_dict(payload)
+
+
 def test_write_2_bars_to_catalog(catalog: ParquetDataCatalog):
     # Arrange
     # Note: we use a python catalog only to setup an empty catalog every time
@@ -65,8 +82,84 @@ def test_write_2_bars_to_catalog(catalog: ParquetDataCatalog):
     pyo3_catalog.write_bars([bar(1), bar(2)])
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert intervals == [(1, 2)]
+
+
+def test_catalog_v2_instrument_roundtrip_with_info_params(catalog: ParquetDataCatalog) -> None:
+    # Roundtrip PyO3 instruments (CurrencyPair with Params in info) via catalog v2.
+    from typing import cast
+
+    inst1 = make_audusd_snapshot(1000, "v1", 1, True)
+    inst2 = make_audusd_snapshot(2000, "v2", 2, False)
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog.write_instruments([inst1])
+    pyo3_catalog.write_instruments([inst2])
+    read = cast(list[CurrencyPair], pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"]))
+    assert len(read) == 2
+    by_ts = {inst.ts_init: inst for inst in read}
+    assert 1000 in by_ts
+    assert 2000 in by_ts
+    assert dict(by_ts[1000].info) == {"venue_extra": "v1", "count": 1, "enabled": True}
+    assert dict(by_ts[2000].info) == {"venue_extra": "v2", "count": 2, "enabled": False}
+    assert str(by_ts[1000].id) == "AUD/USD.SIM"
+    assert str(by_ts[2000].id) == "AUD/USD.SIM"
+
+    filtered = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=1500, end=2500),
+    )
+    assert len(filtered) == 1
+    assert filtered[0].ts_init == 2000
+
+
+def test_catalog_v2_instrument_time_range_query_with_multiple_versions(
+    catalog: ParquetDataCatalog,
+) -> None:
+    from typing import cast
+
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    versions = [
+        make_audusd_snapshot(1000, "v1", 1, True),
+        make_audusd_snapshot(2000, "v2", 2, False),
+        make_audusd_snapshot(3000, "v3", 3, True),
+        make_audusd_snapshot(4000, "v4", 4, False),
+    ]
+
+    for instrument in versions:
+        pyo3_catalog.write_instruments([instrument])
+
+    read_all = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"]),
+    )
+    assert [instrument.ts_init for instrument in read_all] == [1000, 2000, 3000, 4000]
+    assert [dict(instrument.info)["venue_extra"] for instrument in read_all] == [
+        "v1",
+        "v2",
+        "v3",
+        "v4",
+    ]
+
+    middle_range = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=1500, end=3500),
+    )
+    assert [instrument.ts_init for instrument in middle_range] == [2000, 3000]
+
+    upper_range = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=2500, end=4500),
+    )
+    assert [instrument.ts_init for instrument in upper_range] == [3000, 4000]
+
+    lower_range = cast(
+        list[CurrencyPair],
+        pyo3_catalog.instruments(instrument_ids=["AUD/USD.SIM"], start=0, end=2500),
+    )
+    assert [instrument.ts_init for instrument in lower_range] == [1000, 2000]
 
 
 def test_append_data_to_catalog(catalog: ParquetDataCatalog):
@@ -78,7 +171,9 @@ def test_append_data_to_catalog(catalog: ParquetDataCatalog):
     pyo3_catalog.write_bars([bar(3)])
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
 
     assert intervals == [(1, 2), (3, 3)]
 
@@ -93,7 +188,9 @@ def test_consolidate_catalog(catalog: ParquetDataCatalog):
     pyo3_catalog.consolidate_catalog()
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert intervals == [(1, 3)]
 
 
@@ -108,7 +205,9 @@ def test_consolidate_catalog_with_time_range(catalog: ParquetDataCatalog):
     pyo3_catalog.consolidate_catalog(start=1, end=2)
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert intervals == [(1, 2), (3, 3)]
 
 
@@ -119,7 +218,9 @@ def test_get_missing_intervals(catalog: ParquetDataCatalog):
     pyo3_catalog.write_bars([bar(5), bar(6)])
 
     # Act
-    missing = pyo3_catalog.get_missing_intervals_for_request(0, 10, "bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    missing = pyo3_catalog.get_missing_intervals_for_request(0, 10, "bars", bar_type_str)
 
     # Assert
     assert missing == [(0, 0), (3, 4), (7, 10)]
@@ -130,8 +231,15 @@ def test_reset_file_names(catalog: ParquetDataCatalog):
     pyo3_catalog = ParquetDataCatalogV2(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2), bar(3)])
 
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    # Directory name uses urisafe_identifier which removes forward slashes
+    from nautilus_trader.persistence.funcs import urisafe_identifier
+
+    safe_bar_type = urisafe_identifier(bar_type_str)
+
     # Find the actual filename that was created
-    bars_dir = os.path.join(catalog.path, "data", "bars", "AUDUSD.SIM")
+    bars_dir = os.path.join(catalog.path, "data", "bars", safe_bar_type)
     files = os.listdir(bars_dir)
     assert len(files) == 1, f"Expected 1 file, found {len(files)}: {files}"
     original_filename = files[0]
@@ -142,10 +250,10 @@ def test_reset_file_names(catalog: ParquetDataCatalog):
     os.rename(path, new_path)
 
     # Act
-    pyo3_catalog.reset_data_file_names("bars", "AUD/USD.SIM")
+    pyo3_catalog.reset_data_file_names("bars", bar_type_str)
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert intervals == [(1, 3)]
 
 
@@ -157,21 +265,32 @@ def test_extend_file_name(catalog: ParquetDataCatalog):
     pyo3_catalog.write_bars([bar(4)])
 
     # Act - extend the first file to include the missing timestamp 2
-    pyo3_catalog.extend_file_name("bars", "AUD/USD.SIM", start=2, end=3)
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    pyo3_catalog.extend_file_name("bars", bar_type_str, start=2, end=3)
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert intervals == [(1, 3), (4, 4)]
 
 
-def test_reset_catalog_file_names(catalog: ParquetDataCatalog):
+def test_reset_all_file_names(catalog: ParquetDataCatalog):
     # Arrange
     pyo3_catalog = ParquetDataCatalogV2(catalog.path)
     pyo3_catalog.write_bars([bar(1), bar(2)])
     pyo3_catalog.write_bars([bar(3)])
 
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    # Directory name uses urisafe_identifier which removes forward slashes
+    from nautilus_trader.persistence.funcs import urisafe_identifier
+
+    safe_bar_type = urisafe_identifier(bar_type_str)
+
     # Find the actual filenames that were created
-    bars_dir = os.path.join(catalog.path, "data", "bars", "AUDUSD.SIM")
+    bars_dir = os.path.join(catalog.path, "data", "bars", safe_bar_type)
     files = os.listdir(bars_dir)
     assert len(files) == 2, f"Expected 2 files, found {len(files)}: {files}"
 
@@ -182,10 +301,12 @@ def test_reset_catalog_file_names(catalog: ParquetDataCatalog):
         os.rename(path, new_path)
 
     # Act
-    pyo3_catalog.reset_catalog_file_names()
+    pyo3_catalog.reset_all_file_names()
 
     # Assert
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert intervals == [(1, 2), (3, 3)]
 
 
@@ -323,7 +444,9 @@ def test_get_intervals_empty(catalog: ParquetDataCatalog):
     pyo3_catalog = ParquetDataCatalogV2(catalog.path)
 
     # Act
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
 
     # Assert
     assert len(intervals) == 0
@@ -505,7 +628,8 @@ def test_consolidate_catalog_by_period_basic(catalog: ParquetDataCatalog):
     pyo3_catalog.write_quote_ticks([quote_tick(1001)])  # contiguous
 
     # Verify we have multiple files initially
-    bar_intervals_before = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    bar_intervals_before = pyo3_catalog.get_intervals("bars", bar_type_str)
     quote_intervals_before = pyo3_catalog.get_intervals("quotes", "ETH/USDT.BINANCE")
     assert len(bar_intervals_before) == 2
     assert len(quote_intervals_before) == 2
@@ -519,7 +643,7 @@ def test_consolidate_catalog_by_period_basic(catalog: ParquetDataCatalog):
     )
 
     # Assert - should have consolidated files
-    bar_intervals_after = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    bar_intervals_after = pyo3_catalog.get_intervals("bars", bar_type_str)
     quote_intervals_after = pyo3_catalog.get_intervals("quotes", "ETH/USDT.BINANCE")
 
     # Should have same or fewer intervals after consolidation
@@ -543,7 +667,9 @@ def test_consolidate_catalog_by_period_empty_catalog(catalog: ParquetDataCatalog
     )
 
     # Assert - should complete without error
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert len(intervals) == 0
 
 
@@ -563,7 +689,8 @@ def test_consolidate_catalog_by_period_mixed_data_types(catalog: ParquetDataCata
     pyo3_catalog.write_trade_ticks([trade_tick(1001)])  # contiguous
 
     # Get initial file counts
-    initial_bar_count = len(pyo3_catalog.get_intervals("bars", "AUD/USD.SIM"))
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    initial_bar_count = len(pyo3_catalog.get_intervals("bars", bar_type_str))
     initial_quote_count = len(pyo3_catalog.get_intervals("quotes", "ETH/USDT.BINANCE"))
     initial_trade_count = len(pyo3_catalog.get_intervals("trades", "ETH/USDT.BINANCE"))
 
@@ -576,7 +703,7 @@ def test_consolidate_catalog_by_period_mixed_data_types(catalog: ParquetDataCata
     )
 
     # Assert - all data types should be processed
-    final_bar_count = len(pyo3_catalog.get_intervals("bars", "AUD/USD.SIM"))
+    final_bar_count = len(pyo3_catalog.get_intervals("bars", bar_type_str))
     final_quote_count = len(pyo3_catalog.get_intervals("quotes", "ETH/USDT.BINANCE"))
     final_trade_count = len(pyo3_catalog.get_intervals("trades", "ETH/USDT.BINANCE"))
 
@@ -599,13 +726,15 @@ def test_consolidate_data_by_period_basic(catalog: ParquetDataCatalog):
     period_nanos = 86400_000_000_000  # 1 day
     pyo3_catalog.consolidate_data_by_period(
         type_name="bars",
-        identifier="AUD/USD.SIM",
+        identifier=str(AUDUSD_1_MIN_BID),
         period_nanos=period_nanos,
         ensure_contiguous_files=False,
     )
 
     # Assert - verify the operation completed successfully
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert len(intervals) >= 1
 
 
@@ -624,7 +753,7 @@ def test_consolidate_data_by_period_with_time_range(catalog: ParquetDataCatalog)
     period_nanos = 3600_000_000_000  # 1 hour
     pyo3_catalog.consolidate_data_by_period(
         type_name="bars",
-        identifier="AUD/USD.SIM",
+        identifier=str(AUDUSD_1_MIN_BID),
         period_nanos=period_nanos,
         start=start_time,
         end=end_time,
@@ -632,7 +761,9 @@ def test_consolidate_data_by_period_with_time_range(catalog: ParquetDataCatalog)
     )
 
     # Assert - verify the operation completed successfully
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert len(intervals) >= 1
 
 
@@ -647,13 +778,15 @@ def test_consolidate_data_by_period_empty_data(catalog: ParquetDataCatalog):
     period_nanos = 86400_000_000_000  # 1 day
     pyo3_catalog.consolidate_data_by_period(
         type_name="bars",
-        identifier="AUD/USD.SIM",
+        identifier=str(AUDUSD_1_MIN_BID),
         period_nanos=period_nanos,
         ensure_contiguous_files=False,
     )
 
     # Assert - should complete without error
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert len(intervals) == 0
 
 
@@ -669,11 +802,13 @@ def test_consolidate_data_by_period_default_parameters(catalog: ParquetDataCatal
     # Act - consolidate with default parameters (should use 1 day period)
     pyo3_catalog.consolidate_data_by_period(
         type_name="bars",
-        identifier="AUD/USD.SIM",
+        identifier=str(AUDUSD_1_MIN_BID),
     )
 
     # Assert - verify the operation completed successfully
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert len(intervals) >= 1
 
 
@@ -702,13 +837,15 @@ def test_consolidate_data_by_period_different_periods(catalog: ParquetDataCatalo
     for period_nanos in periods:
         pyo3_catalog.consolidate_data_by_period(
             type_name="bars",
-            identifier="AUD/USD.SIM",
+            identifier=str(AUDUSD_1_MIN_BID),
             period_nanos=period_nanos,
             ensure_contiguous_files=False,
         )
 
         # Assert - verify the operation completed successfully
-        intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+        # For bars, identifier should be the full bar_type string, not just instrument_id
+        bar_type_str = str(AUDUSD_1_MIN_BID)
+        intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
         assert len(intervals) >= 1
 
 
@@ -725,13 +862,15 @@ def test_consolidate_data_by_period_ensure_contiguous_files_true(catalog: Parque
     period_nanos = 86400_000_000_000  # 1 day
     pyo3_catalog.consolidate_data_by_period(
         type_name="bars",
-        identifier="AUD/USD.SIM",
+        identifier=str(AUDUSD_1_MIN_BID),
         period_nanos=period_nanos,
         ensure_contiguous_files=True,
     )
 
     # Assert - verify the operation completed successfully
-    intervals = pyo3_catalog.get_intervals("bars", "AUD/USD.SIM")
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    intervals = pyo3_catalog.get_intervals("bars", bar_type_str)
     assert len(intervals) >= 1
 
 
@@ -780,7 +919,7 @@ def test_delete_data_range_complete_file_deletion(catalog: ParquetDataCatalog):
     # Act - delete all data
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         0,
         3_000_000_000,
     )
@@ -806,7 +945,7 @@ def test_delete_data_range_partial_file_overlap_start(catalog: ParquetDataCatalo
     # Act - delete first part of the data
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         0,
         1_500_000_000,
     )
@@ -834,7 +973,7 @@ def test_delete_data_range_partial_file_overlap_end(catalog: ParquetDataCatalog)
     # Act - delete last part of the data
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         2_500_000_000,
         4_000_000_000,
     )
@@ -863,7 +1002,7 @@ def test_delete_data_range_partial_file_overlap_middle(catalog: ParquetDataCatal
     # Act - delete middle part of the data
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         1_500_000_000,
         3_500_000_000,
     )
@@ -885,7 +1024,7 @@ def test_delete_data_range_no_data(catalog: ParquetDataCatalog):
     # Act - delete from empty catalog
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         1_000_000_000,
         2_000_000_000,
     )
@@ -907,7 +1046,7 @@ def test_delete_data_range_no_intersection(catalog: ParquetDataCatalog):
     # Act - delete data outside existing range
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         3_000_000_000,
         4_000_000_000,
     )
@@ -1056,7 +1195,7 @@ def test_delete_data_range_nanosecond_precision_boundaries(catalog: ParquetDataC
     # Act - delete exactly the middle two timestamps [1_000_000_001, 1_000_000_002]
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         1_000_000_001,
         1_000_000_002,
     )
@@ -1089,7 +1228,7 @@ def test_delete_data_range_single_file_double_split(catalog: ParquetDataCatalog)
     # This should create both split_before and split_after operations
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         2_500_000_000,
         3_500_000_000,
     )
@@ -1123,7 +1262,7 @@ def test_delete_data_range_file_contiguity_verification(catalog: ParquetDataCata
     # Act - delete middle timestamp [1_000_000_002, 1_000_000_002]
     pyo3_catalog.delete_data_range(
         "bars",
-        "AUD/USD.SIM",
+        str(AUDUSD_1_MIN_BID),
         1_000_000_002,
         1_000_000_002,
     )
@@ -1142,3 +1281,365 @@ def test_delete_data_range_file_contiguity_verification(catalog: ParquetDataCata
         if timestamps[i] == 1_000_000_001:
             # Should jump from 1_000_000_001 to 1_000_000_003 (skipping 1_000_000_002)
             assert timestamps[i + 1] == 1_000_000_003
+
+
+# ================================================================================================
+# Table naming fix tests for pyo3 bindings
+# ================================================================================================
+
+
+def test_pyo3_query_multiple_instruments_table_naming(catalog: ParquetDataCatalog):
+    """
+    Test that pyo3 bindings handle multiple instruments correctly with identifier-
+    dependent table names.
+
+    This test verifies the fix for the table naming bug where multiple instruments would
+    cause table name conflicts in DataFusion queries when using the Rust backend.
+
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Create quote ticks for multiple instruments with different identifier patterns
+    eurusd_quotes = [
+        TestDataProviderPyo3.quote_tick(
+            ts_init=1000 + i * 100,
+            instrument_id=InstrumentId.from_str("EUR/USD.SIM"),
+        )
+        for i in range(3)
+    ]
+
+    btcusd_quotes = [
+        TestDataProviderPyo3.quote_tick(
+            ts_init=2000 + i * 100,
+            instrument_id=InstrumentId.from_str("BTC-USD.COINBASE"),
+        )
+        for i in range(3)
+    ]
+
+    ethusdt_quotes = [
+        TestDataProviderPyo3.quote_tick(
+            ts_init=3000 + i * 100,
+            instrument_id=InstrumentId.from_str("ETH/USDT.BINANCE"),
+        )
+        for i in range(3)
+    ]
+
+    # Write data for all instruments
+    pyo3_catalog.write_quote_ticks(eurusd_quotes)
+    pyo3_catalog.write_quote_ticks(btcusd_quotes)
+    pyo3_catalog.write_quote_ticks(ethusdt_quotes)
+
+    # Act - Query all instruments simultaneously using pyo3 bindings
+    instrument_ids = ["EUR/USD.SIM", "BTC-USD.COINBASE", "ETH/USDT.BINANCE"]
+    quotes = pyo3_catalog.query_quote_ticks(instrument_ids)
+
+    # Assert - Should get all 9 quotes without table name conflicts
+    assert len(quotes) == 9
+
+    # Verify we have data from all three instruments
+    instrument_counts: dict[str, int] = {}
+    for quote in quotes:
+        instrument_id = quote.instrument_id.value
+        instrument_counts[instrument_id] = instrument_counts.get(instrument_id, 0) + 1
+
+    assert len(instrument_counts) == 3
+    assert instrument_counts.get("EUR/USD.SIM") == 3
+    assert instrument_counts.get("BTC-USD.COINBASE") == 3
+    assert instrument_counts.get("ETH/USDT.BINANCE") == 3
+
+    # Verify data is properly ordered by timestamp
+    timestamps = [quote.ts_init for quote in quotes]
+    assert timestamps == sorted(timestamps)
+
+
+def test_pyo3_query_bars_multiple_instruments_table_naming(catalog: ParquetDataCatalog):
+    """
+    Test that pyo3 bindings handle multiple bar types correctly with identifier-
+    dependent table names.
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Create bars using the existing bar helper function but with different timestamps
+    bars_set1 = [bar(1000000000 + i * 60000000000) for i in range(2)]  # Use nanosecond timestamps
+    bars_set2 = [bar(2000000000000 + i * 60000000000) for i in range(2)]  # Much later timestamps
+
+    # Write data for both sets
+    pyo3_catalog.write_bars(bars_set1)
+    pyo3_catalog.write_bars(bars_set2)
+
+    # Act - Query all bars (this tests the table naming fix)
+    bars = pyo3_catalog.query_bars()
+
+    # Assert - Should get all 4 bars without table name conflicts
+    assert len(bars) == 4
+
+    # Verify data is properly ordered by timestamp
+    timestamps = [bar_data.ts_init for bar_data in bars]
+    assert timestamps == sorted(timestamps)
+
+
+def test_pyo3_backend_session_special_characters_table_naming(catalog: ParquetDataCatalog):
+    """
+    Test that pyo3 backend session handles special characters in identifiers correctly.
+
+    This test verifies that identifiers with dots, hyphens, and slashes are properly
+    converted to safe SQL table names in the Rust backend.
+
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Create trade ticks for instruments with various special characters
+    trades_complex = [
+        TestDataProviderPyo3.trade_tick(
+            ts_init=1000 + i * 100,
+            instrument_id=InstrumentId.from_str("BTC/USD.COINBASE-PRO"),
+        )
+        for i in range(2)
+    ]
+
+    trades_dots = [
+        TestDataProviderPyo3.trade_tick(
+            ts_init=2000 + i * 100,
+            instrument_id=InstrumentId.from_str("ETH.USD.KRAKEN"),
+        )
+        for i in range(2)
+    ]
+
+    trades_mixed = [
+        TestDataProviderPyo3.trade_tick(
+            ts_init=3000 + i * 100,
+            instrument_id=InstrumentId.from_str("ADA-BTC.BINANCE_SPOT"),
+        )
+        for i in range(2)
+    ]
+
+    # Write data
+    pyo3_catalog.write_trade_ticks(trades_complex)
+    pyo3_catalog.write_trade_ticks(trades_dots)
+    pyo3_catalog.write_trade_ticks(trades_mixed)
+
+    # Act - Query all instruments with special characters
+    instrument_ids = [
+        "BTC/USD.COINBASE-PRO",
+        "ETH.USD.KRAKEN",
+        "ADA-BTC.BINANCE_SPOT",
+    ]
+    trades = pyo3_catalog.query_trade_ticks(instrument_ids)
+
+    # Assert - Should handle all special characters correctly
+    assert len(trades) == 6
+
+    # Verify we have data from all instruments
+    instrument_counts: dict[str, int] = {}
+    for trade in trades:
+        instrument_id = trade.instrument_id.value
+        instrument_counts[instrument_id] = instrument_counts.get(instrument_id, 0) + 1
+
+    assert len(instrument_counts) == 3
+    assert instrument_counts.get("BTC/USD.COINBASE-PRO") == 2
+    assert instrument_counts.get("ETH.USD.KRAKEN") == 2
+    assert instrument_counts.get("ADA-BTC.BINANCE_SPOT") == 2
+
+
+def test_query_first_timestamp(catalog: ParquetDataCatalog):
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog.write_bars([bar(1000), bar(2000), bar(3000)])
+
+    # Act
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    first_ts = pyo3_catalog.query_first_timestamp("bars", bar_type_str)
+
+    # Assert
+    assert first_ts == 1000
+
+
+def test_query_first_timestamp_empty(catalog: ParquetDataCatalog):
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act
+    first_ts = pyo3_catalog.query_first_timestamp("bars", "NONEXISTENT")
+
+    # Assert
+    assert first_ts is None
+
+
+def test_query_last_timestamp(catalog: ParquetDataCatalog):
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog.write_bars([bar(1000), bar(2000), bar(3000)])
+
+    # Act
+    # For bars, identifier should be the full bar_type string, not just instrument_id
+    bar_type_str = str(AUDUSD_1_MIN_BID)
+    last_ts = pyo3_catalog.query_last_timestamp("bars", bar_type_str)
+
+    # Assert
+    assert last_ts == 3000
+
+
+def test_list_data_types(catalog: ParquetDataCatalog):
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    pyo3_catalog.write_bars([bar(1000)])
+
+    # Act
+    data_types = pyo3_catalog.list_data_types()
+
+    # Assert
+    assert "bars" in data_types
+
+
+def test_list_backtest_runs(catalog: ParquetDataCatalog):
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    import os
+
+    backtest_dir = os.path.join(catalog.path, "backtest", "test_run_123")
+    os.makedirs(backtest_dir, exist_ok=True)
+
+    # Act
+    runs = pyo3_catalog.list_backtest_runs()
+
+    # Assert
+    assert "test_run_123" in runs
+
+
+def test_list_live_runs(catalog: ParquetDataCatalog):
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+    import os
+
+    live_dir = os.path.join(catalog.path, "live", "test_live_456")
+    os.makedirs(live_dir, exist_ok=True)
+
+    # Act
+    runs = pyo3_catalog.list_live_runs()
+
+    # Assert
+    assert "test_live_456" in runs
+
+
+def test_convert_stream_to_data_no_files(catalog: ParquetDataCatalog):
+    """
+    Test convert_stream_to_data when no files exist (should not error).
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act - should not raise an error when no files are found
+    pyo3_catalog.convert_stream_to_data(
+        "test_instance",
+        "quotes",
+        subdirectory="backtest",
+    )
+
+    # Assert - should complete without error when no files exist
+    # (This is a valid use case - empty backtest/live runs)
+
+
+def test_convert_stream_to_data_default_subdirectory(catalog: ParquetDataCatalog):
+    """
+    Test convert_stream_to_data with default subdirectory (backtest).
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act - should use "backtest" as default subdirectory
+    pyo3_catalog.convert_stream_to_data(
+        "test_instance",
+        "quotes",
+        # subdirectory not specified - should default to "backtest"
+    )
+
+    # Assert - should complete without error
+    # (No files exist, but that's fine)
+
+
+def test_convert_stream_to_data_live_subdirectory(catalog: ParquetDataCatalog):
+    """
+    Test convert_stream_to_data with live subdirectory.
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act - should work with "live" subdirectory
+    pyo3_catalog.convert_stream_to_data(
+        "test_instance",
+        "trades",
+        subdirectory="live",
+    )
+
+    # Assert - should complete without error
+    # (No files exist, but that's fine)
+
+
+def test_convert_stream_to_data_with_identifiers(catalog: ParquetDataCatalog):
+    """
+    Test convert_stream_to_data with identifier filtering.
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act - should work with identifier filtering
+    pyo3_catalog.convert_stream_to_data(
+        "test_instance",
+        "bars",
+        subdirectory="backtest",
+        identifiers=["AUD/USD.SIM"],
+    )
+
+    # Assert - should complete without error
+    # (No files exist, but that's fine)
+
+
+def test_convert_stream_to_data_with_ts_event_replacement(catalog: ParquetDataCatalog):
+    """
+    Test convert_stream_to_data with use_ts_event_for_ts_init option.
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act - should work with use_ts_event_for_ts_init flag
+    pyo3_catalog.convert_stream_to_data(
+        "test_instance",
+        "quotes",
+        subdirectory="backtest",
+        use_ts_event_for_ts_init=True,
+    )
+
+    # Assert - should complete without error
+    # (No files exist, but that's fine)
+
+
+def test_convert_stream_to_data_all_data_types(catalog: ParquetDataCatalog):
+    """
+    Test convert_stream_to_data with all supported data types.
+    """
+    # Arrange
+    pyo3_catalog = ParquetDataCatalogV2(catalog.path)
+
+    # Act & Assert - should work with all data types
+    data_types = [
+        "quotes",
+        "trades",
+        "bars",
+        "order_book_deltas",
+        "order_book_depths",
+        "index_prices",
+        "mark_prices",
+        "instrument_closes",
+    ]
+
+    for data_type in data_types:
+        pyo3_catalog.convert_stream_to_data(
+            "test_instance",
+            data_type,
+            subdirectory="backtest",
+        )
+        # Should complete without error for each type

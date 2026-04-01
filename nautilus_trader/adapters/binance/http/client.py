@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,13 +13,13 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import base64
 import urllib.parse
 from typing import Any
 
 import msgspec
 
 import nautilus_trader
-from nautilus_trader.adapters.binance.common.enums import BinanceKeyType
 from nautilus_trader.adapters.binance.http.error import BinanceClientError
 from nautilus_trader.adapters.binance.http.error import BinanceServerError
 from nautilus_trader.common.component import LiveClock
@@ -31,6 +31,7 @@ from nautilus_trader.core.nautilus_pyo3 import HttpResponse
 from nautilus_trader.core.nautilus_pyo3 import Quota
 from nautilus_trader.core.nautilus_pyo3 import ed25519_signature
 from nautilus_trader.core.nautilus_pyo3 import hmac_signature
+from nautilus_trader.core.nautilus_pyo3 import mask_api_key
 from nautilus_trader.core.nautilus_pyo3 import rsa_signature
 
 
@@ -42,12 +43,12 @@ class BinanceHttpClient:
     ----------
     clock : LiveClock
         The clock for the client.
-    api_key : str
+    api_key : str, optional
         The Binance API key for requests.
-    api_secret : str
+        If ``None``, the client will work for public market data only.
+    api_secret : str, optional
         The Binance API secret for signed requests.
-    key_type : BinanceKeyType, default 'HMAC'
-        The private key cryptographic algorithm type.
+        If ``None``, the client will work for public market data only.
     rsa_private_key : str, optional
         The RSA private key for RSA signing.
     ed25519_private_key : str, optional
@@ -58,41 +59,52 @@ class BinanceHttpClient:
         The keyed rate limiter quotas for the client.
     ratelimiter_quota : Quota, optional
         The default rate limiter quota for the client.
+    proxy_url : str, optional
+        The proxy URL for HTTP requests.
 
     """
 
     def __init__(
         self,
         clock: LiveClock,
-        api_key: str,
-        api_secret: str,
+        api_key: str | None,
+        api_secret: str | None,
         base_url: str,
-        key_type: BinanceKeyType = BinanceKeyType.HMAC,
         rsa_private_key: str | None = None,
         ed25519_private_key: str | None = None,
         ratelimiter_quotas: list[tuple[str, Quota]] | None = None,
         ratelimiter_default_quota: Quota | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self._clock: LiveClock = clock
         self._log: Logger = Logger(type(self).__name__)
-        self._key: str = api_key
+        self._key: str | None = api_key
 
         self._base_url: str = base_url
-        self._secret: str = api_secret
-        self._key_type: BinanceKeyType = key_type
+        self._secret: str | None = api_secret
         self._rsa_private_key: str | None = rsa_private_key
-        self._ed25519_private_key: bytes | None = (
-            ed25519_private_key.encode() if ed25519_private_key else None
-        )
+        self._ed25519_private_key: bytes | None = None
+
+        if ed25519_private_key:
+            # Strip PEM headers/footers if present, then decode base64
+            key_data = "".join(
+                line for line in ed25519_private_key.splitlines() if not line.startswith("-----")
+            )
+            key_bytes = base64.b64decode(key_data)
+            # Extract 32-byte seed (works for both raw and PKCS#8 DER format)
+            self._ed25519_private_key = key_bytes[-32:]
 
         self._headers: dict[str, Any] = {
             "Content-Type": "application/json",
             "User-Agent": nautilus_trader.NAUTILUS_USER_AGENT,
-            "X-MBX-APIKEY": api_key,
         }
+
+        if api_key:
+            self._headers["X-MBX-APIKEY"] = api_key
         self._client = HttpClient(
             keyed_quotas=ratelimiter_quotas or [],
             default_quota=ratelimiter_default_quota,
+            proxy_url=proxy_url,
         )
 
     @property
@@ -108,16 +120,33 @@ class BinanceHttpClient:
         return self._base_url
 
     @property
-    def api_key(self) -> str:
+    def api_key(self) -> str | None:
         """
         Return the Binance API key being used by the client.
+
+        Returns
+        -------
+        str or None
+
+        """
+        return self._key
+
+    @property
+    def api_key_masked(self) -> str:
+        """
+        Return the masked Binance API key being used by the client.
+
+        Shows first 4 and last 4 characters with ellipsis in between.
+        For keys shorter than 8 characters, shows asterisks only.
 
         Returns
         -------
         str
 
         """
-        return self._key
+        if self._key is None:
+            return ""
+        return mask_api_key(self._key)
 
     @property
     def headers(self):
@@ -136,20 +165,14 @@ class BinanceHttpClient:
         return urllib.parse.urlencode(params)
 
     def _get_sign(self, data: str) -> str:
-        match self._key_type:
-            case BinanceKeyType.HMAC:
-                return hmac_signature(self._secret, data)
-            case BinanceKeyType.RSA:
-                if not self._rsa_private_key:
-                    raise ValueError("`rsa_private_key` was `None`")
-                return rsa_signature(self._rsa_private_key, data)
-            case BinanceKeyType.ED25519:
-                if not self._ed25519_private_key:
-                    raise ValueError("`ed25519_private_key` was `None`")
-                return ed25519_signature(self._ed25519_private_key, data)
-            case _:
-                # Theoretically unreachable but retained to keep the match exhaustive
-                raise ValueError(f"Unsupported key type, was '{self._key_type.value}'")
+        if self._secret is None:
+            raise ValueError("Cannot sign request: api_secret not configured")
+
+        if self._ed25519_private_key is not None:
+            return ed25519_signature(self._ed25519_private_key, data)
+        if self._rsa_private_key is not None:
+            return rsa_signature(self._rsa_private_key, data)
+        return hmac_signature(self._secret, data)
 
     async def sign_request(
         self,

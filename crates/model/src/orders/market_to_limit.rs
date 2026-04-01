@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -18,7 +18,6 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use anyhow;
 use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos, correctness::FAILED};
 use rust_decimal::Decimal;
@@ -43,7 +42,11 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct MarketToLimitOrder {
     core: OrderCore,
@@ -191,6 +194,12 @@ impl MarketToLimitOrder {
             ts_init,
         )
         .expect(FAILED)
+    }
+}
+
+impl PartialEq for MarketToLimitOrder {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_order_id == other.client_order_id
     }
 }
 
@@ -373,6 +382,10 @@ impl Order for MarketToLimitOrder {
         self.leaves_qty
     }
 
+    fn overfill_qty(&self) -> Quantity {
+        self.overfill_qty
+    }
+
     fn avg_px(&self) -> Option<f64> {
         self.avg_px
     }
@@ -422,16 +435,17 @@ impl Order for MarketToLimitOrder {
     }
 
     fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
-        if let OrderEventAny::Updated(ref event) = event {
-            self.update(event);
-        };
         let is_order_filled = matches!(event, OrderEventAny::Filled(_));
 
-        self.core.apply(event)?;
+        self.core.apply(event.clone())?;
 
-        if is_order_filled && self.price.is_some() {
-            self.core.set_slippage(self.price.unwrap());
-        };
+        if let OrderEventAny::Updated(ref event) = event {
+            self.update(event);
+        }
+
+        if is_order_filled && let Some(price) = self.price {
+            self.core.set_slippage(price);
+        }
 
         Ok(())
     }
@@ -448,7 +462,7 @@ impl Order for MarketToLimitOrder {
         }
 
         self.quantity = event.quantity;
-        self.leaves_qty = self.quantity - self.filled_qty;
+        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
     }
 
     fn is_triggered(&self) -> Option<bool> {
@@ -555,9 +569,6 @@ impl From<OrderInitialized> for MarketToLimitOrder {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -639,7 +650,7 @@ mod tests {
             .build();
     }
 
-    #[test]
+    #[rstest]
     fn test_market_to_limit_order_update() {
         // Create and accept a basic MarketToLimitOrder
         let order = OrderTestBuilder::new(OrderType::MarketToLimit)
@@ -668,7 +679,7 @@ mod tests {
         assert_eq!(accepted_order.price(), Some(updated_price));
     }
 
-    #[test]
+    #[rstest]
     fn test_market_to_limit_order_expire_time() {
         // Create a new MarketToLimitOrder with an expire time
         let expire_time = UnixNanos::from(1234567890);
@@ -682,7 +693,7 @@ mod tests {
         assert_eq!(order.expire_time(), Some(expire_time));
     }
 
-    #[test]
+    #[rstest]
     fn test_market_to_limit_order_from_order_initialized() {
         // Create an OrderInitialized event with all required fields for a MarketToLimitOrder
         let order_initialized = OrderInitializedBuilder::default()
@@ -702,7 +713,7 @@ mod tests {
         assert_eq!(order.quantity(), order_initialized.quantity);
     }
 
-    #[test]
+    #[rstest]
     fn test_market_to_limit_order_sets_slippage_when_filled() {
         // Create a MarketToLimitOrder
         let order = OrderTestBuilder::new(OrderType::MarketToLimit)

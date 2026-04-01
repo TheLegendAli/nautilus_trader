@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -25,9 +25,12 @@ use nautilus_core::{
         serialization::{from_dict_pyo3, to_dict_pyo3},
         to_pyvalue_err,
     },
-    serialization::Serializable,
+    serialization::{
+        Serializable,
+        msgpack::{FromMsgPack, ToMsgPack},
+    },
 };
-use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+use pyo3::{IntoPyObjectExt, basic::CompareOp, prelude::*, types::PyDict};
 
 use super::data_to_pycapsule;
 use crate::{
@@ -52,6 +55,11 @@ impl OrderBookDelta {
     ///
     /// Returns a `PyErr` if extracting any attribute or converting types fails.
     pub fn from_pyobject(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // Fast path: avoid property getters that trigger enum type deadlocks
+        if let Ok(delta) = obj.cast::<Self>() {
+            return Ok(*delta.borrow());
+        }
+
         let instrument_id_obj: Bound<'_, PyAny> = obj.getattr("instrument_id")?.extract()?;
         let instrument_id_str: String = instrument_id_obj.getattr("value")?.extract()?;
         let instrument_id = InstrumentId::from_str(instrument_id_str.as_str())
@@ -107,7 +115,9 @@ impl OrderBookDelta {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderBookDelta {
+    /// Represents a single change/delta in an order book.
     #[new]
     fn py_new(
         instrument_id: InstrumentId,
@@ -200,20 +210,18 @@ impl OrderBookDelta {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(OrderBookDelta))
     }
 
+    /// Returns the metadata for the type, for use with serialization formats.
     #[staticmethod]
     #[pyo3(name = "get_metadata")]
     fn py_get_metadata(
         instrument_id: &InstrumentId,
         price_precision: u8,
         size_precision: u8,
-    ) -> PyResult<HashMap<String, String>> {
-        Ok(Self::get_metadata(
-            instrument_id,
-            price_precision,
-            size_precision,
-        ))
+    ) -> HashMap<String, String> {
+        Self::get_metadata(instrument_id, price_precision, size_precision)
     }
 
+    /// Returns the field map for the type, for use with Arrow schemas.
     #[staticmethod]
     #[pyo3(name = "get_fields")]
     fn py_get_fields(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
@@ -232,18 +240,6 @@ impl OrderBookDelta {
         from_dict_pyo3(py, values)
     }
 
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_json_bytes(&data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_msgpack_bytes(&data).map_err(to_pyvalue_err)
-    }
-
     /// Creates a `PyCapsule` containing a raw pointer to a `Data::Delta` object.
     ///
     /// This function takes the current object (assumed to be of a type that can be represented as
@@ -260,7 +256,7 @@ impl OrderBookDelta {
     /// The function will panic if the `PyCapsule` creation fails, which can occur if the
     /// `Data::Delta` object cannot be converted into a raw pointer.
     #[pyo3(name = "as_pycapsule")]
-    fn py_as_pycapsule(&self, py: Python<'_>) -> PyObject {
+    fn py_as_pycapsule(&self, py: Python<'_>) -> Py<PyAny> {
         data_to_pycapsule(py, Data::Delta(*self))
     }
 
@@ -273,21 +269,37 @@ impl OrderBookDelta {
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
     fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
     /// Return MsgPack encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    }
+
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let from_dict = py.get_type::<Self>().getattr("from_dict")?;
+        let dict = self.py_to_dict(py)?;
+        (from_dict, (dict,)).into_py_any(py)
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
+#[pymethods]
+impl OrderBookDelta {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -297,9 +309,8 @@ mod tests {
 
     #[rstest]
     fn test_order_book_delta_py_new_with_zero_size_returns_error() {
-        pyo3::prepare_freethreaded_python();
-
-        Python::with_gil(|_py| {
+        Python::initialize();
+        Python::attach(|_py| {
             let instrument_id = InstrumentId::from("AAPL.XNAS");
             let action = BookAction::Add;
             let zero_size = Quantity::from(0);
@@ -328,22 +339,22 @@ mod tests {
 
     #[rstest]
     fn test_to_dict(stub_delta: OrderBookDelta) {
-        pyo3::prepare_freethreaded_python();
         let delta = stub_delta;
 
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict_string = delta.py_to_dict(py).unwrap().to_string();
-            let expected_string = r"{'type': 'OrderBookDelta', 'instrument_id': 'AAPL.XNAS', 'action': 'ADD', 'order': {'side': 'BUY', 'price': '100.00', 'size': '10', 'order_id': 123456}, 'flags': 0, 'sequence': 1, 'ts_event': 1, 'ts_init': 2}";
+            let expected_string = "{'type': 'OrderBookDelta', 'instrument_id': 'AAPL.XNAS', 'action': 'ADD', 'order': {'side': 'BUY', 'price': '100.00', 'size': '10', 'order_id': 123456}, 'flags': 0, 'sequence': 1, 'ts_event': 1, 'ts_init': 2}";
             assert_eq!(dict_string, expected_string);
         });
     }
 
     #[rstest]
     fn test_from_dict(stub_delta: OrderBookDelta) {
-        pyo3::prepare_freethreaded_python();
         let delta = stub_delta;
 
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict = delta.py_to_dict(py).unwrap();
             let parsed = OrderBookDelta::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, delta);
@@ -352,10 +363,10 @@ mod tests {
 
     #[rstest]
     fn test_from_pyobject(stub_delta: OrderBookDelta) {
-        pyo3::prepare_freethreaded_python();
         let delta = stub_delta;
 
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let delta_pyobject = delta.into_py_any_unwrap(py);
             let parsed_delta = OrderBookDelta::from_pyobject(delta_pyobject.bind(py)).unwrap();
             assert_eq!(parsed_delta, delta);

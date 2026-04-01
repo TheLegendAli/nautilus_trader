@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,6 +17,7 @@ from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.execution.reports import ExecutionMassStatus
 from nautilus_trader.execution.reports import FillReport
 from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.execution.reports import PositionStatusReport
 
 from libc.stdint cimport uint64_t
 
@@ -33,12 +34,15 @@ from nautilus_trader.core.uuid cimport UUID4
 from nautilus_trader.execution.messages cimport CancelAllOrders
 from nautilus_trader.execution.messages cimport CancelOrder
 from nautilus_trader.execution.messages cimport ModifyOrder
+from nautilus_trader.execution.messages cimport QueryAccount
+from nautilus_trader.execution.messages cimport QueryOrder
 from nautilus_trader.execution.messages cimport SubmitOrder
 from nautilus_trader.execution.messages cimport SubmitOrderList
 from nautilus_trader.model.events.account cimport AccountState
 from nautilus_trader.model.events.order cimport OrderAccepted
 from nautilus_trader.model.events.order cimport OrderCanceled
 from nautilus_trader.model.events.order cimport OrderCancelRejected
+from nautilus_trader.model.events.order cimport OrderDenied
 from nautilus_trader.model.events.order cimport OrderExpired
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.events.order cimport OrderModifyRejected
@@ -60,6 +64,7 @@ from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
+from nautilus_trader.model.orders.base cimport Order
 
 
 cdef class ExecutionClient(Component):
@@ -254,6 +259,22 @@ cdef class ExecutionClient(Component):
         )
         raise NotImplementedError("method `batch_cancel_orders` must be implemented in the subclass")
 
+    cpdef void query_account(self, QueryAccount command):
+        """
+        Query the account specified by the command which will generate an `AccountState` event.
+
+        Parameters
+        ----------
+        command : QueryAccount
+            The command to execute.
+
+        """
+        self._log.error(  # pragma: no cover
+            f"Cannot execute command {command}: not implemented. "  # pragma: no cover
+            f"You can implement by overriding the `query_account` method for this client",  # pragma: no cover  # noqa
+        )
+        raise NotImplementedError("method `query_account` must be implemented in the subclass")
+
     cpdef void query_order(self, QueryOrder command):
         """
         Initiate a reconciliation for the queried order which will generate an
@@ -314,6 +335,47 @@ cdef class ExecutionClient(Component):
 
         self._send_account_state(account_state)
 
+    cpdef void generate_order_denied(
+        self,
+        StrategyId strategy_id,
+        InstrumentId instrument_id,
+        ClientOrderId client_order_id,
+        str reason,
+        uint64_t ts_event,
+    ):
+        """
+        Generate an `OrderDenied` event and send it to the `ExecutionEngine`.
+
+        Parameters
+        ----------
+        strategy_id : StrategyId
+            The strategy ID associated with the event.
+        instrument_id : InstrumentId
+            The instrument ID.
+        client_order_id : ClientOrderId
+            The client order ID.
+        reason : str
+            The order denied reason.
+        ts_event : uint64_t
+            UNIX timestamp (nanoseconds) when the order denied event occurred.
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        # Generate event
+        cdef OrderDenied denied = OrderDenied(
+            trader_id=self.trader_id,
+            strategy_id=strategy_id,
+            instrument_id=instrument_id,
+            client_order_id=client_order_id,
+            reason=reason,
+            event_id=UUID4(),
+            ts_init=self._clock.timestamp_ns(),
+        )
+        denied._mem.ts_event = ts_event
+
+        self._send_order_event(denied)
+
     cpdef void generate_order_submitted(
         self,
         StrategyId strategy_id,
@@ -357,6 +419,7 @@ cdef class ExecutionClient(Component):
         ClientOrderId client_order_id,
         str reason,
         uint64_t ts_event,
+        bint due_post_only=False,
     ):
         """
         Generate an `OrderRejected` event and send it to the `ExecutionEngine`.
@@ -373,6 +436,8 @@ cdef class ExecutionClient(Component):
             The order rejected reason.
         ts_event : uint64_t
             UNIX timestamp (nanoseconds) when the order rejected event occurred.
+        due_post_only : bool, default False
+            If the order was rejected because it was post-only and would execute immediately as a taker.
 
         """
         # Generate event
@@ -386,6 +451,7 @@ cdef class ExecutionClient(Component):
             event_id=UUID4(),
             ts_event=ts_event,
             ts_init=self._clock.timestamp_ns(),
+            due_post_only=due_post_only,
         )
 
         self._send_order_event(rejected)
@@ -529,6 +595,7 @@ cdef class ExecutionClient(Component):
         Price trigger_price,
         uint64_t ts_event,
         bint venue_order_id_modified=False,
+        object is_quote_quantity=None,
     ):
         """
         Generate an `OrderUpdated` event and send it to the `ExecutionEngine`.
@@ -553,6 +620,9 @@ cdef class ExecutionClient(Component):
             UNIX timestamp (nanoseconds) when the order update event occurred.
         venue_order_id_modified : bool
             If the ID was modified for this event.
+        is_quote_quantity : bool, optional
+            Override for the quote quantity flag. If ``None``, preserves
+            the existing value from the cached order.
 
         """
         Condition.not_none(client_order_id, "client_order_id")
@@ -565,6 +635,16 @@ cdef class ExecutionClient(Component):
                 Condition.equal(existing, venue_order_id, "existing", "order.venue_order_id")
             else:
                 self._log.warning(f"{venue_order_id} does not match existing {repr(existing)}")
+
+        # Resolve is_quote_quantity: explicit override or preserve from cache
+        cdef bint resolved_is_quote_quantity = False
+
+        if is_quote_quantity is not None:
+            resolved_is_quote_quantity = is_quote_quantity
+        else:
+            existing_order = self._cache.order(client_order_id)
+            if existing_order is not None:
+                resolved_is_quote_quantity = existing_order.is_quote_quantity
 
         # Generate event
         cdef OrderUpdated updated = OrderUpdated(
@@ -580,6 +660,7 @@ cdef class ExecutionClient(Component):
             event_id=UUID4(),
             ts_event=ts_event,
             ts_init=self._clock.timestamp_ns(),
+            is_quote_quantity=resolved_is_quote_quantity,
         )
 
         self._send_order_event(updated)
@@ -805,18 +886,24 @@ cdef class ExecutionClient(Component):
 
     cpdef void _send_mass_status_report(self, report: ExecutionMassStatus):
         self._msgbus.send(
-            endpoint="ExecEngine.reconcile_mass_status",
+            endpoint="ExecEngine.reconcile_execution_mass_status",
             msg=report,
         )
 
     cpdef void _send_order_status_report(self, report: OrderStatusReport):
         self._msgbus.send(
-            endpoint="ExecEngine.reconcile_report",
+            endpoint="ExecEngine.reconcile_execution_report",
             msg=report,
         )
 
     cpdef void _send_fill_report(self, report: FillReport):
         self._msgbus.send(
-            endpoint="ExecEngine.reconcile_report",
+            endpoint="ExecEngine.reconcile_execution_report",
+            msg=report,
+        )
+
+    cpdef void _send_position_status_report(self, report: PositionStatusReport):
+        self._msgbus.send(
+            endpoint="ExecEngine.reconcile_execution_report",
             msg=report,
         )

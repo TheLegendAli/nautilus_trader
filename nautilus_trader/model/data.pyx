@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -47,6 +47,7 @@ from nautilus_trader.core.rust.model cimport BookAction
 from nautilus_trader.core.rust.model cimport BookOrder_t
 from nautilus_trader.core.rust.model cimport Data_t
 from nautilus_trader.core.rust.model cimport Data_t_Tag
+from nautilus_trader.core.rust.model cimport IndexPriceUpdate_t
 from nautilus_trader.core.rust.model cimport InstrumentCloseType
 from nautilus_trader.core.rust.model cimport MarketStatusAction
 from nautilus_trader.core.rust.model cimport MarkPriceUpdate_t
@@ -93,6 +94,10 @@ from nautilus_trader.core.rust.model cimport book_order_exposure
 from nautilus_trader.core.rust.model cimport book_order_hash
 from nautilus_trader.core.rust.model cimport book_order_new
 from nautilus_trader.core.rust.model cimport book_order_signed_size
+from nautilus_trader.core.rust.model cimport index_price_update_eq
+from nautilus_trader.core.rust.model cimport index_price_update_hash
+from nautilus_trader.core.rust.model cimport index_price_update_new
+from nautilus_trader.core.rust.model cimport index_price_update_to_cstr
 from nautilus_trader.core.rust.model cimport instrument_id_from_cstr
 from nautilus_trader.core.rust.model cimport mark_price_update_eq
 from nautilus_trader.core.rust.model cimport mark_price_update_hash
@@ -120,6 +125,8 @@ from nautilus_trader.core.rust.model cimport orderbook_depth10_clone
 from nautilus_trader.core.rust.model cimport orderbook_depth10_eq
 from nautilus_trader.core.rust.model cimport orderbook_depth10_hash
 from nautilus_trader.core.rust.model cimport orderbook_depth10_new
+from nautilus_trader.core.rust.model cimport price_from_raw
+from nautilus_trader.core.rust.model cimport quantity_from_raw
 from nautilus_trader.core.rust.model cimport quote_tick_eq
 from nautilus_trader.core.rust.model cimport quote_tick_hash
 from nautilus_trader.core.rust.model cimport quote_tick_new
@@ -161,6 +168,48 @@ from nautilus_trader.model.objects cimport price_new
 from nautilus_trader.model.objects cimport quantity_new
 
 
+_SUPPORTED_BAR_AGGREGATIONS = (
+    BarAggregation.MILLISECOND,
+    BarAggregation.SECOND,
+    BarAggregation.MINUTE,
+    BarAggregation.HOUR,
+    BarAggregation.DAY,
+    BarAggregation.WEEK,
+    BarAggregation.MONTH,
+    BarAggregation.YEAR,
+    BarAggregation.TICK,
+    BarAggregation.TICK_IMBALANCE,
+    BarAggregation.TICK_RUNS,
+    BarAggregation.VOLUME,
+    BarAggregation.VOLUME_IMBALANCE,
+    BarAggregation.VOLUME_RUNS,
+    BarAggregation.VALUE,
+    BarAggregation.VALUE_IMBALANCE,
+    BarAggregation.VALUE_RUNS,
+    BarAggregation.RENKO,
+)
+
+
+cpdef str supported_bar_aggregations_str():
+    cdef list[str] names = []
+
+    # Using an imperative for loop here as closures not supported in cpdef
+    cdef BarAggregation aggregation
+    for aggregation in _SUPPORTED_BAR_AGGREGATIONS:
+        names.append(bar_aggregation_to_str(aggregation))
+
+    return ", ".join(names)
+
+
+cpdef str bar_aggregation_not_implemented_message(BarAggregation aggregation):
+    agg_str = bar_aggregation_to_str(aggregation)
+    supported = supported_bar_aggregations_str()
+    return (
+        f"BarAggregation.{agg_str} is not currently implemented. "
+        f"Supported aggregations are: {supported}."
+    )
+
+
 cdef inline BookOrder order_from_mem_c(BookOrder_t mem):
     cdef BookOrder order = BookOrder.__new__(BookOrder)
     order._mem = mem
@@ -197,6 +246,29 @@ cdef inline TradeTick trade_from_mem_c(TradeTick_t mem):
     return trade
 
 
+cdef inline str data_tag_to_str(Data_t_Tag tag):
+    if tag == Data_t_Tag.DELTA:
+        return "DELTA"
+    elif tag == Data_t_Tag.DELTAS:
+        return "DELTAS"
+    elif tag == Data_t_Tag.DEPTH10:
+        return "DEPTH10"
+    elif tag == Data_t_Tag.QUOTE:
+        return "QUOTE"
+    elif tag == Data_t_Tag.TRADE:
+        return "TRADE"
+    elif tag == Data_t_Tag.BAR:
+        return "BAR"
+    elif tag == Data_t_Tag.MARK_PRICE_UPDATE:
+        return "MARK_PRICE_UPDATE"
+    elif tag == Data_t_Tag.INDEX_PRICE_UPDATE:
+        return "INDEX_PRICE_UPDATE"
+    elif tag == Data_t_Tag.INSTRUMENT_CLOSE:
+        return "INSTRUMENT_CLOSE"
+    else:
+        return f"UNKNOWN({int(tag)})"
+
+
 cdef inline Bar bar_from_mem_c(Bar_t mem):
     cdef Bar bar = Bar.__new__(Bar)
     bar._mem = mem
@@ -204,9 +276,15 @@ cdef inline Bar bar_from_mem_c(Bar_t mem):
 
 
 cdef inline MarkPriceUpdate mark_price_from_mem_c(MarkPriceUpdate_t mem):
-    cdef MarkPriceUpdate obj = MarkPriceUpdate.__new__(MarkPriceUpdate)
-    obj._mem = mem
-    return obj
+    cdef MarkPriceUpdate update = MarkPriceUpdate.__new__(MarkPriceUpdate)
+    update._mem = mem
+    return update
+
+
+cdef inline IndexPriceUpdate index_price_from_mem_c(IndexPriceUpdate_t mem):
+    cdef IndexPriceUpdate update = IndexPriceUpdate.__new__(IndexPriceUpdate)
+    update._mem = mem
+    return update
 
 
 # SAFETY: Do NOT deallocate the capsule here
@@ -231,6 +309,10 @@ cpdef list capsule_to_list(capsule):
             objects.append(bar_from_mem_c(ptr[i].bar))
         elif ptr[i].tag == Data_t_Tag.MARK_PRICE_UPDATE:
             objects.append(mark_price_from_mem_c(ptr[i].mark_price_update))
+        elif ptr[i].tag == Data_t_Tag.INDEX_PRICE_UPDATE:
+            objects.append(index_price_from_mem_c(ptr[i].index_price_update))
+        else:
+            raise RuntimeError("Invalid data element to convert from `PyCapsule`")
 
     return objects
 
@@ -251,6 +333,10 @@ cpdef Data capsule_to_data(capsule):
         return trade_from_mem_c(ptr.trade)
     elif ptr.tag == Data_t_Tag.BAR:
         return bar_from_mem_c(ptr.bar)
+    elif ptr.tag == Data_t_Tag.MARK_PRICE_UPDATE:
+        return mark_price_from_mem_c(ptr.mark_price_update)
+    elif ptr.tag == Data_t_Tag.INDEX_PRICE_UPDATE:
+        return index_price_from_mem_c(ptr.index_price_update)
     else:
         raise RuntimeError("Invalid data element to convert from `PyCapsule`")
 
@@ -449,6 +535,8 @@ cdef class BarSpecification:
         return cstr_to_pystr(bar_specification_to_cstr(&self._mem))
 
     def __eq__(self, BarSpecification other) -> bool:
+        if other is None:
+            return False
         return bar_specification_eq(&self._mem, &other._mem)
 
     def __lt__(self, BarSpecification other) -> bool:
@@ -524,9 +612,6 @@ cdef class BarSpecification:
             Raises
             ------
             ValueError
-                If the aggregation is MONTH or YEAR (since months and years have variable
-                lengths 28-31 days or 365-366 days, making fixed nanosecond conversion
-                impossible).
                 If the aggregation is not a time-based aggregation.
 
             Notes
@@ -534,9 +619,7 @@ cdef class BarSpecification:
             Only time-based aggregations can be converted to nanosecond intervals.
             Threshold-based and information-based aggregations will raise a ValueError.
 
-            Month or year intervals require special handling due to their variable length,
-            which cannot be expressed as a fixed number of nanoseconds. DateOffset is used
-            instead for these aggregations.
+            Month or year intervals use proxy values to estimate their respective durations.
 
             Examples
             --------
@@ -552,27 +635,17 @@ cdef class BarSpecification:
             elif aggregation is BarAggregation.SECOND:
                 return secs_to_nanos(step)
             elif aggregation is BarAggregation.MINUTE:
-                return secs_to_nanos(step) * 60
+                return step * secs_to_nanos(60)
             elif aggregation is BarAggregation.HOUR:
-                return secs_to_nanos(step) * 60 * 60
+                return step * secs_to_nanos(60 * 60)
             elif aggregation is BarAggregation.DAY:
-                return secs_to_nanos(step) * 60 * 60 * 24
+                return step * secs_to_nanos(60 * 60 * 24)
             elif aggregation is BarAggregation.WEEK:
-                return secs_to_nanos(step) * 60 * 60 * 24 * 7
+                return step * secs_to_nanos(60 * 60 * 24 * 7)
             elif aggregation is BarAggregation.MONTH:
-                # Not actually used for the aggregation. DateOffset are used instead
-                # given the fact, the lengths of the months differs.
-                raise ValueError(
-                    f"get_interval_ns not supported for the `BarAggregation.MONTH` aggregation "
-                    f"`DateOffset` is used instead."
-                )
+                return step * secs_to_nanos(60 * 60 * 24 * 30) # Proxy for comparing bar lengths
             elif aggregation is BarAggregation.YEAR:
-                # Not actually used for the aggregation. DateOffset are used instead
-                # given the fact, the lengths of the years differs (leap years).
-                raise ValueError(
-                    f"get_interval_ns not supported for the `BarAggregation.YEAR` aggregation "
-                    f"`DateOffset` is used instead."
-                )
+                return step * secs_to_nanos(60 * 60 * 24 * 365) # Proxy for comparing bar lengths
             else:
                 # Design time error
                 raise ValueError(
@@ -865,74 +938,74 @@ cdef class BarSpecification:
         return BarSpecification.check_information_aggregated_c(aggregation)
 
     cpdef bint is_time_aggregated(self):
-        """
-        Return a value indicating whether the aggregation method is time-driven.
+            """
+            Return a value indicating whether the aggregation method is time-driven.
 
-        Time-based aggregation creates bars at fixed time intervals based on calendar
-        or clock time, providing consistent temporal sampling of market data. Each bar
-        covers a specific time period regardless of trading activity level.
+            Time-based aggregation creates bars at fixed time intervals based on calendar
+            or clock time, providing consistent temporal sampling of market data. Each bar
+            covers a specific time period regardless of trading activity level.
 
-        Time-based aggregation types supported:
-        - ``MILLISECOND``: Fixed millisecond intervals (high-frequency sampling)
-        - ``SECOND``: Fixed second intervals (short-term patterns)
-        - ``MINUTE``: Fixed minute intervals (most common for retail trading)
-        - ``HOUR``: Fixed hour intervals (intraday analysis)
-        - ``DAY``: Fixed daily intervals (daily charts, longer-term analysis)
-        - ``WEEK``: Fixed weekly intervals (weekly patterns, medium-term trends)
-        - ``MONTH``: Fixed monthly intervals (long-term analysis, seasonal patterns)
-        - ``YEAR``: Fixed yearly intervals (annual trends, long-term investment)
+            Time-based aggregation types supported:
+            - ``MILLISECOND``: Fixed millisecond intervals (high-frequency sampling)
+            - ``SECOND``: Fixed second intervals (short-term patterns)
+            - ``MINUTE``: Fixed minute intervals (most common for retail trading)
+            - ``HOUR``: Fixed hour intervals (intraday analysis)
+            - ``DAY``: Fixed daily intervals (daily charts, longer-term analysis)
+            - ``WEEK``: Fixed weekly intervals (weekly patterns, medium-term trends)
+            - ``MONTH``: Fixed monthly intervals (long-term analysis, seasonal patterns)
+            - ``YEAR``: Fixed yearly intervals (annual trends, long-term investment)
 
-        Time-based bars are ideal for:
-        - Regular time-series analysis and charting
-        - Consistent temporal sampling across different market conditions
-        - Traditional technical analysis and pattern recognition
-        - Comparing market behavior across fixed time periods
+            Time-based bars are ideal for:
+            - Regular time-series analysis and charting
+            - Consistent temporal sampling across different market conditions
+            - Traditional technical analysis and pattern recognition
+            - Comparing market behavior across fixed time periods
 
-        This differs from threshold aggregation (volume/tick-based) which creates
-        bars when activity levels are reached, and information aggregation which
-        creates bars based on market microstructure patterns.
+            This differs from threshold aggregation (volume/tick-based) which creates
+            bars when activity levels are reached, and information aggregation which
+            creates bars based on market microstructure patterns.
 
-        Returns
-        -------
-        bool
-            True if the aggregation method is time-based, else False.
+            Returns
+            -------
+            bool
+                True if the aggregation method is time-based, else False.
 
-        See Also
-        --------
-        is_threshold_aggregated : Check for threshold-based aggregation
-        is_information_aggregated : Check for information-based aggregation
+            See Also
+            --------
+            is_threshold_aggregated : Check for threshold-based aggregation
+            is_information_aggregated : Check for information-based aggregation
 
-        Examples
-        --------
-        Create a 5-minute bar specification using last price:
+            Examples
+            --------
+            Create a 5-minute bar specification using last price:
 
-        >>> spec = BarSpecification(5, BarAggregation.MINUTE, PriceType.LAST)
-        >>> str(spec)
-        '5-MINUTE-LAST'
+            >>> spec = BarSpecification(5, BarAggregation.MINUTE, PriceType.LAST)
+            >>> str(spec)
+            '5-MINUTE-LAST'
 
-        Create a tick bar specification:
+            Create a tick bar specification:
 
-        >>> spec = BarSpecification(1000, BarAggregation.TICK, PriceType.MID)
-        >>> str(spec)
-        '1000-TICK-MID'
+            >>> spec = BarSpecification(1000, BarAggregation.TICK, PriceType.MID)
+            >>> str(spec)
+            '1000-TICK-MID'
 
-        Parse from string:
+            Parse from string:
 
-        >>> spec = BarSpecification.from_str("15-MINUTE-BID")
-        >>> spec.step
-        15
-        >>> spec.aggregation
-        BarAggregation.MINUTE
+            >>> spec = BarSpecification.from_str("15-MINUTE-BID")
+            >>> spec.step
+            15
+            >>> spec.aggregation
+            BarAggregation.MINUTE
 
-        Check aggregation type:
+            Check aggregation type:
 
-        >>> spec = BarSpecification(1, BarAggregation.HOUR, PriceType.LAST)
-        >>> spec.is_time_aggregated()
-        True
-        >>> spec.is_threshold_aggregated()
-        False
-        """
-        return BarSpecification.check_time_aggregated_c(self.aggregation)
+            >>> spec = BarSpecification(1, BarAggregation.HOUR, PriceType.LAST)
+            >>> spec.is_time_aggregated()
+            True
+            >>> spec.is_threshold_aggregated()
+            False
+            """
+            return BarSpecification.check_time_aggregated_c(self.aggregation)
 
     cpdef bint is_threshold_aggregated(self):
         """
@@ -1149,6 +1222,8 @@ cdef class BarType:
         return cstr_to_pystr(bar_type_to_cstr(&self._mem))
 
     def __eq__(self, BarType other) -> bool:
+        if other is None:
+            return False
         return self.to_str() == other.to_str()
 
     def __lt__(self, BarType other) -> bool:
@@ -1324,6 +1399,21 @@ cdef class BarType:
         bar_type._mem = bar_type_composite(&self._mem)
         return bar_type
 
+    cpdef tuple[InstrumentId, BarSpecification] id_spec_key(self):
+        """
+        Return the instrument ID and bar specification as a tuple key.
+
+        Useful as a hashmap key when aggregation source should be ignored,
+        such as for indicator registration where INTERNAL and EXTERNAL bars
+        should trigger the same indicators.
+
+        Returns
+        -------
+        tuple[InstrumentId, BarSpecification]
+
+        """
+        return (self.instrument_id, self.spec)
+
 
 cdef class Bar(Data):
     """
@@ -1464,6 +1554,8 @@ cdef class Bar(Data):
             )
 
     def __eq__(self, Bar other) -> bool:
+        if other is None:
+            return False
         return self.to_str() == other.to_str()
 
     def __hash__(self) -> int:
@@ -1591,11 +1683,12 @@ cdef class Bar(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ):
-        cdef Price_t open_price = price_new(open, price_prec)
-        cdef Price_t high_price = price_new(high, price_prec)
-        cdef Price_t low_price = price_new(low, price_prec)
-        cdef Price_t close_price = price_new(close, price_prec)
-        cdef Quantity_t volume_qty = quantity_new(volume, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t open_price = price_from_raw(open, price_prec)
+        cdef Price_t high_price = price_from_raw(high, price_prec)
+        cdef Price_t low_price = price_from_raw(low, price_prec)
+        cdef Price_t close_price = price_from_raw(close, price_prec)
+        cdef Quantity_t volume_qty = quantity_from_raw(volume, size_prec)
         cdef Bar bar = Bar.__new__(Bar)
         bar._mem = bar_new(
             bar_type._mem,
@@ -1722,6 +1815,13 @@ cdef class Bar(Data):
         # It is supposed to be deallocated by the creator
         capsule = pyo3_bar.as_pycapsule()
         cdef Data_t* ptr = <Data_t*>PyCapsule_GetPointer(capsule, NULL)
+        if ptr == NULL:
+            raise ValueError("Invalid Data_t PyCapsule (NULL)")
+
+        # Validate the tag to prevent segfault
+        if ptr.tag != Data_t_Tag.BAR:
+            raise ValueError(f"Invalid Data_t tag: expected BAR, was {data_tag_to_str(ptr.tag)}")
+
         return bar_from_mem_c(ptr.bar)
 
     @staticmethod
@@ -1737,6 +1837,19 @@ cdef class Bar(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ) -> Bar:
+        """
+        Create a bar from raw fixed-point values.
+
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            ``from_dict()`` or other higher-level construction methods instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
+
+        """
         return Bar.from_raw_c(
             bar_type,
             open,
@@ -1903,8 +2016,10 @@ cdef class DataType:
     ----------
     type : type
         The `Data` type of the data.
-    metadata : dict
+    metadata : dict, optional
         The data types metadata.
+    identifier : str, optional
+        Optional catalog path identifier (can contain subdirs, e.g. "venue//symbol").
 
     Raises
     ------
@@ -1920,13 +2035,14 @@ cdef class DataType:
 
     """
 
-    def __init__(self, type type not None, dict metadata = None) -> None:  # noqa (shadows built-in type)
+    def __init__(self, type type not None, dict metadata = None, identifier = None) -> None:  # noqa (shadows built-in type)
         if not issubclass(type, Data):
             if not (hasattr(type, "ts_event") and hasattr(type, "ts_init")):
                 raise TypeError("`type` was not a subclass of `Data`")
 
         self.type = type
         self.metadata = metadata or {}
+        self.identifier = identifier
         self.topic = self.type.__name__ + '.' + '.'.join([
             f'{k}={v if v is not None else "*"}' for k, v in self.metadata.items()
         ]) if self.metadata else self.type.__name__ + "*"
@@ -1935,6 +2051,8 @@ cdef class DataType:
         self._hash = hash((self.type, self._key))  # Assign hash for improved time complexity
 
     def __eq__(self, DataType other) -> bool:
+        if other is None:
+            return False
         return self.type == other.type and self._key == other._key  # noqa
 
     def __lt__(self, DataType other) -> bool:
@@ -2069,6 +2187,8 @@ cdef class BookOrder:
         )
 
     def __eq__(self, BookOrder other) -> bool:
+        if other is None:
+            return False
         return book_order_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -2086,8 +2206,9 @@ cdef class BookOrder:
         uint8_t size_prec,
         uint64_t order_id,
     ):
-        cdef Price_t price = price_new(price_raw, price_prec)
-        cdef Quantity_t size = quantity_new(size_raw, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t price = price_from_raw(price_raw, price_prec)
+        cdef Quantity_t size = quantity_from_raw(size_raw, size_prec)
         cdef BookOrder order = BookOrder.__new__(BookOrder)
         order._mem = book_order_new(
             side,
@@ -2181,7 +2302,16 @@ cdef class BookOrder:
         uint64_t order_id,
     ) -> BookOrder:
         """
-        Return an book order from the given raw values.
+        Return a book order from the given raw values.
+
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            other higher-level construction methods instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
 
         Parameters
         ----------
@@ -2366,6 +2496,8 @@ cdef class OrderBookDelta(Data):
         )
 
     def __eq__(self, OrderBookDelta other) -> bool:
+        if other is None:
+            return False
         return orderbook_delta_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -2533,8 +2665,9 @@ cdef class OrderBookDelta(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ):
-        cdef Price_t price = price_new(price_raw, price_prec)
-        cdef Quantity_t size = quantity_new(size_raw, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t price = price_from_raw(price_raw, price_prec)
+        cdef Quantity_t size = quantity_from_raw(size_raw, size_prec)
         cdef BookOrder_t book_order = book_order_new(
             side,
             price,
@@ -2567,6 +2700,13 @@ cdef class OrderBookDelta(Data):
         # It is supposed to be deallocated by the creator
         capsule = pyo3_delta.as_pycapsule()
         cdef Data_t* ptr = <Data_t*>PyCapsule_GetPointer(capsule, NULL)
+        if ptr == NULL:
+            raise ValueError("Invalid Data_t PyCapsule (NULL)")
+
+        # Validate the tag to prevent segfault
+        if ptr.tag != Data_t_Tag.DELTA:
+            raise ValueError(f"Invalid Data_t tag: expected DELTA, was {data_tag_to_str(ptr.tag)}")
+
         return delta_from_mem_c(ptr.delta)
 
     @staticmethod
@@ -2680,6 +2820,15 @@ cdef class OrderBookDelta(Data):
     ) -> OrderBookDelta:
         """
         Return an order book delta from the given raw values.
+
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            other higher-level construction methods instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
 
         Parameters
         ----------
@@ -2804,10 +2953,17 @@ cdef class OrderBookDelta(Data):
             if size_prec == 0:
                 size_prec = delta._mem.order.size.precision
 
+            # Use per-delta precision for sentinel values (PRICE_UNDEF has precision=0)
             pyo3_book_order = nautilus_pyo3.BookOrder(
                nautilus_pyo3.OrderSide(order_side_to_str(delta._mem.order.side)),
-               nautilus_pyo3.Price.from_raw(delta._mem.order.price.raw, price_prec),
-               nautilus_pyo3.Quantity.from_raw(delta._mem.order.size.raw, size_prec),
+               nautilus_pyo3.Price.from_raw(
+                   delta._mem.order.price.raw,
+                   delta._mem.order.price.precision if delta._mem.order.price.precision == 0 else price_prec,
+               ),
+               nautilus_pyo3.Quantity.from_raw(
+                   delta._mem.order.size.raw,
+                   delta._mem.order.size.precision if delta._mem.order.size.precision == 0 else size_prec,
+               ),
                delta._mem.order.order_id,
             )
 
@@ -2967,6 +3123,9 @@ cdef class OrderBookDeltas(Data):
             orderbook_deltas_drop(self._mem)
 
     def __eq__(self, OrderBookDeltas other) -> bool:
+        if other is None:
+            return False
+
         return OrderBookDeltas.to_dict_c(self) == OrderBookDeltas.to_dict_c(other)
 
     def __hash__(self) -> int:
@@ -3163,7 +3322,8 @@ cdef class OrderBookDeltas(Data):
             OrderBookDelta delta
         for delta in data:
             batch.append(delta)
-            if delta.flags == RecordFlag.F_LAST:
+
+            if delta.flags & RecordFlag.F_LAST:
                 batches.append(batch)
                 batch = []
 
@@ -3186,6 +3346,26 @@ cdef class OrderBookDeltas(Data):
         data[0] = self._mem
         capsule = PyCapsule_New(data, NULL, <PyCapsule_Destructor>capsule_destructor_deltas)
         return capsule
+
+    @staticmethod
+    def from_pyo3(pyo3_deltas) -> OrderBookDeltas:
+        """
+        Return legacy Cython orderbook deltas converted from the given pyo3 Rust object.
+
+        Parameters
+        ----------
+        pyo3_deltas : nautilus_pyo3.OrderBookDeltas
+            The pyo3 Rust orderbook deltas to convert from.
+
+        Returns
+        -------
+        OrderBookDeltas
+
+        """
+        return OrderBookDeltas(
+            instrument_id=InstrumentId.from_str(pyo3_deltas.instrument_id.value),
+            deltas=OrderBookDelta.from_pyo3_list(pyo3_deltas.deltas),
+        )
 
     cpdef to_pyo3(self):
         """
@@ -3361,6 +3541,8 @@ cdef class OrderBookDepth10(Data):
             PyMem_Free(ask_counts_array)
 
     def __eq__(self, OrderBookDepth10 other) -> bool:
+        if other is None:
+            return False
         return orderbook_depth10_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -3433,6 +3615,45 @@ cdef class OrderBookDepth10(Data):
             asks.append(order)
 
         return asks
+
+    cpdef QuoteTick to_quote_tick(self):
+        """
+        Return a `QuoteTick` created from the top of book levels.
+
+        Returns ``None`` when the top-of-book bid or ask is missing or invalid
+        (NULL order or zero size).
+
+        Returns
+        -------
+        QuoteTick or ``None``
+
+        """
+        cdef list[BookOrder] bids = self.bids
+        cdef list[BookOrder] asks = self.asks
+
+        if not bids or not asks:
+            return None
+
+        cdef BookOrder top_bid = bids[0]
+        cdef BookOrder top_ask = asks[0]
+
+        if (
+            top_bid.side == OrderSide.NO_ORDER_SIDE or
+            top_ask.side == OrderSide.NO_ORDER_SIDE or
+            top_bid._mem.size.raw == 0 or
+            top_ask._mem.size.raw == 0
+        ):
+            return None
+
+        return QuoteTick(
+            instrument_id=self.instrument_id,
+            bid_price=top_bid.price,
+            ask_price=top_ask.price,
+            bid_size=top_bid.size,
+            ask_size=top_ask.size,
+            ts_event=self.ts_event,
+            ts_init=self.ts_init,
+        )
 
     @property
     def bid_counts(self) -> list[uint32_t]:
@@ -3530,6 +3751,13 @@ cdef class OrderBookDepth10(Data):
         # It is supposed to be deallocated by the creator
         capsule = pyo3_depth10.as_pycapsule()
         cdef Data_t* ptr = <Data_t*>PyCapsule_GetPointer(capsule, NULL)
+        if ptr == NULL:
+            raise ValueError("Invalid Data_t PyCapsule (NULL)")
+
+        # Validate the tag to prevent segfault
+        if ptr.tag != Data_t_Tag.DEPTH10:
+            raise ValueError(f"Invalid Data_t tag: expected DEPTH10, was {data_tag_to_str(ptr.tag)}")
+
         return depth10_from_mem_c(orderbook_depth10_clone(ptr.depth10))
 
     @staticmethod
@@ -3724,6 +3952,8 @@ cdef class InstrumentStatus(Data):
         self._is_short_sell_restricted = is_short_sell_restricted
 
     def __eq__(self, InstrumentStatus other) -> bool:
+        if other is None:
+            return False
         return InstrumentStatus.to_dict_c(self) == InstrumentStatus.to_dict_c(other)
 
     def __hash__(self) -> int:
@@ -3943,6 +4173,8 @@ cdef class InstrumentClose(Data):
         self.ts_init = ts_init
 
     def __eq__(self, InstrumentClose other) -> bool:
+        if other is None:
+            return False
         return InstrumentClose.to_dict_c(self) == InstrumentClose.to_dict_c(other)
 
     def __hash__(self) -> int:
@@ -4091,7 +4323,7 @@ cdef class InstrumentClose(Data):
             ts_init=pyo3_close.ts_init,
         )
 
-    def to_pyo3(self) -> nautilus_pyo3.IndexPriceUpdate:
+    def to_pyo3(self) -> nautilus_pyo3.InstrumentClose:
         """
         Return a pyo3 object from this legacy Cython instance.
 
@@ -4196,6 +4428,8 @@ cdef class QuoteTick(Data):
         )
 
     def __eq__(self, QuoteTick other) -> bool:
+        if other is None:
+            return False
         return quote_tick_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -4304,6 +4538,13 @@ cdef class QuoteTick(Data):
         # It is supposed to be deallocated by the creator
         capsule = pyo3_quote.as_pycapsule()
         cdef Data_t* ptr = <Data_t*>PyCapsule_GetPointer(capsule, NULL)
+        if ptr == NULL:
+            raise ValueError("Invalid Data_t PyCapsule (NULL)")
+
+        # Validate the tag to prevent segfault
+        if ptr.tag != Data_t_Tag.QUOTE:
+            raise ValueError(f"Invalid Data_t tag: expected QUOTE, was {data_tag_to_str(ptr.tag)}")
+
         return quote_from_mem_c(ptr.quote)
 
     @staticmethod
@@ -4347,10 +4588,11 @@ cdef class QuoteTick(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ):
-        cdef Price_t bid_price = price_new(bid_price_raw, bid_price_prec)
-        cdef Price_t ask_price = price_new(ask_price_raw, ask_price_prec)
-        cdef Quantity_t bid_size = quantity_new(bid_size_raw, bid_size_prec)
-        cdef Quantity_t ask_size = quantity_new(ask_size_raw, ask_size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t bid_price = price_from_raw(bid_price_raw, bid_price_prec)
+        cdef Price_t ask_price = price_from_raw(ask_price_raw, ask_price_prec)
+        cdef Quantity_t bid_size = quantity_from_raw(bid_size_raw, bid_size_prec)
+        cdef Quantity_t ask_size = quantity_from_raw(ask_size_raw, ask_size_prec)
         cdef QuoteTick quote = QuoteTick.__new__(QuoteTick)
         quote._mem = quote_tick_new(
             instrument_id._mem,
@@ -4491,6 +4733,15 @@ cdef class QuoteTick(Data):
         """
         Return a quote tick from the given raw values.
 
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            the regular constructor or ``from_dict`` instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
+
         Parameters
         ----------
         instrument_id : InstrumentId
@@ -4526,6 +4777,8 @@ cdef class QuoteTick(Data):
             If `bid_price_prec` != `ask_price_prec`.
         ValueError
             If `bid_size_prec` != `ask_size_prec`.
+        ValueError
+            If any raw price/size value is invalid for the given precision.
 
         """
         Condition.equal(bid_price_prec, ask_price_prec, "bid_price_prec", "ask_price_prec")
@@ -4810,6 +5063,8 @@ cdef class TradeTick(Data):
         )
 
     def __eq__(self, TradeTick other) -> bool:
+        if other is None:
+            return False
         return trade_tick_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -4918,6 +5173,13 @@ cdef class TradeTick(Data):
         # It is supposed to be deallocated by the creator
         capsule = pyo3_trade.as_pycapsule()
         cdef Data_t* ptr = <Data_t*>PyCapsule_GetPointer(capsule, NULL)
+        if ptr == NULL:
+            raise ValueError("Invalid Data_t PyCapsule (NULL)")
+
+        # Validate the tag to prevent segfault
+        if ptr.tag != Data_t_Tag.TRADE:
+            raise ValueError(f"Invalid Data_t tag: expected TRADE, was {data_tag_to_str(ptr.tag)}")
+
         return trade_from_mem_c(ptr.trade)
 
     @staticmethod
@@ -4934,8 +5196,9 @@ cdef class TradeTick(Data):
     ):
         Condition.positive_int(size_raw, "size_raw")
 
-        cdef Price_t price = price_new(price_raw, price_prec)
-        cdef Quantity_t size = quantity_new(size_raw, size_prec)
+        # SAFETY: Panics if raw values are not correctly aligned for their precision
+        cdef Price_t price = price_from_raw(price_raw, price_prec)
+        cdef Quantity_t size = quantity_from_raw(size_raw, size_prec)
 
         cdef TradeTick trade = TradeTick.__new__(TradeTick)
         trade._mem = trade_tick_new(
@@ -5102,6 +5365,15 @@ cdef class TradeTick(Data):
         """
         Return a trade tick from the given raw values.
 
+        .. warning::
+
+            This method is primarily for **internal use**. Most users should use
+            the regular constructor or ``from_dict`` instead.
+
+            All raw price/size values **must** be valid multiples of the scale factor
+            for the given precision. Invalid raw values will raise a ``ValueError``.
+            See: https://nautilustrader.io/docs/nightly/concepts/data#fixed-point-precision-and-raw-values
+
         Parameters
         ----------
         instrument_id : InstrumentId
@@ -5126,6 +5398,11 @@ cdef class TradeTick(Data):
         Returns
         -------
         TradeTick
+
+        Raises
+        ------
+        ValueError
+            If any raw price/size value is invalid for the given precision.
 
         """
         return TradeTick.from_raw_c(
@@ -5302,6 +5579,8 @@ cdef class MarkPriceUpdate(Data):
         )
 
     def __eq__(self, MarkPriceUpdate other) -> bool:
+        if other is None:
+            return False
         return mark_price_update_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
@@ -5528,7 +5807,6 @@ cdef class IndexPriceUpdate(Data):
         UNIX timestamp (nanoseconds) when the data object was initialized.
 
     """
-
     def __init__(
         self,
         InstrumentId instrument_id not None,
@@ -5536,16 +5814,20 @@ cdef class IndexPriceUpdate(Data):
         uint64_t ts_event,
         uint64_t ts_init,
     ) -> None:
-        self.instrument_id = instrument_id
-        self.value = value
-        self.ts_event = ts_event
-        self.ts_init = ts_init
+        self._mem = index_price_update_new(
+            instrument_id._mem,
+            value._mem,
+            ts_event,
+            ts_init,
+        )
 
     def __eq__(self, IndexPriceUpdate other) -> bool:
-        return self.to_str() == other.to_str()
+        if other is None:
+            return False
+        return index_price_update_eq(&self._mem, &other._mem)
 
     def __hash__(self) -> int:
-        return hash(self.to_str())
+        return index_price_update_hash(&self._mem)
 
     def __str__(self) -> str:
         return self.to_str()
@@ -5554,7 +5836,55 @@ cdef class IndexPriceUpdate(Data):
         return f"{type(self).__name__}({self.to_str()})"
 
     cdef str to_str(self):
-        return f"{self.instrument_id},{self.value},{self.ts_event},{self.ts_init}"
+        return cstr_to_pystr(index_price_update_to_cstr(&self._mem))
+
+    @property
+    def instrument_id(self) -> InstrumentId:
+        """
+        Return the instrument ID.
+
+        Returns
+        -------
+        InstrumentId
+
+        """
+        return InstrumentId.from_mem_c(self._mem.instrument_id)
+
+    @property
+    def value(self) -> Price:
+        """
+        The mark price.
+
+        Returns
+        -------
+        Price
+
+        """
+        return Price.from_raw_c(self._mem.value.raw, self._mem.value.precision)
+
+    @property
+    def ts_event(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the data event occurred.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._mem.ts_event
+
+    @property
+    def ts_init(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the object was initialized.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._mem.ts_init
 
     @staticmethod
     cdef IndexPriceUpdate from_dict_c(dict values):
@@ -5699,6 +6029,336 @@ cdef class IndexPriceUpdate(Data):
         return nautilus_pyo3.IndexPriceUpdate(
             nautilus_pyo3.InstrumentId.from_str(self.instrument_id.value),
             nautilus_pyo3.Price(float(self.value), self.value.precision),
+            self.ts_event,
+            self.ts_init,
+        )
+
+
+cdef class FundingRateUpdate(Data):
+    """
+    Represents a funding rate update for a perpetual swap instrument.
+
+    Parameters
+    ----------
+    instrument_id : InstrumentId
+        The instrument ID for the funding rate.
+    rate : Decimal
+        The current funding rate.
+    interval : int
+        Time interval (minutes) between funding payments.
+    next_funding_ns : int, optional
+        UNIX timestamp (nanoseconds) of the next funding payment (if available).
+    ts_event : int
+        UNIX timestamp (nanoseconds) when the update occurred.
+    ts_init : int
+        UNIX timestamp (nanoseconds) when the data object was initialized.
+
+    """
+
+    def __init__(
+        self,
+        InstrumentId instrument_id not None,
+        rate not None,
+        uint64_t ts_event,
+        uint64_t ts_init,
+        interval = None,
+        next_funding_ns = None,
+    ) -> None:
+        self.instrument_id = instrument_id
+        self.rate = rate
+        self.interval = interval
+        self.next_funding_ns = next_funding_ns
+        self._ts_event = ts_event
+        self._ts_init = ts_init
+
+    def __eq__(self, FundingRateUpdate other) -> bool:
+        if other is None:
+            return False
+        return (
+            self.instrument_id == other.instrument_id
+            and self.rate == other.rate
+            and self.interval == other.interval
+            and self.next_funding_ns == other.next_funding_ns
+        )
+
+    def __hash__(self) -> int:
+        return hash((
+            self.instrument_id,
+            self.rate,
+            self.interval,
+            self.next_funding_ns,
+        ))
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}("
+            f"instrument_id={self.instrument_id}, "
+            f"rate={self.rate}, "
+            f"interval={self.interval}, "
+            f"next_funding_ns={self.next_funding_ns}, "
+            f"ts_event={self._ts_event}, "
+            f"ts_init={self._ts_init})"
+        )
+
+    @property
+    def ts_event(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the data event occurred.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._ts_event
+
+    @property
+    def ts_init(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the object was initialized.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._ts_init
+
+    @staticmethod
+    cdef FundingRateUpdate from_dict_c(dict values):
+        Condition.not_none(values, "values")
+        return FundingRateUpdate(
+            instrument_id=InstrumentId.from_str_c(values["instrument_id"]),
+            rate=values["rate"],
+            ts_event=values["ts_event"],
+            ts_init=values["ts_init"],
+            interval=values.get("interval"),
+            next_funding_ns=values.get("next_funding_ns"),
+        )
+
+    @staticmethod
+    cdef dict to_dict_c(FundingRateUpdate obj):
+        Condition.not_none(obj, "obj")
+        result = {
+            "type": type(obj).__name__,
+            "instrument_id": str(obj.instrument_id),
+            "rate": obj.rate,
+            "ts_event": obj.ts_event,
+            "ts_init": obj.ts_init,
+        }
+        if obj.interval is not None:
+            result["interval"] = obj.interval
+        if obj.next_funding_ns is not None:
+            result["next_funding_ns"] = obj.next_funding_ns
+        return result
+
+    @staticmethod
+    def from_dict(dict values) -> FundingRateUpdate:
+        """
+        Return a funding rate update from the given dict values.
+
+        Parameters
+        ----------
+        values : dict[str, object]
+            The values for initialization.
+
+        Returns
+        -------
+        FundingRateUpdate
+
+        """
+        return FundingRateUpdate.from_dict_c(values)
+
+    @staticmethod
+    def to_dict(FundingRateUpdate obj) -> dict[str, object]:
+        """
+        Return a dictionary representation of this object.
+
+        Returns
+        -------
+        dict[str, object]
+
+        """
+        return FundingRateUpdate.to_dict_c(obj)
+
+    @staticmethod
+    def from_pyo3_list(list pyo3_funding_rates) -> list[FundingRateUpdate]:
+        """
+        Return legacy Cython funding rate updates converted from the given pyo3 Rust objects.
+
+        Parameters
+        ----------
+        pyo3_funding_rates : list[nautilus_pyo3.FundingRateUpdate]
+            The pyo3 Rust funding rate updates to convert from.
+
+        Returns
+        -------
+        list[FundingRateUpdate]
+
+        """
+        cdef list[FundingRateUpdate] output = []
+
+        for pyo3_funding_rate in pyo3_funding_rates:
+            output.append(FundingRateUpdate.from_pyo3(pyo3_funding_rate))
+
+        return output
+
+    @staticmethod
+    def from_pyo3(pyo3_funding_rate) -> FundingRateUpdate:
+        """
+        Return a legacy Cython funding rate update converted from the given pyo3 Rust object.
+
+        Parameters
+        ----------
+        pyo3_funding_rate : nautilus_pyo3.FundingRateUpdate
+            The pyo3 Rust funding rate update to convert from.
+
+        Returns
+        -------
+        FundingRateUpdate
+
+        """
+        return FundingRateUpdate(
+            instrument_id=InstrumentId.from_str(pyo3_funding_rate.instrument_id.value),
+            rate=pyo3_funding_rate.rate,
+            interval=pyo3_funding_rate.interval,
+            next_funding_ns=pyo3_funding_rate.next_funding_ns,
+            ts_event=pyo3_funding_rate.ts_event,
+            ts_init=pyo3_funding_rate.ts_init,
+        )
+
+
+cdef class OptionGreeks(Data):
+    """
+    Represents exchange-provided option Greeks and implied volatility for a single instrument.
+
+    Parameters
+    ----------
+    instrument_id : InstrumentId
+        The instrument ID these Greeks apply to.
+    delta : double
+        The delta.
+    gamma : double
+        The gamma.
+    vega : double
+        The vega.
+    theta : double
+        The theta.
+    rho : double
+        The rho.
+    mark_iv : float, optional
+        The mark implied volatility.
+    bid_iv : float, optional
+        The bid implied volatility.
+    ask_iv : float, optional
+        The ask implied volatility.
+    underlying_price : float, optional
+        The underlying price at time of Greeks calculation.
+    open_interest : float, optional
+        The open interest for the instrument.
+    ts_event : uint64_t
+        UNIX timestamp (nanoseconds) when the data event occurred.
+    ts_init : uint64_t
+        UNIX timestamp (nanoseconds) when the object was initialized.
+
+    """
+
+    def __init__(
+        self,
+        InstrumentId instrument_id not None,
+        double delta,
+        double gamma,
+        double vega,
+        double theta,
+        double rho,
+        object mark_iv,
+        object bid_iv,
+        object ask_iv,
+        object underlying_price,
+        object open_interest,
+        uint64_t ts_event,
+        uint64_t ts_init,
+    ) -> None:
+        self.instrument_id = instrument_id
+        self.delta = delta
+        self.gamma = gamma
+        self.vega = vega
+        self.theta = theta
+        self.rho = rho
+        self.mark_iv = mark_iv
+        self.bid_iv = bid_iv
+        self.ask_iv = ask_iv
+        self.underlying_price = underlying_price
+        self.open_interest = open_interest
+        self.ts_event = ts_event
+        self.ts_init = ts_init
+
+    def __repr__(self) -> str:
+        return (
+            f"OptionGreeks("
+            f"instrument_id={self.instrument_id}, "
+            f"delta={self.delta:.4f}, "
+            f"gamma={self.gamma:.4f}, "
+            f"vega={self.vega:.4f}, "
+            f"theta={self.theta:.4f}, "
+            f"mark_iv={self.mark_iv})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    @staticmethod
+    def from_pyo3(pyo3_greeks) -> OptionGreeks:
+        """
+        Return a legacy Cython OptionGreeks converted from the given pyo3 Rust object.
+
+        Parameters
+        ----------
+        pyo3_greeks : nautilus_pyo3.OptionGreeks
+            The pyo3 Rust option greeks to convert from.
+
+        Returns
+        -------
+        OptionGreeks
+
+        """
+        return OptionGreeks(
+            instrument_id=InstrumentId.from_str(pyo3_greeks.instrument_id.value),
+            delta=pyo3_greeks.delta,
+            gamma=pyo3_greeks.gamma,
+            vega=pyo3_greeks.vega,
+            theta=pyo3_greeks.theta,
+            rho=pyo3_greeks.rho,
+            mark_iv=pyo3_greeks.mark_iv,
+            bid_iv=pyo3_greeks.bid_iv,
+            ask_iv=pyo3_greeks.ask_iv,
+            underlying_price=pyo3_greeks.underlying_price,
+            open_interest=pyo3_greeks.open_interest,
+            ts_event=pyo3_greeks.ts_event,
+            ts_init=pyo3_greeks.ts_init,
+        )
+
+    def to_pyo3(self) -> nautilus_pyo3.OptionGreeks:
+        """
+        Return a pyo3 object from this legacy Cython instance.
+
+        Returns
+        -------
+        nautilus_pyo3.OptionGreeks
+
+        """
+        return nautilus_pyo3.OptionGreeks(
+            nautilus_pyo3.InstrumentId.from_str(self.instrument_id.value),
+            self.delta,
+            self.gamma,
+            self.vega,
+            self.theta,
+            self.rho,
+            self.mark_iv,
+            self.bid_iv,
+            self.ask_iv,
+            self.underlying_price,
+            self.open_interest,
             self.ts_event,
             self.ts_init,
         )

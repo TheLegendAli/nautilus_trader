@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,13 +15,16 @@
 
 use std::{sync::Arc, vec::IntoIter};
 
-use binary_heap_plus::{BinaryHeap, PeekMut};
-use compare::Compare;
 use futures::{Stream, StreamExt};
 use tokio::{
     runtime::Runtime,
     sync::mpsc::{self, Receiver},
     task::JoinHandle,
+};
+
+use super::{
+    binary_heap::{BinaryHeap, PeekMut},
+    compare::Compare,
 };
 
 pub struct EagerStream<T> {
@@ -36,14 +39,15 @@ impl<T> EagerStream<T> {
         S: Stream<Item = T> + Send + 'static,
         T: Send + 'static,
     {
-        let _guard = runtime.enter();
         let (tx, rx) = mpsc::channel(1);
-        let task = tokio::spawn(async move {
-            stream
-                .for_each(|item| async {
-                    let _ = tx.send(item).await;
-                })
-                .await;
+
+        let task = runtime.spawn(async move {
+            futures::pin_mut!(stream);
+            while let Some(item) = stream.next().await {
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
         });
 
         Self { rx, task, runtime }
@@ -82,14 +86,12 @@ where
 {
     fn new_from_iter(mut iter: I) -> Option<Self> {
         loop {
-            match iter.next() {
-                Some(mut batch) => match batch.next() {
-                    Some(item) => {
-                        break Some(Self { item, batch, iter });
-                    }
-                    None => continue,
-                },
-                None => break None,
+            let Some(mut batch) = iter.next() else {
+                break None;
+            };
+
+            if let Some(item) = batch.next() {
+                break Some(Self { item, batch, iter });
             }
         }
     }
@@ -146,22 +148,18 @@ where
                     // Otherwise get the next batch and the element from it
                     // Unless the underlying iterator is exhausted
                     None => loop {
-                        if let Some(mut batch) = heap_elem.iter.next() {
-                            match batch.next() {
-                                Some(mut item) => {
-                                    heap_elem.batch = batch;
-                                    std::mem::swap(&mut item, &mut heap_elem.item);
-                                    break Some(item);
-                                }
-                                // Get next batch from iterator
-                                None => continue,
-                            }
-                        } else {
+                        let Some(mut batch) = heap_elem.iter.next() else {
                             let ElementBatchIter {
                                 item,
                                 batch: _,
                                 iter: _,
                             } = PeekMut::pop(heap_elem);
+                            break Some(item);
+                        };
+
+                        if let Some(mut item) = batch.next() {
+                            heap_elem.batch = batch;
+                            std::mem::swap(&mut item, &mut heap_elem.item);
                             break Some(item);
                         }
                     },
@@ -172,12 +170,8 @@ where
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
-
     use proptest::prelude::*;
     use rstest::rstest;
 
@@ -294,10 +288,8 @@ mod tests {
                     boundaries.dedup();
 
                     let mut nested_vec = Vec::new();
-                    for window in boundaries.windows(2) {
-                        let start = window[0];
-                        let end = window[1];
-                        nested_vec.push(flat_vec[start..end].to_vec());
+                    for [start, end] in boundaries.array_windows() {
+                        nested_vec.push(flat_vec[*start..*end].to_vec());
                     }
 
                     SortedNestedVec(nested_vec)
@@ -306,13 +298,9 @@ mod tests {
         })
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // Property-based testing
-    ////////////////////////////////////////////////////////////////////////////////
-
     proptest! {
         /// Property: K-way merge should produce the same result as sorting all data together
-        #[test]
+        #[rstest]
         fn prop_kmerge_equivalent_to_sort(
             all_data in prop::collection::vec(sorted_nested_vec_strategy(), 0..=10)
         ) {
@@ -336,7 +324,7 @@ mod tests {
         }
 
         /// Property: K-way merge should preserve sortedness when inputs are sorted
-        #[test]
+        #[rstest]
         fn prop_kmerge_preserves_sort_order(
             all_data in prop::collection::vec(sorted_nested_vec_strategy(), 1..=5)
         ) {
@@ -349,13 +337,13 @@ mod tests {
             let merged_data: Vec<u64> = kmerge.collect();
 
             // Check that the merged data is sorted
-            for window in merged_data.windows(2) {
-                prop_assert!(window[0] <= window[1], "Merged data should be sorted");
+            for [a, b] in merged_data.array_windows() {
+                prop_assert!(a <= b, "Merged data should be sorted");
             }
         }
 
         /// Property: Empty iterators should not affect the merge result
-        #[test]
+        #[rstest]
         fn prop_kmerge_handles_empty_iterators(
             data in sorted_nested_vec_strategy(),
             empty_count in 0usize..=5

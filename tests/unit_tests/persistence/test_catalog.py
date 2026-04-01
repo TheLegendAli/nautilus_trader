@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -19,6 +19,7 @@ import tempfile
 from unittest.mock import patch
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.dataset as ds
 import pytest
 
@@ -30,14 +31,22 @@ from nautilus_trader.core.data import Data
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.rust.model import AggressorSide
 from nautilus_trader.core.rust.model import BookAction
+from nautilus_trader.core.rust.model import OrderSide
 from nautilus_trader.model.custom import customdataclass
 from nautilus_trader.model.data import Bar
+from nautilus_trader.model.data import BarSpecification
+from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import CustomData
+from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.enums import BarAggregation
+from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.instruments import BettingInstrument
+from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
@@ -57,7 +66,7 @@ def test_list_data_types(catalog_betfair: ParquetDataCatalog) -> None:
         "custom_betfair_sequence_completed",
         "custom_betfair_ticker",
         "instrument_status",
-        "order_book_delta",
+        "order_book_deltas",
         "trade_tick",
     ]
     assert data_types == expected
@@ -75,14 +84,16 @@ def test_catalog_query_filtered(
     trades = catalog_betfair.trade_ticks(start=1576875378384999936)
     assert len(trades) == 121
 
-    trades = catalog_betfair.trade_ticks(start=datetime.datetime(2019, 12, 20, 20, 56, 18))
+    trades = catalog_betfair.trade_ticks(
+        start=datetime.datetime(2019, 12, 20, 20, 56, 18, tzinfo=datetime.UTC),
+    )
     assert len(trades) == 121
 
     deltas = catalog_betfair.order_book_deltas()
     assert len(deltas) == 2384
 
     deltas = catalog_betfair.order_book_deltas(batched=True)
-    assert len(deltas) == 2007
+    assert len(deltas) == 2009
 
 
 def test_catalog_query_custom_filtered(
@@ -98,7 +109,7 @@ def test_catalog_instruments_df(
     catalog_betfair: ParquetDataCatalog,
 ) -> None:
     instruments = catalog_betfair.instruments()
-    assert len(instruments) == 2
+    assert len(instruments) == 4
 
 
 def test_catalog_instruments_filtered_df(
@@ -106,7 +117,7 @@ def test_catalog_instruments_filtered_df(
 ) -> None:
     instrument_id = catalog_betfair.instruments()[0].id.value
     instruments = catalog_betfair.instruments(instrument_ids=[instrument_id])
-    assert len(instruments) == 1
+    assert len(instruments) == 2  # There are duplicates in the test data
     assert all(isinstance(ins, BettingInstrument) for ins in instruments)
     assert instruments[0].id.value == instrument_id
 
@@ -148,6 +159,187 @@ def test_catalog_instrument_ids_correctly_unmapped(catalog: ParquetDataCatalog) 
     # Assert
     assert instrument.id.value == "AUD/USD.SIM"
     assert trade_tick.instrument_id.value == "AUD/USD.SIM"
+
+
+def test_enforce_monotonic_ts_already_sorted_returns_unchanged() -> None:
+    table = pa.table(
+        {
+            "ts_init": pa.array([1000, 2000, 3000], type=pa.uint64()),
+            "x": pa.array([1, 2, 3]),
+        },
+    )
+    result = ParquetDataCatalog._enforce_monotonic_ts(table)
+    assert result.num_rows == 3
+    assert result.column("ts_init")[0].as_py() == 1000
+    assert result.column("ts_init")[1].as_py() == 2000
+    assert result.column("ts_init")[2].as_py() == 3000
+
+
+def test_enforce_monotonic_ts_unsorted_returns_sorted_by_ts_init() -> None:
+    table = pa.table(
+        {
+            "ts_init": pa.array([3000, 1000, 2000], type=pa.uint64()),
+            "x": pa.array([3, 1, 2]),
+        },
+    )
+    result = ParquetDataCatalog._enforce_monotonic_ts(table)
+    assert result.num_rows == 3
+    assert result.column("ts_init")[0].as_py() == 1000
+    assert result.column("ts_init")[1].as_py() == 2000
+    assert result.column("ts_init")[2].as_py() == 3000
+    assert result.column("x")[0].as_py() == 1
+    assert result.column("x")[1].as_py() == 2
+    assert result.column("x")[2].as_py() == 3
+
+
+def test_enforce_monotonic_ts_single_row_missing_ts_init_raises_error() -> None:
+    # Arrange
+    table = pa.table({"x": pa.array([1])})
+
+    # Act, Assert
+    with pytest.raises(ValueError, match="no 'ts_init' column"):
+        ParquetDataCatalog._enforce_monotonic_ts(table)
+
+
+def test_enforce_monotonic_ts_chunked_array_unsorted_returns_sorted() -> None:
+    # Tables from concat can have ChunkedArray ts_init; ensure we sort correctly
+    t1 = pa.table(
+        {
+            "ts_init": pa.array([3000, 1000], type=pa.uint64()),
+            "x": pa.array([3, 1]),
+        },
+    )
+    t2 = pa.table(
+        {
+            "ts_init": pa.array([2000], type=pa.uint64()),
+            "x": pa.array([2]),
+        },
+    )
+    combined = pa.concat_tables([t1, t2])
+    assert isinstance(combined.column("ts_init"), pa.ChunkedArray)
+    result = ParquetDataCatalog._enforce_monotonic_ts(combined)
+    assert result.num_rows == 3
+    assert result.column("ts_init")[0].as_py() == 1000
+    assert result.column("ts_init")[1].as_py() == 2000
+    assert result.column("ts_init")[2].as_py() == 3000
+
+
+def test_query_files_discovers_when_files_none(
+    catalog: ParquetDataCatalog,
+    monkeypatch,
+) -> None:
+    discovered_files = ["a.parquet", "b.parquet"]
+
+    def fake_get_file_list(data_cls: type):
+        return discovered_files
+
+    monkeypatch.setattr(catalog, "get_file_list_from_data_cls", fake_get_file_list)
+    monkeypatch.setattr(
+        catalog,
+        "filter_files",
+        lambda data_cls, file_paths, identifiers, start, end: file_paths,
+    )
+
+    result = catalog._query_files(
+        data_cls=QuoteTick,
+        identifiers=None,
+        start=None,
+        end=None,
+        files=None,
+    )
+
+    assert result == discovered_files
+
+
+def test_query_files_respects_empty_files_list(
+    catalog: ParquetDataCatalog,
+    monkeypatch,
+) -> None:
+    def fail_get_file_list(_):
+        raise AssertionError("get_file_list_from_data_cls should not be called")
+
+    monkeypatch.setattr(catalog, "get_file_list_from_data_cls", fail_get_file_list)
+    monkeypatch.setattr(
+        catalog,
+        "filter_files",
+        lambda data_cls, file_paths, identifiers, start, end: file_paths,
+    )
+
+    result = catalog._query_files(
+        data_cls=QuoteTick,
+        identifiers=None,
+        start=None,
+        end=None,
+        files=[],
+    )
+
+    assert result == []
+
+
+def test_write_data_empty_records_gap_extends_file(catalog: ParquetDataCatalog) -> None:
+    # Regression: empty-data gap handling moved from engine to parquet write_data
+    # Verifies that write_data([], start=..., end=..., data_cls=..., identifier=...)
+    # extends an adjacent parquet file name to record the gap.
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    bar_spec = BarSpecification(1000, BarAggregation.TICK, PriceType.MID)
+    bar_type = BarType(instrument.id, bar_spec)
+    bar_type_str = str(bar_type)
+    ts = 1000
+    bar = Bar(
+        bar_type,
+        Price.from_str("1051.0"),
+        Price.from_str("1055.0"),
+        Price.from_str("1050.0"),
+        Price.from_str("1052.0"),
+        Quantity.from_int(100),
+        ts,
+        ts,
+    )
+    catalog.write_data([instrument, bar])
+    intervals_before = catalog.get_intervals(Bar, bar_type_str)
+    assert intervals_before == [(1000, 1000)]
+
+    catalog.write_data(
+        [],
+        start=1001,
+        end=2000,
+        data_cls=Bar,
+        identifier=bar_type_str,
+    )
+    intervals_after = catalog.get_intervals(Bar, bar_type_str)
+    assert intervals_after == [(1000, 2000)]
+
+
+def test_write_data_empty_with_start_zero_does_not_skip_branch(
+    catalog: ParquetDataCatalog,
+) -> None:
+    # Guards against truthiness: start=0 / end=0 must still enter empty-data branch
+    # (branch uses "is not None", so 0 is valid).
+    instrument = TestInstrumentProvider.ethusdt_binance()
+    bar_spec = BarSpecification(1000, BarAggregation.TICK, PriceType.MID)
+    bar_type = BarType(instrument.id, bar_spec)
+    catalog.write_data([instrument])
+    catalog.write_data(
+        [],
+        start=0,
+        end=0,
+        data_cls=Bar,
+        identifier=str(bar_type),
+    )
+    # No file to extend; just assert we did not skip the branch (no error)
+    intervals = catalog.get_intervals(Bar, str(bar_type))
+    assert intervals == []
+
+
+def test_from_uri_fs_storage_options_empty_dict_singleton(tmp_path) -> None:
+    # Ensures empty dict is preserved (no "or None") so singleton identity is stable
+    catalog_dir = tmp_path / "cat"
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    uri = str(catalog_dir)
+    c1 = ParquetDataCatalog.from_uri(uri, fs_storage_options={})
+    c2 = ParquetDataCatalog.from_uri(uri, fs_storage_options={})
+    assert c1 is c2
+    assert c1.path == c2.path
 
 
 @pytest.mark.skip("development_only")
@@ -207,8 +399,12 @@ def test_catalog_custom_data(catalog: ParquetDataCatalog) -> None:
     # Assert
     assert data_usd is not None
     assert data_chf is not None
-    assert len(data_usd) == 22941
-    assert len(data_chf) == 2745
+    assert (
+        len(data_usd) == 1258
+    )  # Reduced from 22941 for faster testing (USD events in first 5k rows)
+    assert (
+        len(data_chf) == 210
+    )  # Reduced from 2745 for faster testing (CHF events in first 5k rows)
     assert isinstance(data_chf[0], CustomData)
 
 
@@ -366,6 +562,41 @@ def test_catalog_persists_equity(
     assert instrument_from_catalog == instrument
     assert len(quotes_from_catalog) == 1
     assert quotes_from_catalog[0].instrument_id == instrument.id
+
+
+def test_catalog_instrument_roundtrip_with_info_params(
+    catalog: ParquetDataCatalog,
+) -> None:
+    # Roundtrip a vector of same instrument (CurrencyPair) with Params in info and
+    # small variations: two ts_init times.
+    base = TestInstrumentProvider.default_fx_ccy("AUD/USD")
+    d = CurrencyPair.to_dict(base)
+    inst1 = CurrencyPair.from_dict(
+        {
+            **d,
+            "info": {"venue_extra": "v1", "count": 1, "enabled": True},
+            "ts_event": 1000,
+            "ts_init": 1000,
+        },
+    )
+    inst2 = CurrencyPair.from_dict(
+        {
+            **d,
+            "info": {"venue_extra": "v2", "count": 2, "enabled": False},
+            "ts_event": 2000,
+            "ts_init": 2000,
+        },
+    )
+    catalog.write_data([inst1, inst2])
+    read = catalog.instruments(instrument_ids=["AUD/USD.SIM"])
+    assert len(read) == 2
+    by_ts = {inst.ts_init: inst for inst in read}
+    assert 1000 in by_ts
+    assert 2000 in by_ts
+    assert by_ts[1000].info == {"venue_extra": "v1", "count": 1, "enabled": True}
+    assert by_ts[2000].info == {"venue_extra": "v2", "count": 2, "enabled": False}
+    assert by_ts[1000].id == inst1.id
+    assert by_ts[2000].id == inst2.id
 
 
 def test_list_backtest_runs(
@@ -726,17 +957,19 @@ class TestConsolidateDataByPeriod:
         request_end = pd.Timestamp("1970-01-01 00:00:00.000004", tz="UTC")  # 4000 ns
 
         # Mock the filesystem exists check to return False (no existing target files)
-        with patch.object(self.catalog.fs, "exists", return_value=False):
-            with patch.object(self.catalog, "_make_path", return_value="/test/path"):
-                queries = self.catalog._prepare_consolidation_queries(
-                    intervals=intervals,
-                    period=period,
-                    start=request_start,
-                    end=request_end,
-                    ensure_contiguous_files=False,
-                    data_cls=QuoteTick,
-                    identifier="EURUSD.SIM",
-                )
+        with (
+            patch.object(self.catalog.fs, "exists", return_value=False),
+            patch.object(self.catalog, "_make_path", return_value="/test/path"),
+        ):
+            queries = self.catalog._prepare_consolidation_queries(
+                intervals=intervals,
+                period=period,
+                start=request_start,
+                end=request_end,
+                ensure_contiguous_files=False,
+                data_cls=QuoteTick,
+                identifier="EURUSD.SIM",
+            )
 
         # Should have 3 queries: split before, split after, and consolidation
         assert len(queries) == 3
@@ -984,7 +1217,7 @@ class TestConsolidateDataByPeriod:
         initial_file_count = len(initial_intervals)
 
         # Note: With realistic timestamps, we might get 1 file initially, which is fine
-        assert initial_file_count >= 1, f"Should have at least 1 file, got {initial_file_count}"
+        assert initial_file_count >= 1, f"Should have at least 1 file, was {initial_file_count}"
 
         # Act - consolidate by 1-day periods
         self.catalog.consolidate_data_by_period(
@@ -1014,6 +1247,7 @@ class TestConsolidateDataByPeriod:
         for original_bar, retrieved_bar in zip(
             sorted(test_bars, key=lambda x: x.ts_init),
             sorted(all_bars, key=lambda x: x.ts_init),
+            strict=False,
         ):
             assert original_bar.open == retrieved_bar.open
             assert original_bar.high == retrieved_bar.high
@@ -1057,7 +1291,9 @@ class TestConsolidateDataByPeriod:
         retrieved_sorted = sorted(all_bars, key=lambda x: x.ts_init)
 
         # Verify each bar's timestamp is exactly preserved
-        for i, (original, retrieved) in enumerate(zip(original_sorted, retrieved_sorted)):
+        for i, (original, retrieved) in enumerate(
+            zip(original_sorted, retrieved_sorted, strict=False),
+        ):
             assert original.ts_init == retrieved.ts_init, f"Timestamp mismatch at index {i}"
 
     def test_consolidate_mixed_data_types_integration(self):
@@ -1178,6 +1414,56 @@ class TestConsolidateDataByPeriod:
 
         retrieved_timestamps = sorted([bar.ts_init for bar in bars])
         assert retrieved_timestamps == sorted(boundary_timestamps)
+
+    def test_consolidate_rejects_conflicting_metadata(self):
+        """
+        Test that consolidation raises when parquet files have different precision
+        metadata.
+        """
+        # Arrange
+        instrument_id = self.audusd_sim.id
+
+        # Write batch with price_precision=2, size_precision=4
+        deltas_batch1 = [
+            OrderBookDelta(
+                instrument_id=instrument_id,
+                action=BookAction.UPDATE,
+                order=BookOrder(
+                    OrderSide.BUY,
+                    Price(1.11, 2),
+                    Quantity(10.0001, 4),
+                    1,
+                ),
+                flags=0,
+                sequence=0,
+                ts_event=100,
+                ts_init=100,
+            ),
+        ]
+        self.catalog.write_data(deltas_batch1)
+
+        # Write batch with price_precision=3, size_precision=6
+        deltas_batch2 = [
+            OrderBookDelta(
+                instrument_id=instrument_id,
+                action=BookAction.UPDATE,
+                order=BookOrder(
+                    OrderSide.BUY,
+                    Price(1.123, 3),
+                    Quantity(10.000001, 6),
+                    2,
+                ),
+                flags=0,
+                sequence=0,
+                ts_event=200,
+                ts_init=200,
+            ),
+        ]
+        self.catalog.write_data(deltas_batch2, skip_disjoint_check=True)
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="conflicting metadata"):
+            self.catalog.consolidate_catalog(ensure_contiguous_files=False)
 
 
 def test_consolidate_catalog_by_period(catalog: ParquetDataCatalog) -> None:
@@ -1658,10 +1944,10 @@ def test_delete_data_range_cross_file_split(catalog: ParquetDataCatalog) -> None
 
     # Verify initial state - should have 3 files and 10 quotes
     initial_intervals = catalog.get_intervals(QuoteTick, "AUD/USD.SIM")
-    assert len(initial_intervals) == 3, f"Expected 3 files, got {len(initial_intervals)}"
+    assert len(initial_intervals) == 3, f"Expected 3 files, was {len(initial_intervals)}"
 
     initial_quotes = catalog.quote_ticks()
-    assert len(initial_quotes) == 10, f"Expected 10 quotes, got {len(initial_quotes)}"
+    assert len(initial_quotes) == 10, f"Expected 10 quotes, was {len(initial_quotes)}"
 
     # Act - delete range [4_000_000_000, 10_000_000_000] which should:
     # - Split file 1 to keep [1_000_000_000, 2_000_000_000, 3_000_000_000]
@@ -1679,23 +1965,23 @@ def test_delete_data_range_cross_file_split(catalog: ParquetDataCatalog) -> None
     remaining_timestamps.sort()
 
     expected_remaining = [1_000_000_000, 2_000_000_000, 3_000_000_000]
-    assert (
-        remaining_timestamps == expected_remaining
-    ), f"Expected {expected_remaining}, got {remaining_timestamps}"
+    assert remaining_timestamps == expected_remaining, (
+        f"Expected {expected_remaining}, was {remaining_timestamps}"
+    )
 
     # Verify file structure - should have 1 file remaining
     final_intervals = catalog.get_intervals(QuoteTick, "AUD/USD.SIM")
-    assert len(final_intervals) == 1, f"Expected 1 file, got {len(final_intervals)}"
+    assert len(final_intervals) == 1, f"Expected 1 file, was {len(final_intervals)}"
 
     # Verify the remaining file covers the correct range (should end just before deletion start)
     expected_start = 1_000_000_000
     expected_end = 4_000_000_000 - 1  # Just before deletion range starts (one nanosecond before)
-    assert (
-        final_intervals[0][0] == expected_start
-    ), f"Expected start {expected_start}, got {final_intervals[0][0]}"
-    assert (
-        final_intervals[0][1] == expected_end
-    ), f"Expected end {expected_end}, got {final_intervals[0][1]}"
+    assert final_intervals[0][0] == expected_start, (
+        f"Expected start {expected_start}, was {final_intervals[0][0]}"
+    )
+    assert final_intervals[0][1] == expected_end, (
+        f"Expected end {expected_end}, was {final_intervals[0][1]}"
+    )
 
     # Verify we can query the remaining data correctly
     queried_quotes = catalog.query(
@@ -1707,9 +1993,9 @@ def test_delete_data_range_cross_file_split(catalog: ParquetDataCatalog) -> None
     queried_timestamps = [q.ts_init for q in queried_quotes]
     queried_timestamps.sort()
 
-    assert (
-        queried_timestamps == expected_remaining
-    ), f"Query result should be {expected_remaining}, got {queried_timestamps}"
+    assert queried_timestamps == expected_remaining, (
+        f"Query result should be {expected_remaining}, was {queried_timestamps}"
+    )
 
 
 def test_delete_data_range_cross_file_split_keep_end(catalog: ParquetDataCatalog) -> None:
@@ -1753,10 +2039,10 @@ def test_delete_data_range_cross_file_split_keep_end(catalog: ParquetDataCatalog
 
     # Verify initial state
     initial_intervals = catalog.get_intervals(QuoteTick, "AUD/USD.SIM")
-    assert len(initial_intervals) == 3, f"Expected 3 files, got {len(initial_intervals)}"
+    assert len(initial_intervals) == 3, f"Expected 3 files, was {len(initial_intervals)}"
 
     initial_quotes = catalog.quote_ticks()
-    assert len(initial_quotes) == 10, f"Expected 10 quotes, got {len(initial_quotes)}"
+    assert len(initial_quotes) == 10, f"Expected 10 quotes, was {len(initial_quotes)}"
 
     # Act - delete range [1_000_000_000, 7_000_000_000] which should:
     # - Delete file 1 completely
@@ -1775,13 +2061,13 @@ def test_delete_data_range_cross_file_split_keep_end(catalog: ParquetDataCatalog
     remaining_timestamps.sort()
 
     expected_remaining = [8_000_000_000, 9_000_000_000, 10_000_000_000]
-    assert (
-        remaining_timestamps == expected_remaining
-    ), f"Expected {expected_remaining}, got {remaining_timestamps}"
+    assert remaining_timestamps == expected_remaining, (
+        f"Expected {expected_remaining}, was {remaining_timestamps}"
+    )
 
     # Verify file structure - should have 2 files remaining (split file 2 + intact file 3)
     final_intervals = catalog.get_intervals(QuoteTick, "AUD/USD.SIM")
-    assert len(final_intervals) == 2, f"Expected 2 files, got {len(final_intervals)}"
+    assert len(final_intervals) == 2, f"Expected 2 files, was {len(final_intervals)}"
 
     # Verify we can query the remaining data correctly
     queried_quotes = catalog.query(
@@ -1793,9 +2079,9 @@ def test_delete_data_range_cross_file_split_keep_end(catalog: ParquetDataCatalog
     queried_timestamps = [q.ts_init for q in queried_quotes]
     queried_timestamps.sort()
 
-    assert (
-        queried_timestamps == expected_remaining
-    ), f"Query result should be {expected_remaining}, got {queried_timestamps}"
+    assert queried_timestamps == expected_remaining, (
+        f"Query result should be {expected_remaining}, was {queried_timestamps}"
+    )
 
 
 def test_delete_catalog_range_partial_overlap(catalog: ParquetDataCatalog) -> None:
@@ -2128,3 +2414,317 @@ def test_delete_data_range_zero_timestamp_edge_case(catalog: ParquetDataCatalog)
     timestamps = [q.ts_init for q in remaining_data]
     timestamps.sort()
     assert timestamps == [2, 3]
+
+
+def test_backend_session_table_naming_multiple_instruments(catalog: ParquetDataCatalog) -> None:
+    """
+    Test that backend_session creates identifier-dependent table names for multiple
+    instruments.
+
+    This test verifies the fix for the table naming bug where multiple instruments would
+    cause table name conflicts in DataFusion queries.
+
+    """
+    # Arrange - Create bars for multiple instruments
+    bar_type1 = TestDataStubs.bartype_adabtc_binance_1min_last()
+    instrument1 = TestInstrumentProvider.adabtc_binance()
+    bars1 = TestDataStubs.binance_bars_from_csv(
+        "ADABTC-1m-2021-11-27.csv",
+        bar_type1,
+        instrument1,
+    )[:5]  # Use fewer bars for faster test
+
+    bar_type2 = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+    instrument2 = TestInstrumentProvider.btcusdt_binance()
+    bars2 = TestDataStubs.binance_bars_from_csv(
+        "ADABTC-1m-2021-11-27.csv",  # Reuse same CSV data but with different bar_type
+        bar_type2,
+        instrument2,
+    )[:5]  # Use fewer bars for faster test
+
+    # Write data for both instruments
+    catalog.write_data(bars1)
+    catalog.write_data(bars2)
+
+    # Act - Create backend session with multiple instruments
+    identifiers = [str(bar_type1), str(bar_type2)]
+    session = catalog.backend_session(
+        data_cls=Bar,
+        identifiers=identifiers,
+    )
+
+    # Assert - Session should be created successfully without table name conflicts
+    assert session is not None
+
+    # Query data using the session to verify it works correctly
+    result = session.to_query_result()
+    data = []
+    for chunk in result:
+        from nautilus_trader.model.data import capsule_to_list
+
+        data.extend(capsule_to_list(chunk))
+
+    # Should get data from both instruments
+    assert len(data) == 10  # 5 bars from each instrument
+
+    # Verify we have data from both instruments
+    instrument_ids = {bar.bar_type.instrument_id.value for bar in data}
+    assert len(instrument_ids) == 2
+    assert instrument1.id.value in instrument_ids
+    assert instrument2.id.value in instrument_ids
+
+
+def test_backend_session_table_naming_special_characters(catalog: ParquetDataCatalog) -> None:
+    """
+    Test that backend_session handles special characters in identifiers correctly.
+
+    This test verifies that identifiers with dots, hyphens, and slashes are properly
+    converted to safe SQL table names.
+
+    """
+    # Arrange - Create quote ticks for instruments with special characters
+    eurusd_instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD", Venue("SIM"))
+    btcusd_instrument = TestInstrumentProvider.default_fx_ccy("BTC-USD", Venue("COINBASE"))
+
+    quotes_eurusd = [
+        TestDataStubs.quote_tick(
+            instrument=eurusd_instrument,
+            ts_init=i * 1000,
+        )
+        for i in range(3)
+    ]
+
+    quotes_btc_usd = [
+        TestDataStubs.quote_tick(
+            instrument=btcusd_instrument,
+            ts_init=i * 1000 + 500,
+        )
+        for i in range(3)
+    ]
+
+    # Write data
+    catalog.write_data(quotes_eurusd)
+    catalog.write_data(quotes_btc_usd)
+
+    # Act - Create backend session with identifiers containing special characters
+    identifiers = [str(eurusd_instrument.id), str(btcusd_instrument.id)]
+    session = catalog.backend_session(
+        data_cls=QuoteTick,
+        identifiers=identifiers,
+    )
+
+    # Assert - Session should be created successfully
+    assert session is not None
+
+    # Query data to verify it works
+    result = session.to_query_result()
+    data = []
+    for chunk in result:
+        from nautilus_trader.model.data import capsule_to_list
+
+        data.extend(capsule_to_list(chunk))
+
+    # Should get data from both instruments
+    assert len(data) == 6  # 3 quotes from each instrument
+
+    # Verify we have data from both instruments
+    instrument_ids = {quote.instrument_id.value for quote in data}
+    assert len(instrument_ids) == 2
+    assert str(eurusd_instrument.id) in instrument_ids
+    assert str(btcusd_instrument.id) in instrument_ids
+
+
+def test_query_first_and_last_timestamp(catalog: ParquetDataCatalog) -> None:
+    # Arrange
+    instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD", venue=Venue("SIM"))
+    first_ts = 1000000000
+    last_ts = 2000000000
+
+    trade_ticks = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.0"),
+            size=Quantity.from_int(1),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("1"),
+            ts_event=first_ts,
+            ts_init=first_ts,
+        ),
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.1"),
+            size=Quantity.from_int(1),
+            aggressor_side=AggressorSide.SELLER,
+            trade_id=TradeId("2"),
+            ts_event=last_ts,
+            ts_init=last_ts,
+        ),
+    ]
+    catalog.write_data([instrument])
+    catalog.write_data(trade_ticks)
+
+    # Act
+    first_result = catalog.query_first_timestamp(TradeTick, str(instrument.id))
+    last_result = catalog.query_last_timestamp(TradeTick, str(instrument.id))
+
+    # Assert
+    assert first_result == pd.Timestamp(first_ts, tz="UTC")
+    assert last_result == pd.Timestamp(last_ts, tz="UTC")
+    assert first_result < last_result
+
+
+def test_query_first_timestamp_returns_none_when_no_data(catalog: ParquetDataCatalog) -> None:
+    # Act
+    result = catalog.query_first_timestamp(TradeTick, "NONEXISTENT.VENUE")
+
+    # Assert
+    assert result is None
+
+
+def test_backend_session_files_with_optimize_disabled_reads_only_specified_files(
+    catalog: ParquetDataCatalog,
+) -> None:
+    """
+    Test that with optimize_file_loading=False, only specified files are read.
+
+    When `optimize_file_loading=False`, each file is registered individually with
+    DataFusion. This is needed for operations like consolidation where precise file
+    control is required.
+
+    """
+    # Arrange
+    instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD", Venue("SIM"))
+    catalog.write_data([instrument])
+
+    trades_batch1 = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.10000"),
+            size=Quantity.from_int(100),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId(f"batch1_{i}"),
+            ts_event=1000 + i,
+            ts_init=1000 + i,
+        )
+        for i in range(3)
+    ]
+    catalog.write_data(trades_batch1)
+
+    trades_batch2 = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.20000"),
+            size=Quantity.from_int(200),
+            aggressor_side=AggressorSide.SELLER,
+            trade_id=TradeId(f"batch2_{i}"),
+            ts_event=2000 + i,
+            ts_init=2000 + i,
+        )
+        for i in range(3)
+    ]
+    catalog.write_data(trades_batch2)
+
+    trades_batch3 = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.30000"),
+            size=Quantity.from_int(300),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId(f"batch3_{i}"),
+            ts_event=3000 + i,
+            ts_init=3000 + i,
+        )
+        for i in range(3)
+    ]
+    catalog.write_data(trades_batch3)
+
+    all_files = catalog._query_files(TradeTick, [str(instrument.id)], None, None)
+    assert len(all_files) == 3, f"Expected 3 files, was {len(all_files)}: {all_files}"
+    selected_files = [all_files[0]]
+
+    # Act
+    session = catalog.backend_session(
+        data_cls=TradeTick,
+        files=selected_files,
+        optimize_file_loading=False,
+    )
+
+    result = session.to_query_result()
+    data = []
+    for chunk in result:
+        from nautilus_trader.model.data import capsule_to_list
+
+        data.extend(capsule_to_list(chunk))
+
+    # Assert
+    assert len(data) == 3, f"Expected 3 trades from one file, was {len(data)}"
+    prices = {str(trade.price) for trade in data}
+    assert len(prices) == 1, f"Expected trades from single batch, was prices: {prices}"
+
+
+def test_backend_session_files_with_optimize_reads_entire_directory(
+    catalog: ParquetDataCatalog,
+) -> None:
+    """
+    Test that with optimize_file_loading=True, the entire directory is read.
+
+    The `files` parameter is a performance hint to skip file discovery, but with
+    `optimize_file_loading=True` (the default), DataFusion reads all files in the
+    directory for efficiency. Only with `optimize_file_loading=False` are the
+    specific files honored.
+
+    """
+    # Arrange
+    instrument = TestInstrumentProvider.default_fx_ccy("GBP/USD", Venue("SIM"))
+    catalog.write_data([instrument])
+
+    trades_batch1 = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.25000"),
+            size=Quantity.from_int(100),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId(f"opt_batch1_{i}"),
+            ts_event=1000 + i,
+            ts_init=1000 + i,
+        )
+        for i in range(3)
+    ]
+    catalog.write_data(trades_batch1)
+
+    trades_batch2 = [
+        TradeTick(
+            instrument_id=instrument.id,
+            price=Price.from_str("1.26000"),
+            size=Quantity.from_int(200),
+            aggressor_side=AggressorSide.SELLER,
+            trade_id=TradeId(f"opt_batch2_{i}"),
+            ts_event=2000 + i,
+            ts_init=2000 + i,
+        )
+        for i in range(3)
+    ]
+    catalog.write_data(trades_batch2)
+
+    all_files = catalog._query_files(TradeTick, [str(instrument.id)], None, None)
+    assert len(all_files) == 2
+    selected_files = [all_files[0]]  # Only pass one file, but expect all to be read
+
+    # Act
+    session = catalog.backend_session(
+        data_cls=TradeTick,
+        files=selected_files,
+        optimize_file_loading=True,  # Directory-based reading
+    )
+
+    result = session.to_query_result()
+    data = []
+    for chunk in result:
+        from nautilus_trader.model.data import capsule_to_list
+
+        data.extend(capsule_to_list(chunk))
+
+    # Assert - with optimize_file_loading=True, the entire directory is read
+    assert len(data) == 6, f"Expected 6 trades from entire directory, was {len(data)}"
+    prices = {str(trade.price) for trade in data}
+    assert len(prices) == 2, f"Expected trades from both batches, was prices: {prices}"

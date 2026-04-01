@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -20,23 +20,24 @@ import os
 import platform
 import re
 from collections import defaultdict
-from collections.abc import Callable
 from collections.abc import Generator
 from itertools import groupby
 from os import PathLike
 from pathlib import Path
-from typing import Any, NamedTuple, Union
+from typing import Any
+from typing import NamedTuple
+from typing import Union
 
 import fsspec
 import pandas as pd
 import portion as P
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pds
 import pyarrow.parquet as pq
 from fsspec.implementations.local import make_path_posix
 from fsspec.implementations.memory import MemoryFileSystem
 from fsspec.utils import infer_storage_options
-from pyarrow import ArrowInvalid
 
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
@@ -46,7 +47,6 @@ from nautilus_trader.core.datetime import maybe_dt_to_unix_nanos
 from nautilus_trader.core.datetime import time_object_to_dt
 from nautilus_trader.core.datetime import unix_nanos_to_iso8601
 from nautilus_trader.core.inspect import is_nautilus_class
-from nautilus_trader.core.message import Event
 from nautilus_trader.core.nautilus_pyo3 import DataBackendSession
 from nautilus_trader.core.nautilus_pyo3 import NautilusDataType
 from nautilus_trader.model.data import Bar
@@ -105,6 +105,9 @@ class ParquetDataCatalog(BaseDataCatalog):
         meaning the catalog operates on the local filesystem.
     fs_storage_options : dict, optional
         The fs storage options.
+    fs_rust_storage_options : dict[str, str], optional
+        Storage-specific configuration options for the rust backend.
+        Defaults to what is used for fs_storage_options if not specified.
     max_rows_per_group : int, default 5000
         The maximum number of rows per group. If the value is greater than 0,
         then the dataset writer may split up large incoming batches into
@@ -129,7 +132,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         path: PathLike[str] | str,
         fs_protocol: str | None = _DEFAULT_FS_PROTOCOL,
         fs_storage_options: dict | None = None,
-        dataset_kwargs: dict | None = None,
+        fs_rust_storage_options: dict | None = None,
         max_rows_per_group: int = 5_000,
         show_query_paths: bool = False,
     ) -> None:
@@ -144,15 +147,12 @@ class ParquetDataCatalog(BaseDataCatalog):
             self.fs_protocol,
             **self.fs_storage_options,
         )
+        self.fs_rust_storage_options = fs_rust_storage_options or self.fs_storage_options
         self.serializer = ArrowSerializer()
-        self.dataset_kwargs = dataset_kwargs or {}
         self.max_rows_per_group = max_rows_per_group
         self.show_query_paths = show_query_paths
 
-        if self.fs_protocol == "file":
-            final_path = str(make_path_posix(str(path)))
-        else:
-            final_path = str(path)
+        final_path = str(make_path_posix(str(path))) if self.fs_protocol == "file" else str(path)
 
         if (
             isinstance(self.fs, MemoryFileSystem)
@@ -188,7 +188,8 @@ class ParquetDataCatalog(BaseDataCatalog):
     def from_uri(
         cls,
         uri: str,
-        storage_options: dict[str, str] | None = None,
+        fs_storage_options: dict[str, str] | None = None,
+        fs_rust_storage_options: dict[str, str] | None = None,
     ) -> ParquetDataCatalog:
         """
         Create a data catalog instance from the given `uri` with optional storage
@@ -198,11 +199,14 @@ class ParquetDataCatalog(BaseDataCatalog):
         ----------
         uri : str
             The URI string for the backing path.
-        storage_options : dict[str, str], optional
+        fs_storage_options : dict[str, str], optional
             Storage-specific configuration options.
             For S3: endpoint_url, region, access_key_id, secret_access_key, session_token, etc.
             For GCS: service_account_path, service_account_key, project_id, etc.
             For Azure: account_name, account_key, sas_token, etc.
+        fs_rust_storage_options : dict[str, str], optional
+            Storage-specific configuration options for the rust backend.
+            Defaults to what is used for fs_storage_options if not specified.
 
         Returns
         -------
@@ -211,7 +215,8 @@ class ParquetDataCatalog(BaseDataCatalog):
         """
         if "://" not in uri:
             # Assume a local path
-            uri = "file://" + uri
+            # .resolve() will return absolute path in case relative one is provided, and .as_uri() will return path that follows RFC3986
+            uri = Path(uri).resolve().as_uri()
 
         parsed = infer_storage_options(uri)
         path = parsed.pop("path")
@@ -219,21 +224,28 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         # Merge parsed storage options with provided storage options
         # Provided storage options take precedence
-        merged_storage_options = parsed.copy()
+        merged_fs_storage_options = parsed.copy()
 
-        if storage_options:
-            merged_storage_options.update(storage_options)
+        if fs_storage_options:
+            merged_fs_storage_options.update(fs_storage_options)
 
-        return cls(path=path, fs_protocol=protocol, fs_storage_options=merged_storage_options)
+        return cls(
+            path=path,
+            fs_protocol=protocol,
+            fs_storage_options=merged_fs_storage_options,
+            fs_rust_storage_options=fs_rust_storage_options,
+        )
 
     # -- WRITING ----------------------------------------------------------------------------------
 
     def write_data(
         self,
-        data: list[Data | Event] | list[NautilusRustDataType],
+        data: list,
         start: int | None = None,
         end: int | None = None,
-        skip_disjoint_check: bool = False,
+        data_cls: type | None = None,
+        identifier: str | None = None,
+        **kwargs: Any,
     ) -> None:
         """
         Write the given `data` to the catalog.
@@ -241,6 +253,9 @@ class ParquetDataCatalog(BaseDataCatalog):
         The function categorizes the data based on their class name and, when applicable, their
         associated instrument ID. It then delegates the actual writing process to the
         `write_chunk` method.
+
+        When `data` is empty but `start`, `end`, and `data_cls` are provided, extends existing
+        parquet file names to record the gap (parquet-specific behavior).
 
         Parameters
         ----------
@@ -250,8 +265,12 @@ class ParquetDataCatalog(BaseDataCatalog):
             The start timestamp for the data chunk.
         end : int, optional
             The end timestamp for the data chunk.
-        skip_disjoint_check : bool, default False
-            If True, skip the disjoint intervals check.
+        data_cls : type, optional
+            Data class for the empty-data case (e.g. when recording a gap).
+        identifier : str, optional
+            Identifier (e.g. instrument_id or bar_type string) for the empty-data case.
+        **kwargs : Any
+            Additional implementation-specific keyword arguments (e.g. skip_disjoint_check).
 
         Warnings
         --------
@@ -264,6 +283,8 @@ class ParquetDataCatalog(BaseDataCatalog):
          - Instrument-specific data should have either an `instrument_id` attribute or be an instance of `Instrument`.
          - The `Bar` class is treated as a special case, being grouped based on its `bar_type` attribute.
          - The input data list must be non-empty, and all data items must be of the appropriate class type.
+         - Pass ``skip_disjoint_check=True`` in ``**kwargs`` to skip the disjoint-intervals check when writing
+           (e.g. when consolidating or re-writing chunks where you manage intervals explicitly).
 
         Raises
         ------
@@ -271,6 +292,16 @@ class ParquetDataCatalog(BaseDataCatalog):
             If data of the same type is not monotonically increasing (or non-decreasing) based on `ts_init`.
 
         """
+        skip_disjoint_check: bool = kwargs.pop("skip_disjoint_check", False)
+
+        if len(data) == 0 and start is not None and end is not None and data_cls is not None:
+            self.extend_file_name(
+                data_cls=data_cls,
+                identifier=identifier,
+                start=start,
+                end=end,
+            )
+            return
 
         def identifier_function(obj: Any) -> tuple[str, str | None]:
             if isinstance(obj, CustomData):
@@ -325,30 +356,30 @@ class ParquetDataCatalog(BaseDataCatalog):
         directory = self._make_path(data_cls=data_cls, identifier=identifier)
         self.fs.mkdirs(directory, exist_ok=True)
 
-        if isinstance(data[0], Instrument):
-            # When writing an instrument for a given instrument_id, we don't want duplicates
-            # Also keeping the first occurrence can give information about when it's first available
-            data = [data[0]]
-
-            for file in self.fs.glob(f"{directory}/*.parquet"):
-                self.fs.rm(file)
-
-        start = start if start else data[0].ts_init
-        end = end if end else data[-1].ts_init
+        start = start or data[0].ts_init
+        end = end or data[-1].ts_init
         filename = _timestamps_to_filename(start, end)
         parquet_file = f"{directory}/{filename}"
+
+        if self.fs.exists(parquet_file):
+            print(f"File {parquet_file} already exists, skipping write")
+            return
+
+        if not skip_disjoint_check:
+            current_intervals = self._get_directory_intervals(directory)
+            new_intervals = [*current_intervals, (start, end)]
+            if not _are_intervals_disjoint(new_intervals):
+                raise ValueError(
+                    f"Writing file {filename} with interval ({start}, {end}) would create "
+                    f"non-disjoint intervals. Existing intervals: {current_intervals}",
+                )
+
         pq.write_table(
             table,
             where=parquet_file,
             filesystem=self.fs,
             row_group_size=self.max_rows_per_group,
         )
-
-        if not skip_disjoint_check:
-            intervals = self._get_directory_intervals(directory)
-            assert _are_intervals_disjoint(
-                intervals,
-            ), "Intervals are not disjoint after writing a new file"
 
     def _objects_to_table(self, data: list[Data], data_cls: type) -> pa.Table:
         PyCondition.not_empty(data, "data")
@@ -436,7 +467,7 @@ class ParquetDataCatalog(BaseDataCatalog):
             intervals,
         ), "Intervals are not disjoint after extending file name"
 
-    def reset_catalog_file_names(self) -> None:
+    def reset_all_file_names(self) -> None:
         """
         Reset the filenames of all parquet files in the catalog to match their actual
         content timestamps.
@@ -475,7 +506,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         ID.
 
         This method resets the filenames of parquet files for the specified data class and
-        instrument ID to accurately reflect the minimum and maximum timestamps of the data
+        identifier to accurately reflect the minimum and maximum timestamps of the data
         they contain. It examines the parquet metadata for each file and renames the file
         to follow the pattern '{first_timestamp}-{last_timestamp}.parquet'.
 
@@ -484,13 +515,13 @@ class ParquetDataCatalog(BaseDataCatalog):
         data_cls : type
             The data class type to reset filenames for (e.g., QuoteTick, TradeTick, Bar).
         identifier : str, optional
-            The specific instrument ID to reset filenames for. If None, resets filenames
-            for all instruments of the specified data class.
+            The specific identifier (instrument ID, etc) to reset filenames for.
+            If None, resets filenames for all instruments of the specified data class.
 
         Notes
         -----
-        - This operation is more targeted than `reset_catalog_file_names` as it only affects
-          files for a specific data class and instrument ID.
+        - This operation is more targeted than `reset_all_file_names` as it only affects
+          files for a specific data class and identifier.
         - The method does not modify the content of the files, only their names.
         - After renaming, the method verifies that the intervals represented by the filenames
           are disjoint (non-overlapping) to maintain data integrity.
@@ -508,7 +539,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         parquet_files = self.fs.glob(os.path.join(directory, "*.parquet"))
 
         for file in parquet_files:
-            first_ts, last_ts = _min_max_from_parquet_metadata(file, "ts_init")
+            first_ts, last_ts = self._min_max_from_parquet_metadata(file, "ts_init")
 
             if first_ts == -1:
                 continue
@@ -522,11 +553,43 @@ class ParquetDataCatalog(BaseDataCatalog):
             intervals,
         ), "Intervals are not disjoint after resetting file names"
 
+    def _min_max_from_parquet_metadata(self, file_path: str, column_name: str) -> tuple[int, int]:
+        parquet_file = pq.ParquetFile(file_path, filesystem=self.fs)
+        metadata = parquet_file.metadata
+
+        overall_min_value = None
+        overall_max_value = None
+
+        for i in range(metadata.num_row_groups):
+            row_group_metadata = metadata.row_group(i)
+
+            for j in range(row_group_metadata.num_columns):
+                col_metadata = row_group_metadata.column(j)
+
+                if (
+                    col_metadata.path_in_schema == column_name
+                    and col_metadata.statistics is not None
+                ):
+                    min_value = col_metadata.statistics.min
+                    max_value = col_metadata.statistics.max
+
+                    if overall_min_value is None or min_value < overall_min_value:
+                        overall_min_value = min_value
+                    if overall_max_value is None or max_value > overall_max_value:
+                        overall_max_value = max_value
+
+        if overall_min_value is None or overall_max_value is None:
+            print(f"Column '{column_name}' not found or has no statistics in any row group.")
+            return -1, -1
+        else:
+            return overall_min_value, overall_max_value
+
     def consolidate_catalog(
         self,
         start: TimestampLike | None = None,
         end: TimestampLike | None = None,
         ensure_contiguous_files: bool = True,
+        deduplicate: bool = False,
     ) -> None:
         """
         Consolidate all parquet files across the entire catalog within the specified
@@ -549,6 +612,8 @@ class ParquetDataCatalog(BaseDataCatalog):
             up to the end of time will be considered.
         ensure_contiguous_files : bool, default True
             If True, ensures that files have contiguous timestamps before consolidation.
+        deduplicate : bool, default False
+            If True, removes duplicate rows from the consolidated file.
 
         Notes
         -----
@@ -566,7 +631,13 @@ class ParquetDataCatalog(BaseDataCatalog):
         leaf_directories = self._find_leaf_data_directories()
 
         for directory in leaf_directories:
-            self._consolidate_directory(directory, start, end, ensure_contiguous_files)
+            self._consolidate_directory(
+                directory,
+                start,
+                end,
+                ensure_contiguous_files,
+                deduplicate=deduplicate,
+            )
 
     def consolidate_data(
         self,
@@ -575,6 +646,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         start: TimestampLike | None = None,
         end: TimestampLike | None = None,
         ensure_contiguous_files: bool = True,
+        deduplicate: bool = False,
     ) -> None:
         """
         Consolidate multiple parquet files for a specific data class and instrument ID
@@ -601,6 +673,8 @@ class ParquetDataCatalog(BaseDataCatalog):
             up to the end of time will be considered.
         ensure_contiguous_files : bool, default True
             If True, ensures that files have contiguous timestamps before consolidation.
+        deduplicate : bool, default False
+            If True, removes duplicate rows from the consolidated file.
 
         Notes
         -----
@@ -612,7 +686,13 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         """
         directory = self._make_path(data_cls, identifier)
-        self._consolidate_directory(directory, start, end, ensure_contiguous_files)
+        self._consolidate_directory(
+            directory,
+            start,
+            end,
+            ensure_contiguous_files,
+            deduplicate=deduplicate,
+        )
 
     def _consolidate_directory(
         self,
@@ -620,6 +700,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         start: TimestampLike | None = None,
         end: TimestampLike | None = None,
         ensure_contiguous_files: bool = True,
+        deduplicate: bool = False,
     ) -> None:
         parquet_files = self.fs.glob(os.path.join(directory, "*.parquet"))
         files_to_consolidate = []
@@ -651,18 +732,80 @@ class ParquetDataCatalog(BaseDataCatalog):
             _timestamps_to_filename(intervals[0][0], intervals[-1][1]),
         )
         files_to_consolidate.sort()
-        self._combine_parquet_files(files_to_consolidate, new_file_name)
+        self._combine_parquet_files(files_to_consolidate, new_file_name, deduplicate=deduplicate)
 
-    def _combine_parquet_files(self, file_list: list[str], new_file: str) -> None:
+    def _combine_parquet_files(
+        self,
+        file_list: list[str],
+        new_file: str,
+        deduplicate: bool = False,
+    ) -> None:
         if len(file_list) <= 1:
             return
 
-        tables = [pq.read_table(file, memory_map=True, pre_buffer=False) for file in file_list]
+        tables = [
+            pq.read_table(file, memory_map=True, pre_buffer=False, filesystem=self.fs)
+            for file in file_list
+        ]
+        self._validate_table_metadata(tables, file_list)
+
         combined_table = pa.concat_tables(tables)
-        pq.write_table(combined_table, where=new_file)
+
+        if deduplicate:
+            combined_table = self._deduplicate_table(combined_table)
+
+        pq.write_table(combined_table, where=new_file, filesystem=self.fs)
 
         for file in file_list:
-            self.fs.rm(file)
+            if file != new_file:
+                self.fs.rm(file)
+
+    @staticmethod
+    def _validate_table_metadata(
+        tables: list[pa.Table],
+        file_list: list[str],
+    ) -> None:
+        if len(tables) <= 1:
+            return
+
+        reference_metadata = tables[0].schema.metadata or {}
+        reference_keys = set(reference_metadata.keys())
+
+        for i, table in enumerate(tables[1:], start=1):
+            metadata = table.schema.metadata or {}
+            metadata_keys = set(metadata.keys())
+
+            missing = reference_keys - metadata_keys
+            if missing:
+                raise ValueError(
+                    f"Cannot consolidate parquet files with mismatched metadata: "
+                    f"keys {missing!r} present in '{file_list[0]}' "
+                    f"but missing from '{file_list[i]}'",
+                )
+
+            extra = metadata_keys - reference_keys
+            if extra:
+                raise ValueError(
+                    f"Cannot consolidate parquet files with mismatched metadata: "
+                    f"keys {extra!r} present in '{file_list[i]}' "
+                    f"but missing from '{file_list[0]}'",
+                )
+
+            for key in reference_keys:
+                if reference_metadata[key] != metadata[key]:
+                    raise ValueError(
+                        f"Cannot consolidate parquet files with conflicting metadata: "
+                        f"key {key!r} has value {reference_metadata[key]!r} in "
+                        f"'{file_list[0]}' but {metadata[key]!r} in '{file_list[i]}'",
+                    )
+
+    @staticmethod
+    def _deduplicate_table(table: pa.Table) -> pa.Table:
+        deduped_data_table = table.group_by(table.column_names).aggregate([])
+        return pa.Table.from_arrays(
+            deduped_data_table.columns,
+            schema=table.schema,
+        )
 
     def consolidate_catalog_by_period(
         self,
@@ -821,12 +964,14 @@ class ParquetDataCatalog(BaseDataCatalog):
                 start=query_info["query_start"],
                 end=query_info["query_end"],
                 files=existing_files,
+                optimize_file_loading=False,
             )
 
             if not period_data:
                 # Skip if no data found, but maintain contiguity by using query start
                 if file_start_ns is None:
                     file_start_ns = query_info["query_start"]
+
                 continue
             else:
                 file_start_ns = None
@@ -932,6 +1077,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         used_end: pd.Timestamp | None = time_object_to_dt(end)
 
         filtered_intervals = []
+
         for interval_start, interval_end in intervals:
             # Check if interval overlaps with the specified range
             if (used_start is None or used_start.value <= interval_end) and (
@@ -978,6 +1124,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         # Handle interval splitting by creating split operations for data preservation
         if filtered_intervals and used_start is not None:
             first_interval = filtered_intervals[0]
+
             if first_interval[0] < used_start.value <= first_interval[1]:
                 # Split before start: preserve data from interval_start to start-1
                 queries_to_execute.append(
@@ -990,6 +1137,7 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         if filtered_intervals and used_end is not None:
             last_interval = filtered_intervals[-1]
+
             if last_interval[0] <= used_end.value < last_interval[1]:
                 # Split after end: preserve data from end+1 to interval_end
                 queries_to_execute.append(
@@ -1029,6 +1177,7 @@ class ParquetDataCatalog(BaseDataCatalog):
 
             while current_start_ns <= group_end_ts:
                 iteration_count += 1
+
                 if iteration_count > max_iterations:
                     # Safety break to prevent infinite loops
                     break
@@ -1135,6 +1284,7 @@ class ParquetDataCatalog(BaseDataCatalog):
     ) -> tuple[type | None, str | None]:
         # Remove the base catalog path to get the relative path
         base_path = self.path.rstrip("/")
+
         if directory.startswith(base_path):
             relative_path = directory[len(base_path) :].lstrip("/")
         else:
@@ -1202,6 +1352,7 @@ class ParquetDataCatalog(BaseDataCatalog):
                 if f"/data/{data_cls_name}/" in directory:
                     # Extract the identifier from the directory path
                     parts = directory.split("/")
+
                     if len(parts) >= 3 and parts[-2] == data_cls_name:
                         dir_identifier = parts[-1]
                         # Recursively call delete for this specific identifier
@@ -1244,6 +1395,7 @@ class ParquetDataCatalog(BaseDataCatalog):
                     end=operation["query_end"],
                     files=operation["files"],
                 )
+
                 if before_data:
                     self.write_data(
                         data=before_data,
@@ -1261,6 +1413,7 @@ class ParquetDataCatalog(BaseDataCatalog):
                     end=operation["query_end"],
                     files=operation["files"],
                 )
+
                 if after_data:
                     self.write_data(
                         data=after_data,
@@ -1391,7 +1544,6 @@ class ParquetDataCatalog(BaseDataCatalog):
         self,
         base_cls: type,
         identifiers: list[str] | None = None,
-        filter_expr: Callable | None = None,
         **kwargs: Any,
     ) -> list[Data]:
         subclasses = [base_cls, *base_cls.__subclasses__()]
@@ -1401,7 +1553,6 @@ class ParquetDataCatalog(BaseDataCatalog):
             try:
                 data_list = self.query(
                     data_cls=cls,
-                    filter_expr=filter_expr,
                     identifiers=identifiers,
                     raise_on_empty=False,
                     **kwargs,
@@ -1412,14 +1563,6 @@ class ParquetDataCatalog(BaseDataCatalog):
                     continue
 
                 raise
-            except ArrowInvalid as e:
-                # If we're using a `filter_expr` here, there's a good chance
-                # this error is using a filter that is specific to one set of
-                # instruments and not to others, so we ignore it (if not; raise).
-                if filter_expr is not None:
-                    continue
-                else:
-                    raise e
 
         non_empty_data_lists = [data_list for data_list in data_lists if data_list is not None]
         objects = [o for objs in non_empty_data_lists for o in objs]  # flatten of list of lists
@@ -1509,8 +1652,7 @@ class ParquetDataCatalog(BaseDataCatalog):
                 **kwargs,
             )
 
-        if not is_nautilus_class(data_cls):
-            # Special handling for generic data
+        if not is_nautilus_class(data_cls) and data and isinstance(data[0], Data):
             metadata = kwargs.get("metadata")
 
             if callable(metadata):
@@ -1543,14 +1685,13 @@ class ParquetDataCatalog(BaseDataCatalog):
             start=start,
             end=end,
             where=where,
-            file=files,
+            files=files,
             **kwargs,
         )
         result = session.to_query_result()
 
         # Gather data
         data = []
-
         for chunk in result:
             data.extend(capsule_to_list(chunk))
 
@@ -1570,6 +1711,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         where: str | None = None,
         session: DataBackendSession | None = None,
         files: list[str] | None = None,
+        optimize_file_loading: bool = False,
         **kwargs: Any,
     ) -> DataBackendSession:
         """
@@ -1594,8 +1736,15 @@ class ParquetDataCatalog(BaseDataCatalog):
         session : DataBackendSession, optional
             An existing session to update. If None, a new session is created.
         files : list[str], optional
-            A specific list of files to query from. If provided, these files are used
-            instead of discovering files through the normal process.
+            A list of known files to use, skipping the file discovery step. This is a
+            performance optimization when the caller already knows which files exist.
+            Note: With `optimize_file_loading=True`, the entire directory containing
+            these files will be read by DataFusion, not just the specified files.
+        optimize_file_loading : bool, default False
+            If True, registers entire directories with DataFusion, which is
+            more efficient for managing many files. If False, registers each file
+            individually (needed for operations like consolidation where precise file
+            control is required).
         **kwargs : Any
             Additional keyword arguments.
 
@@ -1620,7 +1769,6 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         """
         data_type: NautilusDataType = ParquetDataCatalog._nautilus_data_cls_to_data_type(data_cls)
-        file_list = files if files else self._query_files(data_cls, identifiers, start, end)
         file_prefix = class_to_filename(data_cls)
 
         if session is None:
@@ -1630,37 +1778,130 @@ class ParquetDataCatalog(BaseDataCatalog):
         if self.fs_protocol != "file":
             self._register_object_store_with_session(session)
 
-        for idx, file in enumerate(file_list):
-            table = f"{file_prefix}_{idx}"
-            query = self._build_query(
-                table,
-                start=start,
-                end=end,
-                where=where,
-            )
+        if files is not None and not optimize_file_loading:
+            # Register files individually only when optimization is disabled
+            # (e.g., for consolidation operations requiring precise file control)
+            for file in files:
+                self._register_file_table(
+                    session=session,
+                    file=file,
+                    data_type=data_type,
+                    file_prefix=file_prefix,
+                    start=start,
+                    end=end,
+                    where=where,
+                )
+        else:
+            # Use directory-based registration for efficiency. DataFusion handles
+            # reading all files in each directory, which is more memory-efficient
+            # than registering many individual file tables.
+            if files is not None:
+                file_list = files
+            else:
+                file_list = self._query_files(data_cls, identifiers, start, end)
 
-            # Convert file path to URI format for object store compatibility
-            file_uri = file
-
-            if self.fs_protocol != "file" and "://" not in file:
-                # Convert relative paths to full URIs based on protocol
-                if self.fs_protocol == "s3":
-                    file_uri = f"s3://{file}"
-                elif self.fs_protocol in ("gcs", "gs"):
-                    file_uri = f"gs://{file}"
-                elif self.fs_protocol in ("azure", "abfs"):
-                    file_uri = f"azure://{file}"
-                elif self.fs_protocol in ("http", "https"):
-                    file_uri = f"{self.fs_protocol}://{file}"
-                # Add more protocols as needed
-            elif self.fs_protocol == "file" and not file.startswith("file://"):
-                # For local files, DataFusion can handle both absolute paths and file:// URIs
-                # We'll keep the original path format for compatibility
-                file_uri = file
-
-            session.add_file(data_type, table, file_uri, query)
+            directories = {os.path.dirname(file) for file in file_list}
+            for directory in directories:
+                self._register_directory_table(
+                    session=session,
+                    directory=directory,
+                    data_type=data_type,
+                    file_prefix=file_prefix,
+                    start=start,
+                    end=end,
+                    where=where,
+                )
 
         return session
+
+    def _register_file_table(
+        self,
+        session: DataBackendSession,
+        file: str,
+        data_type: NautilusDataType,
+        file_prefix: str,
+        start: TimestampLike | None = None,
+        end: TimestampLike | None = None,
+        where: str | None = None,
+    ) -> None:
+        # Extract identifier from file path and filename to create meaningful table names
+        identifier = file.split("/")[-2]
+        safe_sql_identifier = _sanitize_sql_identifier(urisafe_identifier(identifier))
+        safe_filename = _extract_safe_filename(file)
+        table = f"{file_prefix}_{safe_sql_identifier}_{safe_filename}"
+
+        query = self._build_query(
+            table,
+            start=start,
+            end=end,
+            where=where,
+        )
+
+        file_uri = self._build_file_uri(file)
+        session.add_file(data_type, table, file_uri, query)
+
+    def _register_directory_table(
+        self,
+        session: DataBackendSession,
+        directory: str,
+        data_type: NautilusDataType,
+        file_prefix: str,
+        start: TimestampLike | None = None,
+        end: TimestampLike | None = None,
+        where: str | None = None,
+    ) -> None:
+        # Extract identifier from directory path
+        identifier = directory.split("/")[-1]
+        safe_sql_identifier = _sanitize_sql_identifier(urisafe_identifier(identifier))
+        table = f"{file_prefix}_{safe_sql_identifier}"
+
+        query = self._build_query(
+            table,
+            start=start,
+            end=end,
+            where=where,
+        )
+
+        # Ensure directory URI ends with / to be treated as a directory by some backends
+        file_uri = self._build_file_uri(directory)
+        if not file_uri.endswith("/"):
+            file_uri = file_uri + "/"
+        session.add_file(data_type, table, file_uri, query)
+
+    def _build_file_uri(self, file: str) -> str:
+        """
+        Convert a file path to a URI format based on the filesystem protocol.
+
+        Parameters
+        ----------
+        file : str
+            The file path to convert.
+
+        Returns
+        -------
+        str
+            The file path in URI format.
+
+        """
+        if self.fs_protocol != "file" and "://" not in file:
+            # Convert relative paths to full URIs based on protocol
+            if self.fs_protocol == "s3":
+                return f"s3://{file}"
+            elif self.fs_protocol in ("gcs", "gs"):
+                return f"gs://{file}"
+            elif self.fs_protocol in ("abfs"):
+                return f"{self.path}/{file.partition('/')[2]}"
+            elif self.fs_protocol in ("azure", "az"):
+                return f"az://{file}"
+            elif self.fs_protocol in ("http", "https"):
+                return f"{self.fs_protocol}://{file}"
+            # Add more protocols as needed
+        elif self.fs_protocol == "file" and not file.startswith("file://"):
+            # For local files, DataFusion can handle both absolute paths and file:// URIs
+            # We'll keep the original path format for compatibility
+            return file
+
+        return file
 
     def _register_object_store_with_session(self, session: DataBackendSession) -> None:
         """
@@ -1682,8 +1923,10 @@ class ParquetDataCatalog(BaseDataCatalog):
                 catalog_uri = f"s3://{self.path}"
             elif self.fs_protocol in ("gcs", "gs"):
                 catalog_uri = f"gs://{self.path}"
-            elif self.fs_protocol in ("azure", "abfs"):
-                catalog_uri = f"azure://{self.path}"
+            elif self.fs_protocol in ("abfs"):
+                catalog_uri = f"abfs://{self.path}"
+            elif self.fs_protocol in ("azure", "az"):
+                catalog_uri = f"az://{self.path}"
             elif self.fs_protocol in ("http", "https"):
                 catalog_uri = f"{self.fs_protocol}://{self.path}"
             else:
@@ -1694,7 +1937,7 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         try:
             # Register object store using the Rust implementation with storage options
-            session.register_object_store_from_uri(catalog_uri, self.fs_storage_options)
+            session.register_object_store_from_uri(catalog_uri, self.fs_rust_storage_options)
 
         except Exception as e:
             # Log the error but don't fail - DataFusion might still work with built-in support
@@ -1732,7 +1975,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         where: str | None = None,
     ) -> str:
         # Build datafusion SQL query
-        query = f"SELECT * FROM {table}"  # noqa (possible SQL injection)
+        query = f"SELECT * FROM {table}"  # noqa: S608
         conditions: list[str] = [] + ([where] if where else [])
 
         if start:
@@ -1756,12 +1999,12 @@ class ParquetDataCatalog(BaseDataCatalog):
         identifiers: list[str] | None = None,
         start: TimestampLike | None = None,
         end: TimestampLike | None = None,
-        filter_expr: str | None = None,
+        filter_expr: pds.Expression | None = None,
         files: list[str] | None = None,
         **kwargs: Any,
     ) -> list[Data]:
         # Load dataset - use provided files or query for them
-        file_list = files if files else self._query_files(data_cls, identifiers, start, end)
+        file_list = files or self._query_files(data_cls, identifiers, start, end)
 
         if not file_list:
             return []
@@ -1779,10 +2022,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         if used_end is not None:
             filters.append(pds.field("ts_init") <= used_end.value)
 
-        if filters:
-            combined_filters = combine_filters(*filters)
-        else:
-            combined_filters = None
+        combined_filters = combine_filters(*filters) if filters else None
 
         table = dataset.to_table(filter=combined_filters)
 
@@ -1798,35 +2038,98 @@ class ParquetDataCatalog(BaseDataCatalog):
         identifiers: list[str] | None = None,
         start: TimestampLike | None = None,
         end: TimestampLike | None = None,
-    ):
-        file_prefix = class_to_filename(data_cls)
-        base_path = self.path.rstrip("/")
-        glob_path = f"{base_path}/data/{file_prefix}/**/*.parquet"
-        file_paths: list[str] = self.fs.glob(glob_path)
+        files: list[str] | None = None,
+    ) -> list[str]:
+        """
+        Query files based on data class, identifiers, and time range.
 
+        This function either retrieves files for a data class or uses a provided list,
+        then filters them based on identifiers and time range.
+
+        Parameters
+        ----------
+        data_cls : type
+            The data class type to query for (e.g., Bar, TradeTick).
+        identifiers : list[str] | None, optional
+            List of identifiers to match against file paths. If None, no identifier filtering is applied.
+        start : TimestampLike | None, optional
+            Start timestamp for filtering. If None, no start time constraint is applied.
+        end : TimestampLike | None, optional
+            End timestamp for filtering. If None, no end time constraint is applied.
+        files : list[str] | None, optional
+            Predefined list of files to filter. If None, files are retrieved using get_file_list_from_data_cls.
+
+        Returns
+        -------
+        list[str]
+            List of file paths that match the query criteria.
+
+        """
+        file_paths = files if files is not None else self.get_file_list_from_data_cls(data_cls)
+
+        return self.filter_files(data_cls, file_paths, identifiers, start, end)
+
+    def filter_files(
+        self,
+        data_cls: type,
+        file_paths: list[str],
+        identifiers: list[str] | None = None,
+        start: TimestampLike | None = None,
+        end: TimestampLike | None = None,
+    ) -> list[str]:
+        """
+        Filter a list of file paths based on identifiers and time range.
+
+        This function filters the provided file paths by:
+        1. Matching identifiers (exact match for instruments, prefix match for bars)
+        2. Intersecting with the specified time range
+
+        Parameters
+        ----------
+        data_cls : type
+            The data class type to filter for (e.g., Bar, TradeTick).
+        file_paths : list[str]
+            List of file paths to filter.
+        identifiers : list[str] | None, optional
+            List of identifiers to match against file paths. If None, no identifier filtering is applied.
+        start : TimestampLike | None, optional
+            Start timestamp for filtering. If None, no start time constraint is applied.
+        end : TimestampLike | None, optional
+            End timestamp for filtering. If None, no end time constraint is applied.
+
+        Returns
+        -------
+        list[str]
+            Filtered list of file paths that match the criteria.
+
+        Notes
+        -----
+        For Bar data classes, if exact identifier matching fails, the function attempts
+        partial matching by checking if the file's identifier starts with the provided identifier
+        followed by a dash (to match bar type patterns).
+
+        """
         if identifiers:
             if not isinstance(identifiers, list):
                 identifiers = [identifiers]
 
             safe_identifiers = [urisafe_identifier(identifier) for identifier in identifiers]
+            file_safe_identifiers = [file_path.split("/")[-2] for file_path in file_paths]
 
             # Exact match by default for instrument_ids or bar_types
             exact_match_file_paths = [
-                file_path
-                for file_path in file_paths
-                if any(
-                    safe_identifier == file_path.split("/")[-2]
-                    for safe_identifier in safe_identifiers
-                )
+                file_paths[i]
+                for i, file_instrument in enumerate(file_safe_identifiers)
+                if any(safe_identifier == file_instrument for safe_identifier in safe_identifiers)
             ]
 
             if not exact_match_file_paths and data_cls in [Bar, *Bar.__subclasses__()]:
                 # Partial match of instrument_ids in bar_types for bars
                 file_paths = [
-                    file_path
-                    for file_path in file_paths
+                    file_paths[i]
+                    for i, file_safe_identifier in enumerate(file_safe_identifiers)
                     if any(
-                        file_path.split("/")[-2].startswith(f"{safe_identifier}-")
+                        file_safe_identifier.startswith(f"{safe_identifier}-")
                         for safe_identifier in safe_identifiers
                     )
                 ]
@@ -1847,31 +2150,48 @@ class ParquetDataCatalog(BaseDataCatalog):
 
         return file_paths
 
-    @staticmethod
-    def _handle_table_nautilus(
-        table: pa.Table | pd.DataFrame,
+    def get_file_list_from_data_cls(
+        self,
         data_cls: type,
-    ) -> list[Data]:
-        if isinstance(table, pd.DataFrame):
-            table = pa.Table.from_pandas(table)
+    ) -> list[str]:
+        """
+        Retrieve a list of file paths for a given data class.
 
-        data = ArrowSerializer.deserialize(data_cls=data_cls, batch=table)
+        This function constructs a glob pattern to find all parquet files
+        associated with the specified data class in the catalog's directory structure.
 
-        # TODO (bm/cs) remove when pyo3 objects are used everywhere.
-        module = data[0].__class__.__module__
+        Parameters
+        ----------
+        data_cls : type
+            The data class type to retrieve file paths for (e.g., Bar, TradeTick).
 
-        if "nautilus_pyo3" in module:
-            cython_cls = {
-                "OrderBookDelta": OrderBookDelta,
-                "OrderBookDeltas": OrderBookDelta,
-                "OrderBookDepth10": OrderBookDepth10,
-                "QuoteTick": QuoteTick,
-                "TradeTick": TradeTick,
-                "Bar": Bar,
-            }.get(data_cls.__name__, data_cls.__name__)
-            data = cython_cls.from_pyo3_list(data)
+        Returns
+        -------
+        list[str]
+            List of file paths matching the data class.
 
-        return data
+        """
+        file_prefix = class_to_filename(data_cls)
+        base_path = self.path.rstrip("/")
+        glob_path = f"{base_path}/data/{file_prefix}/**/*.parquet"
+        file_paths: list[str] = self.fs.glob(glob_path)
+
+        return file_paths
+
+    def query_first_timestamp(
+        self,
+        data_cls: type,
+        identifier: str | None = None,
+    ) -> pd.Timestamp | None:
+        subclasses = [data_cls, *data_cls.__subclasses__()]
+
+        for cls in subclasses:
+            intervals = self.get_intervals(cls, identifier)
+
+            if intervals:
+                return time_object_to_dt(intervals[0][0])
+
+        return None
 
     def query_last_timestamp(
         self,
@@ -1998,18 +2318,13 @@ class ParquetDataCatalog(BaseDataCatalog):
         base_path = self.path.rstrip("/")
         directory = f"{base_path}/data/{file_prefix}"
 
-        # identifier can be an instrument_id or a bar_type
+        # Identifier can be an instrument_id or a bar_type
         if identifier is not None:
             directory += f"/{urisafe_identifier(identifier)}"
 
         return directory
 
     # -- OVERLOADED BASE METHODS ------------------------------------------------------------------
-
-    def _list_directory_stems(self, subdirectory: str) -> list[str]:
-        glob_path = f"{self.path}/{subdirectory}/*"
-
-        return [Path(p).stem for p in self.fs.glob(glob_path)]
 
     def list_data_types(self) -> list[str]:
         """
@@ -2047,7 +2362,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         """
         return self._list_directory_stems("live")
 
-    def read_live_run(self, instance_id: str, **kwargs: Any) -> list[Data]:
+    def read_live_run(self, instance_id: str, **kwargs: Any) -> list[Data] | dict[str, list[Data]]:
         """
         Read data from a live run.
 
@@ -2069,7 +2384,7 @@ class ParquetDataCatalog(BaseDataCatalog):
         """
         return self._read_feather(kind="live", instance_id=instance_id, **kwargs)
 
-    def read_backtest(self, instance_id: str, **kwargs: Any) -> list[Data]:
+    def read_backtest(self, instance_id: str, **kwargs: Any) -> list[Data] | dict[str, list[Data]]:
         """
         Read data from a backtest run.
 
@@ -2096,11 +2411,14 @@ class ParquetDataCatalog(BaseDataCatalog):
         kind: str,
         instance_id: str,
         raise_on_failed_deserialize: bool = False,
-    ) -> list[Data]:
+        data_cls: type | None = None,
+        identifiers: list[str] | None = None,
+        return_as_dict: bool = False,
+    ) -> list[Data] | dict[str, list[Data]]:
         class_mapping: dict[str, type] = {class_to_filename(cls): cls for cls in list_schemas()}
         data = defaultdict(list)
 
-        for feather_file in self._list_feather_files(kind=kind, instance_id=instance_id):
+        for feather_file in self._list_feather_files(kind, instance_id, data_cls, identifiers):
             path = feather_file.path
             cls_name = feather_file.class_name
             table: pa.Table = self._read_feather_file(path=path)
@@ -2111,65 +2429,20 @@ class ParquetDataCatalog(BaseDataCatalog):
             if table is None:
                 continue
 
-            # Apply post read fixes
             try:
                 data_cls = class_mapping[cls_name]
-                objs = self._handle_table_nautilus(table=table, data_cls=data_cls)
-                data[cls_name].extend(objs)
+                data_objects = self._handle_table_nautilus(table=table, data_cls=data_cls)
+                data[cls_name].extend(data_objects)
             except Exception as e:
                 if raise_on_failed_deserialize:
                     raise
 
                 print(f"Failed to deserialize {cls_name}: {e}")
 
+        if return_as_dict:
+            return data
+
         return sorted(itertools.chain.from_iterable(data.values()), key=lambda x: x.ts_init)
-
-    def _list_feather_files(
-        self,
-        kind: str,
-        instance_id: str,
-    ) -> Generator[FeatherFile, None, None]:
-        prefix = f"{self.path}/{kind}/{urisafe_identifier(instance_id)}"
-
-        # Non-instrument feather files
-        for path_str in self.fs.glob(f"{prefix}/*.feather"):
-            if not Path(path_str).is_file():
-                continue
-
-            file_name = path_str.replace(prefix + "/", "").replace(".feather", "")
-            cls_name = "_".join(file_name.split("_")[:-1])
-
-            if not cls_name:
-                raise ValueError(f"`cls_name` was empty when a value was expected: {path_str}")
-
-            yield FeatherFile(path=path_str, class_name=cls_name)
-
-        # Per-instrument feather files
-        for path_str in self.fs.glob(f"{prefix}/**/*.feather"):
-            if not Path(path_str).is_file():
-                continue
-
-            file_name = path_str.replace(prefix + "/", "").replace(".feather", "")
-            cls_name = Path(file_name).parent.name
-
-            if not cls_name:
-                continue
-
-            yield FeatherFile(path=path_str, class_name=cls_name)
-
-    def _read_feather_file(
-        self,
-        path: str,
-    ) -> pa.Table | None:
-        if not self.fs.exists(path):
-            return None
-        try:
-            with self.fs.open(path) as f:
-                reader = pa.ipc.open_stream(f)
-
-                return reader.read_all()
-        except (pa.ArrowInvalid, OSError):
-            return None
 
     def convert_stream_to_data(
         self,
@@ -2177,6 +2450,8 @@ class ParquetDataCatalog(BaseDataCatalog):
         data_cls: type,
         other_catalog: ParquetDataCatalog | None = None,
         subdirectory: str = "backtest",
+        identifiers: list[str] | None = None,
+        use_ts_event_for_ts_init: bool = False,
     ) -> None:
         """
         Convert stream data from feather files to parquet files.
@@ -2195,37 +2470,318 @@ class ParquetDataCatalog(BaseDataCatalog):
             An alternative catalog to write the data to. If None, writes to this catalog.
         subdirectory : str, default "backtest"
             The subdirectory containing the feather files. Either "backtest" or "live".
-
-        Notes
-        -----
-        - The method looks for feather files in two possible locations:
-          1. {path}/{subdirectory}/{instance_id}/{table_name}/*.feather
-          2. {path}/{subdirectory}/{instance_id}/{table_name}_*.feather
-        - It reads each feather file, deserializes the data, and collects it into a list.
-        - The data is then sorted by timestamp and written to the catalog.
-        - If no feather files are found or they contain no data, no action is taken.
+        identifiers : list[str], optional
+            Filter to only include data containing these identifiers in their instrument_ids or bar_types.
+        use_ts_event_for_ts_init : bool, default False
+            If True, replaces the `ts_init` column with `ts_event` column values before deserializing.
 
         """
-        table_name = class_to_filename(data_cls)
-        feather_dir = Path(self.path) / subdirectory / instance_id
-
-        if (feather_dir / table_name).is_dir():
-            feather_files = sorted((feather_dir / table_name).glob("*.feather"))
-        else:
-            feather_files = sorted(feather_dir.glob(f"{table_name}_*.feather"))
-
-        all_data = []
-
-        for feather_file in feather_files:
-            feather_table = self._read_feather_file(str(feather_file))
-
-            if feather_table is not None:
-                custom_data_list = self._handle_table_nautilus(feather_table, data_cls)
-                all_data.extend(custom_data_list)
-
-        all_data.sort(key=lambda x: x.ts_init)
         used_catalog = self if other_catalog is None else other_catalog
-        used_catalog.write_data(all_data)
+
+        for feather_file in self._list_feather_data_files(
+            kind=subdirectory,
+            instance_id=instance_id,
+            data_cls=data_cls,
+            identifiers=identifiers,
+        ):
+            feather_table = self._read_feather_file(feather_file.path)
+            if feather_table is None:
+                continue
+
+            self._convert_feather_table_to_parquet(
+                feather_table=feather_table,
+                feather_path=feather_file.path,
+                data_cls=data_cls,
+                used_catalog=used_catalog,
+                use_ts_event_for_ts_init=use_ts_event_for_ts_init,
+            )
+
+    def _convert_feather_table_to_parquet(
+        self,
+        feather_table: pa.Table,
+        feather_path: str,
+        data_cls: type,
+        used_catalog: ParquetDataCatalog,
+        use_ts_event_for_ts_init: bool = False,
+    ) -> None:
+        # Apply table-only transforms (no deserialization).
+        table = self._apply_stream_conversion_transforms(
+            feather_table,
+            use_ts_event_for_ts_init=use_ts_event_for_ts_init,
+            convert_bar_type_to_external=True,
+        )
+
+        if table is None or len(table) == 0:
+            return
+
+        identifier = self._identifier_from_table_or_path(table, data_cls, feather_path)
+        start = int(pa.compute.min(table["ts_init"]).as_py())
+        end = int(pa.compute.max(table["ts_init"]).as_py())
+
+        directory = used_catalog._make_path(data_cls=data_cls, identifier=identifier)
+        used_catalog.fs.mkdirs(directory, exist_ok=True)
+        filename = _timestamps_to_filename(start, end)
+        parquet_file = f"{directory}/{filename}"
+
+        if used_catalog.fs.exists(parquet_file):
+            print(f"File {parquet_file} already exists, skipping write")
+            return
+
+        current_intervals = used_catalog._get_directory_intervals(directory)
+        new_intervals = [*current_intervals, (start, end)]
+        if not _are_intervals_disjoint(new_intervals):
+            raise ValueError(
+                f"Writing file {filename} with interval ({start}, {end}) would create "
+                f"non-disjoint intervals. Existing intervals: {current_intervals}",
+            )
+
+        pq.write_table(
+            table,
+            where=parquet_file,
+            filesystem=used_catalog.fs,
+            row_group_size=used_catalog.max_rows_per_group,
+        )
+
+    @staticmethod
+    def _apply_stream_conversion_transforms(
+        table: pa.Table,
+        use_ts_event_for_ts_init: bool = False,
+        convert_bar_type_to_external: bool = False,
+    ) -> pa.Table:
+        if use_ts_event_for_ts_init:
+            schema = table.schema
+            column_names = schema.names
+            if "ts_event" not in column_names or "ts_init" not in column_names:
+                raise ValueError(
+                    "Both 'ts_event' and 'ts_init' columns must exist in the table "
+                    "to use 'use_ts_event_for_ts_init' option",
+                )
+
+            ts_event_idx = column_names.index("ts_event")
+            ts_init_idx = column_names.index("ts_init")
+            new_arrays = list(table.columns)
+            new_arrays[ts_init_idx] = new_arrays[ts_event_idx]
+            table = pa.Table.from_arrays(new_arrays, schema=schema)
+
+        if convert_bar_type_to_external and table.schema.metadata:
+            metadata = dict(table.schema.metadata)
+            if b"bar_type" in metadata:
+                bar_type_str = metadata[b"bar_type"].decode()
+                if bar_type_str.endswith("-INTERNAL"):
+                    metadata[b"bar_type"] = bar_type_str.replace(
+                        "-INTERNAL",
+                        "-EXTERNAL",
+                    ).encode()
+
+            table = table.replace_schema_metadata(metadata)
+
+        table = ParquetDataCatalog._enforce_monotonic_ts(table)
+
+        return table
+
+    @staticmethod
+    def _enforce_monotonic_ts(table: pa.Table) -> pa.Table:
+        if len(table) > 0 and "ts_init" not in table.schema.names:
+            raise ValueError(
+                "Table has no 'ts_init' column; cannot enforce monotonicity",
+            )
+
+        if len(table) <= 1:
+            return table
+
+        ts_col = table.column("ts_init")
+        if isinstance(ts_col, pa.ChunkedArray):
+            ts_col = ts_col.combine_chunks()
+
+        # Use direct comparison instead of pairwise_diff to avoid uint64 overflow
+        is_sorted = pc.all(
+            pc.greater_equal(ts_col.slice(1), ts_col.slice(0, len(ts_col) - 1)),
+        ).as_py()
+
+        if not is_sorted:
+            sort_indices = pc.sort_indices(
+                table,
+                sort_keys=[("ts_init", "ascending")],
+            )
+            table = table.take(sort_indices)
+
+        return table
+
+    @staticmethod
+    def _identifier_from_table_or_path(
+        table: pa.Table,
+        data_cls: type,
+        feather_path: str,
+    ) -> str | None:
+        metadata = table.schema.metadata or {}
+        if b"bar_type" in metadata:
+            return metadata[b"bar_type"].decode()
+
+        if b"instrument_id" in metadata:
+            return metadata[b"instrument_id"].decode()
+
+        # Fallback: per-instrument feather layout .../data_name/identifier/file.feather
+        parts = feather_path.rstrip("/").split("/")
+        data_name = class_to_filename(data_cls)
+        if len(parts) >= 3 and parts[-3] == data_name:
+            return parts[-2]
+
+        return None
+
+    def _read_feather_file(
+        self,
+        path: str,
+    ) -> pa.Table | None:
+        if not self.fs.exists(path):
+            return None
+
+        try:
+            with self.fs.open(path) as f:
+                reader = pa.ipc.open_stream(f)
+                return reader.read_all()
+        except (pa.ArrowInvalid, OSError):
+            return None
+
+    @staticmethod
+    def _handle_table_nautilus(
+        table: pa.Table | pd.DataFrame,
+        data_cls: type,
+        convert_bar_type_to_external: bool = False,
+        use_ts_event_for_ts_init: bool = False,
+    ) -> list[Data]:
+        if isinstance(table, pd.DataFrame):
+            table = pa.Table.from_pandas(table)
+
+        table = ParquetDataCatalog._apply_stream_conversion_transforms(
+            table,
+            use_ts_event_for_ts_init=use_ts_event_for_ts_init,
+            convert_bar_type_to_external=convert_bar_type_to_external,
+        )
+
+        data = ArrowSerializer.deserialize(data_cls=data_cls, batch=table)
+        if len(data) == 0:
+            return []
+
+        module = data[0].__class__.__module__
+
+        if "nautilus_pyo3" in module:
+            cython_cls = {
+                "OrderBookDelta": OrderBookDelta,
+                "OrderBookDeltas": OrderBookDelta,
+                "OrderBookDepth10": OrderBookDepth10,
+                "QuoteTick": QuoteTick,
+                "TradeTick": TradeTick,
+                "Bar": Bar,
+            }.get(data_cls.__name__)
+
+            if cython_cls is not None:
+                data = cython_cls.from_pyo3_list(data)
+
+        return data
+
+    def _list_feather_files(
+        self,
+        kind: str,
+        instance_id: str,
+        data_cls: type | None = None,
+        identifiers: list[str] | None = None,
+    ) -> Generator[FeatherFile]:
+        """
+        List feather files for a given instance.
+
+        Parameters
+        ----------
+        kind : str
+            The kind of data (e.g., "backtest", "live").
+        instance_id : str
+            The instance ID.
+        data_cls : type, optional
+            If provided, only list files for this specific data class.
+        identifiers : list[str], optional
+            If provided (and data_cls is also provided), only include files
+            from subdirectories containing these identifiers.
+
+        Yields
+        ------
+        FeatherFile
+            Named tuple containing path and class_name.
+
+        """
+        if data_cls is not None:
+            yield from self._list_feather_data_files(kind, instance_id, data_cls, identifiers)
+        else:
+            base_dir = Path(self.path) / kind / urisafe_identifier(instance_id)
+            discovered_classes: set[str] = set()
+
+            # Discover data classes from flat files
+            for path_str in self.fs.glob(str(base_dir / "*.feather")):
+                if not self.fs.isfile(path_str):
+                    continue
+
+                # Extract class name by removing .feather extension and timestamp suffix
+                path = Path(path_str)
+                cls_name = "_".join(path.stem.split("_")[:-1])
+
+                if not cls_name:
+                    raise ValueError(f"`cls_name` was empty when a value was expected: {path_str}")
+
+                discovered_classes.add(cls_name)
+
+            # Discover data classes from per-instrument subdirectories
+            # Use _list_directory_stems to get subdirectory names (data class names)
+            subdirs = self._list_directory_stems(f"{kind}/{urisafe_identifier(instance_id)}")
+            discovered_classes.update(subdirs)
+
+            # Use _list_feather_data_files for each discovered class
+            class_mapping: dict[str, type] = {class_to_filename(cls): cls for cls in list_schemas()}
+
+            for cls_name in discovered_classes:
+                if cls_name in class_mapping:
+                    yield from self._list_feather_data_files(
+                        kind,
+                        instance_id,
+                        class_mapping[cls_name],
+                        identifiers,
+                    )
+
+    def _list_directory_stems(self, subdirectory: str) -> list[str]:
+        glob_path = f"{self.path}/{subdirectory}/*"
+
+        return [Path(p).stem for p in self.fs.glob(glob_path)]
+
+    def _list_feather_data_files(
+        self,
+        kind: str,
+        instance_id: str,
+        data_cls: type,
+        identifiers: list[str] | None = None,
+    ) -> Generator[FeatherFile]:
+        """
+        List feather files for a specific data class.
+        """
+        base_dir = Path(self.path) / kind / instance_id
+        data_name = class_to_filename(data_cls)
+        data_dir = base_dir / data_name
+
+        if self.fs.isdir(str(data_dir)):
+            # Per-instrument feather files organized in subdirectories
+            sub_dirs = [d for d in self.fs.glob(str(data_dir / "*")) if self.fs.isdir(d)]
+
+            for sub_dir in sub_dirs:
+                # Apply identifier filter if provided
+                if identifiers:
+                    sub_dir_name = Path(sub_dir).name
+
+                    if not any(identifier in sub_dir_name for identifier in identifiers):
+                        continue
+
+                # Yield all feather files in this subdirectory
+                for path_str in sorted(self.fs.glob(str(Path(sub_dir) / "*.feather"))):
+                    yield FeatherFile(path=path_str, class_name=data_name)
+        else:
+            # Data is in flat files (old format or non-per-instrument data)
+            for path_str in sorted(self.fs.glob(str(base_dir / f"{data_name}_*.feather"))):
+                yield FeatherFile(path=path_str, class_name=data_name)
 
 
 def _timestamps_to_filename(timestamp_1: int, timestamp_2: int) -> str:
@@ -2283,36 +2839,6 @@ def _file_timestamp_to_iso_timestamp(file_timestamp: str) -> str:
     return f"{date_part}T{final_time_part}Z"
 
 
-def _min_max_from_parquet_metadata(file_path: str, column_name: str) -> tuple[int, int]:
-    parquet_file = pq.ParquetFile(file_path)
-    metadata = parquet_file.metadata
-
-    overall_min_value = None
-    overall_max_value = None
-
-    for i in range(metadata.num_row_groups):
-        row_group_metadata = metadata.row_group(i)
-
-        for j in range(row_group_metadata.num_columns):
-            col_metadata = row_group_metadata.column(j)
-
-            if col_metadata.path_in_schema == column_name:
-                if col_metadata.statistics is not None:
-                    min_value = col_metadata.statistics.min
-                    max_value = col_metadata.statistics.max
-
-                    if overall_min_value is None or min_value < overall_min_value:
-                        overall_min_value = min_value
-                    if overall_max_value is None or max_value > overall_max_value:
-                        overall_max_value = max_value
-
-    if overall_min_value is None or overall_max_value is None:
-        print(f"Column '{column_name}' not found or has no statistics in any row group.")
-        return -1, -1
-    else:
-        return overall_min_value, overall_max_value
-
-
 def _are_intervals_disjoint(intervals: list[tuple[int, int]]) -> bool:
     n = len(intervals)
 
@@ -2333,11 +2859,7 @@ def _are_intervals_contiguous(intervals: list[tuple[int, int]]) -> bool:
     if n <= 1:
         return True
 
-    for i in range(1, n):
-        if intervals[i - 1][1] + 1 != intervals[i][0]:
-            return False
-
-    return True
+    return all(intervals[i - 1][1] + 1 == intervals[i][0] for i in range(1, n))
 
 
 def _query_interval_diff(
@@ -2373,3 +2895,23 @@ def _get_integer_interval_set(intervals: list[tuple[int, int]]) -> P.Interval:
         union_result |= P.closedopen(interval[0], interval[1] + 1)
 
     return union_result
+
+
+def _extract_safe_filename(file_path: str) -> str:
+    if not file_path:
+        return "unknown_file"
+
+    filename = file_path.split("/")[-1].replace(".parquet", "")
+
+    return _sanitize_sql_identifier(filename)
+
+
+def _sanitize_sql_identifier(identifier: str) -> str:
+    return (
+        identifier.replace(".", "_")
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace("^", "_")
+        .replace(":", "_")
+        .lower()
+    )

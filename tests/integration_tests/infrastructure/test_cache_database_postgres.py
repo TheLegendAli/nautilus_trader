@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -30,8 +30,6 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarAggregation
 from nautilus_trader.model.data import BarSpecification
 from nautilus_trader.model.data import BarType
-from nautilus_trader.model.data import CustomData
-from nautilus_trader.model.data import DataType
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.enums import CurrencyType
@@ -56,8 +54,6 @@ from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
-from nautilus_trader.trading.filters import NewsEvent
-from nautilus_trader.trading.filters import NewsImpact
 from nautilus_trader.trading.strategy import Strategy
 
 
@@ -65,7 +61,7 @@ _TEST_TIMEOUT = 5.0
 _AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 
 # Requirements:
-# - A Postgres service listening on the default port 5432
+# - A Postgres service listening on the default port 5432 (e.g. `makeinit-services`)
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -73,6 +69,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.xdist_group(name="postgres_integration")
 class TestCachePostgresAdapter:
     def setup(self) -> None:
         # set envs
@@ -81,9 +78,22 @@ class TestCachePostgresAdapter:
         os.environ["POSTGRES_USERNAME"] = "nautilus"
         os.environ["POSTGRES_PASSWORD"] = "pass"
         os.environ["POSTGRES_DATABASE"] = "nautilus"
-        self.database: CachePostgresAdapter = CachePostgresAdapter()
-        # reset database
-        self.database.flush()
+        try:
+            self.database: CachePostgresAdapter = CachePostgresAdapter()
+            # reset database
+            self.database.flush()
+        except BaseException as e:
+            message = str(e)
+
+            if (
+                "error communicating with database" in message
+                or "Operation not permitted" in message
+            ):
+                pytest.skip(
+                    "Postgres service not available; skipping Postgres adapter integration tests.",
+                )
+                return
+            raise
         self.clock = TestClock()
 
         self.trader_id = TestIdStubs.trader_id()
@@ -112,8 +122,10 @@ class TestCachePostgresAdapter:
         )
 
     def teardown(self):
-        self.database.flush()
-        self.database.dispose()
+        database = getattr(self, "database", None)
+        if database is not None:
+            database.flush()
+            database.dispose()
 
     ################################################################################
     # General
@@ -166,57 +178,6 @@ class TestCachePostgresAdapter:
 
         currencies = self.database.load_currencies()
         assert list(currencies.keys()) == ["BTC"]
-
-    ################################################################################
-    # Instrument - Betting
-    ################################################################################
-    @pytest.mark.skip(reason="from_pyo3 must be implemented")
-    @pytest.mark.asyncio
-    async def test_add_instrument_betting(self):
-        betting = TestInstrumentProvider.betting_instrument()
-        self.database.add_currency(betting.quote_currency)
-
-        # Check that we have added target currencies, because of foreign key constraints
-        await eventually(lambda: self.database.load_currencies(), timeout=_TEST_TIMEOUT)
-
-        currencies = self.database.load_currencies()
-        assert list(currencies.keys()) == ["GBP"]
-
-        # add instrument
-        self.database.add_instrument(betting)
-
-        # Allow MPSC thread to insert
-        await eventually(lambda: self.database.load_instrument(betting.id), timeout=_TEST_TIMEOUT)
-
-        # Assert
-        assert betting == self.database.load_instrument(betting.id)
-
-    ################################################################################
-    # Instrument - Binary Option
-    ################################################################################
-    @pytest.mark.skip(reason="from_pyo3 must be implemented")
-    @pytest.mark.asyncio
-    async def test_add_instrument_binary_option(self):
-        binary_option = TestInstrumentProvider.binary_option()
-        self.database.add_currency(binary_option.quote_currency)
-
-        # Check that we have added target currencies, because of foreign key constraints
-        await eventually(lambda: self.database.load_currencies(), timeout=_TEST_TIMEOUT)
-
-        currencies = self.database.load_currencies()
-        assert list(currencies.keys()) == ["USDC"]
-
-        # add instrument
-        self.database.add_instrument(binary_option)
-
-        # Allow MPSC thread to insert
-        await eventually(
-            lambda: self.database.load_instrument(binary_option.id),
-            timeout=_TEST_TIMEOUT,
-        )
-
-        # Assert
-        assert binary_option == self.database.load_instrument(binary_option.id)
 
     ################################################################################
     # Instrument - Crypto Future
@@ -306,7 +267,7 @@ class TestCachePostgresAdapter:
         )
 
         # Assert
-        assert _AUDUSD_SIM == self.database.load_instrument(_AUDUSD_SIM.id)
+        assert self.database.load_instrument(_AUDUSD_SIM.id) == _AUDUSD_SIM
 
         # Update some fields, to check that add_instrument is idempotent
         aud_usd_currency_pair_updated = CurrencyPair(
@@ -338,8 +299,9 @@ class TestCachePostgresAdapter:
 
         # We have to manually sleep and not use eventually
         await eventually(
-            lambda: self.database.load_instrument(_AUDUSD_SIM.id).min_price
-            == Price.from_str("111"),
+            lambda: (
+                self.database.load_instrument(_AUDUSD_SIM.id).min_price == Price.from_str("111")
+            ),
             timeout=_TEST_TIMEOUT,
         )
 
@@ -818,25 +780,3 @@ class TestCachePostgresAdapter:
 
         signals = self.database.load_signals(signal_cls, signal_name)
         assert len(signals) == 1
-
-    @pytest.mark.skip(reason="WIP")
-    @pytest.mark.asyncio
-    async def test_add_and_load_custom_data(self):
-        metadata = {"a": "1", "b": "2"}
-        data_type = DataType(NewsEvent, metadata)
-        event = NewsEvent(
-            impact=NewsImpact.LOW,
-            name="something-happened",
-            currency="USD",
-            ts_event=1,
-            ts_init=2,
-        )
-        data = CustomData(data_type, event)
-
-        self.database.add_custom_data(data)
-
-        # TODO: WIP - loading needs more work
-        # await eventually(lambda: len(self.database.load_custom_data(data_type)) > 0, timeout=_TEST_TIMEOUT)
-        #
-        # signals = self.database.load_custom_data(data_type)
-        # assert len(signals) == 1

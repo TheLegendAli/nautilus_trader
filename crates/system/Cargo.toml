@@ -6,12 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "System orchestration for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "nautilus_system"
@@ -19,12 +22,17 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
-extension-module = [
-    "pyo3/extension-module",
-]
+defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
+streaming = ["nautilus-persistence"]
+extension-module = ["python", "pyo3/extension-module", "streaming"]
+live = ["nautilus-common/live"]
 python = [
-    "pyo3",
+  "nautilus-core/python",
+  "nautilus-persistence/python",
+  "pyo3",
+  "streaming",
 ]
+tracing-bridge = ["nautilus-common/tracing-bridge"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -36,17 +44,19 @@ nautilus-core = { workspace = true }
 nautilus-data = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true, features = ["stubs"] }
-nautilus-persistence = { workspace = true }
+nautilus-persistence = { workspace = true, optional = true }
 nautilus-portfolio = { workspace = true }
 nautilus-risk = { workspace = true }
 nautilus-trading = { workspace = true }
 
+ahash = { workspace = true }
 anyhow = { workspace = true }
-futures = { workspace = true }
-hostname = { workspace = true }
+bon = { workspace = true }
 log = { workspace = true }
-pyo3 = { workspace = true, optional = true }
+sysinfo = { workspace = true }
 ustr = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

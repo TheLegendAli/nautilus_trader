@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -21,7 +21,6 @@ import pytest
 
 from nautilus_trader import TEST_DATA_DIR
 from nautilus_trader.adapters.databento.loaders import DatabentoDataLoader
-from nautilus_trader.model import convert_to_raw_int
 from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDelta
@@ -199,6 +198,26 @@ class TestOrderBook:
         assert book.get_avg_px_for_quantity(quantity, order_side) == 0.0
 
     @pytest.mark.parametrize(
+        "order_side",
+        [
+            OrderSide.BUY,
+            OrderSide.SELL,
+        ],
+    )
+    def test_get_worst_px_for_quantity_when_no_market(self, order_side: OrderSide) -> None:
+        # Arrange
+        book = OrderBook(
+            instrument_id=self.instrument.id,
+            book_type=BookType.L2_MBP,
+        )
+
+        quantity = Quantity.from_str("1.0")
+
+        # Act, Assert
+        result = book.get_worst_px_for_quantity(quantity, order_side)
+        assert result is None
+
+    @pytest.mark.parametrize(
         ("order_side", "expected"),
         [
             [OrderSide.BUY, 11.0],
@@ -241,6 +260,65 @@ class TestOrderBook:
         # Assert
         assert result == expected
 
+    def test_get_worst_px_for_quantity(self) -> None:
+        # Arrange
+        book = OrderBook(
+            instrument_id=self.instrument.id,
+            book_type=BookType.L2_MBP,
+        )
+
+        book.add(
+            BookOrder(
+                price=Price(10.0, 1),
+                size=Quantity(100.0, 0),
+                side=OrderSide.BUY,
+                order_id=0,
+            ),
+            0,
+            0,
+        )
+        book.add(
+            BookOrder(
+                price=Price(9.0, 1),
+                size=Quantity(200.0, 0),
+                side=OrderSide.BUY,
+                order_id=1,
+            ),
+            0,
+            0,
+        )
+        book.add(
+            BookOrder(
+                price=Price(11.0, 1),
+                size=Quantity(100.0, 0),
+                side=OrderSide.SELL,
+                order_id=2,
+            ),
+            0,
+            0,
+        )
+        book.add(
+            BookOrder(
+                price=Price(12.0, 1),
+                size=Quantity(200.0, 0),
+                side=OrderSide.SELL,
+                order_id=3,
+            ),
+            0,
+            0,
+        )
+
+        quantity = Quantity.from_str("150")
+
+        # Act, Assert
+        buy_result = book.get_worst_px_for_quantity(quantity, OrderSide.BUY)
+        sell_result = book.get_worst_px_for_quantity(quantity, OrderSide.SELL)
+
+        assert isinstance(buy_result, Price)
+        assert isinstance(sell_result, Price)
+        assert buy_result == Price(12.0, 1)
+        assert sell_result == Price(9.0, 1)
+
     def test_add_orders_to_book(self):
         # Arrange
         book = OrderBook(
@@ -281,16 +359,19 @@ class TestOrderBook:
         assert book.midpoint() == 10.5
         assert len(book.bids()) == 1
         assert len(book.asks()) == 1
-        assert (
-            repr(book.bids())
-            == f"[BookLevel(price=10.0, orders=[BookOrder(side=BUY, price=10.0, size=5, order_id={convert_to_raw_int(10, 0)})])]"
-        )
-        assert (
-            repr(book.asks())
-            == f"[BookLevel(price=11.0, orders=[BookOrder(side=SELL, price=11.0, size=6, order_id={convert_to_raw_int(11, 0)})])]"
-        )
+        # For L2_MBP books, order_ids are deterministic hashes of the price
+        # NOTE: We test hash properties rather than exact values because AHash produces
+        # platform-specific results (different on Windows vs Unix due to architecture
+        # differences). The important properties are: determinism within a platform,
+        # non-zero values, and collision resistance (different prices -> different IDs).
         bid_level = book.bids()[0]
         ask_level = book.asks()[0]
+        bid_order_id = bid_level.orders()[0].order_id
+        ask_order_id = ask_level.orders()[0].order_id
+        # Verify order_ids are non-zero and different
+        assert bid_order_id > 0, "Bid order_id should be non-zero"
+        assert ask_order_id > 0, "Ask order_id should be non-zero"
+        assert bid_order_id != ask_order_id, "Different prices should produce different order_ids"
         assert bid_level.side == OrderSide.BUY
         assert ask_level.side == OrderSide.SELL
         assert len(bid_level.orders()) == 1
@@ -334,6 +415,9 @@ class TestOrderBook:
             "update_count: 2\n"
             "bid_levels: 1\n"
             "ask_levels: 1\n"
+            "sequence: 0\n"
+            "update_count: 2\n"
+            "ts_last: 0\n"
             "╭──────┬───────┬──────╮\n"
             "│ bids │ price │ asks │\n"
             "├──────┼───────┼──────┤\n"
@@ -354,7 +438,11 @@ class TestOrderBook:
 
         # Assert
         assert (
-            result == "bid_levels: 0\nask_levels: 0\n"
+            result == "bid_levels: 0\n"
+            "ask_levels: 0\n"
+            "sequence: 0\n"
+            "update_count: 0\n"
+            "ts_last: 0\n"
             "╭──────┬───────┬──────╮\n"
             "│ bids │ price │ asks │\n"
             "├──────┼───────┼──────┤"
@@ -718,10 +806,10 @@ class TestOrderBook:
             book.apply_delta(delta)
 
         # Assert
-        assert len(data) == 74509  # No trades
+        assert len(data) == 74544  # Includes NoOrderSide deltas that are now decoded
         assert book.ts_last == 1703548799446821072
         assert book.sequence == 59585
-        assert book.update_count == 74509
+        assert book.update_count == 74537  # 28 NoOrderSide resolved, 7 skipped
         assert len(book.bids()) == 922
         assert len(book.asks()) == 565
         assert book.best_bid_price() == Price.from_str("4810.00")

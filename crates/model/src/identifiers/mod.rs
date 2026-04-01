@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -25,9 +25,9 @@ pub mod actor_id;
 pub mod client_id;
 pub mod client_order_id;
 pub mod component_id;
-pub mod default;
 pub mod exec_algorithm_id;
 pub mod instrument_id;
+pub mod option_series_id;
 pub mod order_list_id;
 pub mod position_id;
 pub mod strategy_id;
@@ -44,8 +44,9 @@ pub mod stubs;
 pub use crate::identifiers::{
     account_id::AccountId, actor_id::ActorId, client_id::ClientId, client_order_id::ClientOrderId,
     component_id::ComponentId, exec_algorithm_id::ExecAlgorithmId, instrument_id::InstrumentId,
-    order_list_id::OrderListId, position_id::PositionId, strategy_id::StrategyId, symbol::Symbol,
-    trade_id::TradeId, trader_id::TraderId, venue::Venue, venue_order_id::VenueOrderId,
+    option_series_id::OptionSeriesId, order_list_id::OrderListId, position_id::PositionId,
+    strategy_id::StrategyId, symbol::Symbol, trade_id::TradeId, trader_id::TraderId, venue::Venue,
+    venue_order_id::VenueOrderId,
 };
 
 impl_from_str_for_identifier!(account_id::AccountId);
@@ -93,8 +94,8 @@ impl_as_ref_for_identifier!(venue_order_id::VenueOrderId);
 
 /// Print interned string cache statistics for debugging purposes.
 pub fn interned_string_stats() {
-    dbg!(ustr::total_allocated());
-    dbg!(ustr::total_capacity());
+    ustr::total_allocated();
+    ustr::total_capacity();
 
     ustr::string_cache_iter().for_each(|s| println!("{s}"));
 }

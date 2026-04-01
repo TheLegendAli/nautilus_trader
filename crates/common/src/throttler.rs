@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -34,13 +34,10 @@ use ustr::Ustr;
 use crate::{
     actor::{
         Actor,
-        registry::{get_actor_unchecked, register_actor},
+        registry::{get_actor_unchecked, register_actor, try_get_actor_unchecked},
     },
     clock::Clock,
-    msgbus::{
-        self,
-        handler::{MessageHandler, ShareableMessageHandler},
-    },
+    msgbus::{self, Endpoint, Handler, MStr, ShareableMessageHandler},
     timer::{TimeEvent, TimeEventCallback},
 };
 
@@ -83,7 +80,7 @@ pub struct Throttler<T, F> {
     /// The interval between messages in nanoseconds.
     interval: u64,
     /// The name of the timer.
-    timer_name: String,
+    timer_name: Ustr,
     /// The callback to send a message.
     output_send: F,
     /// The callback to drop a message.
@@ -133,7 +130,7 @@ where
         limit: usize,
         interval: u64,
         clock: Rc<RefCell<dyn Clock>>,
-        timer_name: String,
+        timer_name: &str,
         output_send: F,
         output_drop: Option<F>,
         actor_id: Ustr,
@@ -144,10 +141,10 @@ where
             is_limiting: false,
             limit,
             buffer: VecDeque::new(),
-            timestamps: VecDeque::with_capacity(limit),
+            timestamps: VecDeque::with_capacity(limit.min(1024)),
             clock,
             interval,
-            timer_name,
+            timer_name: Ustr::from(timer_name),
             output_send,
             output_drop,
             actor_id,
@@ -167,7 +164,7 @@ where
     pub fn set_timer(&mut self, callback: Option<TimeEventCallback>) {
         let delta = self.delta_next();
         let mut clock = self.clock.borrow_mut();
-        if clock.timer_names().contains(&self.timer_name.as_str()) {
+        if clock.timer_exists(&self.timer_name) {
             clock.cancel_timer(&self.timer_name);
         }
         let alert_ts = clock.timestamp_ns() + delta;
@@ -233,9 +230,9 @@ where
     pub fn to_actor(self) -> Rc<UnsafeCell<Self>> {
         // Register process endpoint
         let process_handler = ThrottlerProcess::<T, F>::new(self.actor_id);
-        msgbus::register(
+        msgbus::register_any(
             process_handler.id().as_str().into(),
-            ShareableMessageHandler::from(Rc::new(process_handler) as Rc<dyn MessageHandler>),
+            ShareableMessageHandler::from(Rc::new(process_handler) as Rc<dyn Handler<dyn Any>>),
         );
 
         // Register actor state and return the wrapped reference
@@ -257,21 +254,28 @@ where
 
     #[inline]
     pub fn limit_msg(&mut self, msg: T) {
-        let callback = if self.output_drop.is_none() {
+        if self.output_drop.is_none() {
             self.buffer.push_front(msg);
             log::debug!("Buffering {}", self.buffer.len());
-            Some(ThrottlerProcess::<T, F>::new(self.actor_id).get_timer_callback())
+
+            if !self.is_limiting {
+                log::debug!("Limiting");
+                let cb = Some(ThrottlerProcess::<T, F>::new(self.actor_id).get_timer_callback());
+                self.set_timer(cb);
+                self.is_limiting = true;
+            }
         } else {
             log::debug!("Dropping");
+
             if let Some(drop) = &self.output_drop {
                 drop(msg);
             }
-            Some(throttler_resume::<T, F>(self.actor_id))
-        };
-        if !self.is_limiting {
-            log::debug!("Limiting");
-            self.set_timer(callback);
-            self.is_limiting = true;
+
+            if !self.is_limiting {
+                log::debug!("Limiting");
+                self.set_timer(Some(throttler_resume::<T, F>(self.actor_id)));
+                self.is_limiting = true;
+            }
         }
     }
 
@@ -283,7 +287,17 @@ where
     {
         self.recv_count += 1;
 
-        if self.is_limiting || self.delta_next() > 0 {
+        let delta = self.delta_next();
+
+        // Auto-reset when the rate window has passed but no timer callback
+        // arrived (e.g. for embedded throttlers not registered as actors).
+        // Gated on an empty buffer so buffered throttlers keep draining via
+        // ThrottlerProcess; only drop-mode throttlers have an empty buffer here.
+        if self.is_limiting && delta == 0 && self.buffer.is_empty() {
+            self.is_limiting = false;
+        }
+
+        if self.is_limiting || delta > 0 {
             self.limit_msg(msg);
         } else {
             self.send_msg(msg);
@@ -297,7 +311,7 @@ where
 /// is registered as a separated endpoint on the message bus as `{actor_id}_process`.
 struct ThrottlerProcess<T, F> {
     actor_id: Ustr,
-    endpoint: Ustr,
+    endpoint: MStr<Endpoint>,
     phantom_t: PhantomData<T>,
     phantom_f: PhantomData<F>,
 }
@@ -307,7 +321,7 @@ where
     T: Debug,
 {
     pub fn new(actor_id: Ustr) -> Self {
-        let endpoint = Ustr::from(&format!("{actor_id}_process"));
+        let endpoint = MStr::endpoint(format!("{actor_id}_process")).expect(FAILED);
         Self {
             actor_id,
             endpoint,
@@ -317,25 +331,24 @@ where
     }
 
     pub fn get_timer_callback(&self) -> TimeEventCallback {
-        let endpoint = self.endpoint.into(); // TODO: Optimize this
-        let process_callback = Rc::new(move |_event: TimeEvent| {
-            msgbus::send_any(endpoint, &());
-        });
-        TimeEventCallback::Rust(process_callback)
+        let endpoint = self.endpoint;
+        TimeEventCallback::from(move |event: TimeEvent| {
+            msgbus::send_any(endpoint, &(event));
+        })
     }
 }
 
-impl<T, F> MessageHandler for ThrottlerProcess<T, F>
+impl<T, F> Handler<dyn Any> for ThrottlerProcess<T, F>
 where
     T: 'static + Debug,
     F: Fn(T) + 'static,
 {
     fn id(&self) -> Ustr {
-        self.endpoint
+        *self.endpoint
     }
 
     fn handle(&self, _message: &dyn Any) {
-        let throttler = get_actor_unchecked::<Throttler<T, F>>(&self.actor_id);
+        let mut throttler = get_actor_unchecked::<Throttler<T, F>>(&self.actor_id);
         while let Some(msg) = throttler.buffer.pop_back() {
             throttler.send_msg(msg);
 
@@ -345,42 +358,37 @@ where
             if !throttler.buffer.is_empty() && throttler.delta_next() > 0 {
                 throttler.is_limiting = true;
 
-                let endpoint = self.endpoint.into(); // TODO: Optimize this
+                let endpoint = self.endpoint;
 
                 // Send message to throttler process endpoint to resume
-                let process_callback = Rc::new(move |_event: TimeEvent| {
-                    msgbus::send_any(endpoint, &());
-                });
-                throttler.set_timer(Some(TimeEventCallback::Rust(process_callback)));
+                throttler.set_timer(Some(TimeEventCallback::from(move |event: TimeEvent| {
+                    msgbus::send_any(endpoint, &(event));
+                })));
                 return;
             }
         }
 
         throttler.is_limiting = false;
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
-/// Sets throttler to resume sending messages
+/// Sets throttler to resume sending messages.
+///
+/// Uses `try_get_actor_unchecked` so that embedded throttlers (not registered
+/// in the actor registry) are handled gracefully. The `send()` auto-reset
+/// ensures such throttlers recover once the rate window passes.
 pub fn throttler_resume<T, F>(actor_id: Ustr) -> TimeEventCallback
 where
     T: 'static + Debug,
     F: Fn(T) + 'static,
 {
-    let callback = Rc::new(move |_event: TimeEvent| {
-        let throttler = get_actor_unchecked::<Throttler<T, F>>(&actor_id);
-        throttler.is_limiting = false;
-    });
-
-    TimeEventCallback::Rust(callback)
+    TimeEventCallback::from(move |_event: TimeEvent| {
+        if let Some(mut throttler) = try_get_actor_unchecked::<Throttler<T, F>>(&actor_id) {
+            throttler.is_limiting = false;
+        }
+    })
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use std::{
@@ -392,8 +400,8 @@ mod tests {
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
-    use super::{RateLimit, Throttler};
-    use crate::clock::TestClock;
+    use super::{RateLimit, Throttler, ThrottlerProcess};
+    use crate::{clock::TestClock, msgbus::Handler};
     type SharedThrottler = Rc<UnsafeCell<Throttler<u64, Box<dyn Fn(u64)>>>>;
 
     /// Test throttler with default values for testing
@@ -424,14 +432,14 @@ mod tests {
         let inner_clock = Rc::clone(&clock);
         let rate_limit = RateLimit::new(5, 10);
         let interval = rate_limit.interval_ns;
-        let actor_id = Ustr::from(&UUID4::new().to_string());
+        let actor_id = Ustr::from(UUID4::new().as_str());
 
         TestThrottler {
             throttler: Throttler::new(
                 rate_limit.limit,
                 rate_limit.interval_ns,
                 clock,
-                "buffer_timer".to_string(),
+                "buffer_timer",
                 output_send,
                 None,
                 actor_id,
@@ -454,14 +462,14 @@ mod tests {
         let inner_clock = Rc::clone(&clock);
         let rate_limit = RateLimit::new(5, 10);
         let interval = rate_limit.interval_ns;
-        let actor_id = Ustr::from(&UUID4::new().to_string());
+        let actor_id = Ustr::from(UUID4::new().as_str());
 
         TestThrottler {
             throttler: Throttler::new(
                 rate_limit.limit,
                 rate_limit.interval_ns,
                 clock,
-                "dropper_timer".to_string(),
+                "dropper_timer",
                 output_send,
                 Some(output_drop),
                 actor_id,
@@ -749,7 +757,7 @@ mod tests {
         prop::collection::vec(throttler_input_strategy(), 10..=150)
     }
 
-    fn test_throttler_with_inputs(inputs: Vec<ThrottlerInput>, test_throttler: TestThrottler) {
+    fn test_throttler_with_inputs(inputs: Vec<ThrottlerInput>, test_throttler: &TestThrottler) {
         let test_clock = test_throttler.clock.clone();
         let interval = test_throttler.interval;
         let throttler = test_throttler.get_throttler();
@@ -775,7 +783,7 @@ mod tests {
             }
 
             // Check the throttler rate limits on the appropriate conditions
-            // * Atleast one message is buffered
+            // * At least one message is buffered
             // * Timestamp queue is filled upto limit
             // * Least recent timestamp in queue exceeds interval
             let buffered_messages = throttler.qsize() > 0;
@@ -791,51 +799,52 @@ mod tests {
             assert_eq!(sent_count, throttler.sent_count + throttler.qsize());
         }
 
-        // Advance clock by a large amount to process all messages
-        let time_events = test_clock
-            .borrow_mut()
-            .advance_time((interval * 100).into(), true);
-        let mut clock_ref = test_clock.borrow_mut();
-        for each_event in clock_ref.match_handlers(time_events) {
-            drop(clock_ref);
-            each_event.callback.call(each_event.event);
-            clock_ref = test_clock.borrow_mut();
+        // Drain all buffered messages by repeatedly advancing the clock.
+        // Each timer callback may send up to `limit` messages and schedule
+        // a new timer for the next batch, so we must keep advancing.
+        for i in 1..=100u64 {
+            if throttler.qsize() == 0 {
+                break;
+            }
+            let advance_to = interval * 100 * i;
+            let time_events = test_clock
+                .borrow_mut()
+                .advance_time(advance_to.into(), true);
+            let mut clock_ref = test_clock.borrow_mut();
+            for each_event in clock_ref.match_handlers(time_events) {
+                drop(clock_ref);
+                each_event.callback.call(each_event.event);
+                clock_ref = test_clock.borrow_mut();
+            }
         }
         assert_eq!(throttler.qsize(), 0);
     }
 
-    #[ignore = "Used for manually testing failing cases"]
     #[rstest]
-    fn test_case() {
-        let inputs = [
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::AdvanceClock(5),
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::AdvanceClock(5),
-            ThrottlerInput::SendMessage(42),
-            ThrottlerInput::SendMessage(42),
-        ]
-        .to_vec();
-
-        let test_throttler = test_throttler_buffered();
-        test_throttler_with_inputs(inputs, test_throttler);
+    fn prop_test() {
+        // Create a fresh throttler for each iteration to ensure clean state,
+        // even when tests panic (which would skip the reset code)
+        proptest!(|(inputs in throttler_test_strategy())| {
+            let test_throttler = test_throttler_buffered();
+            test_throttler_with_inputs(inputs, &test_throttler);
+        });
     }
 
     #[rstest]
-    #[allow(unsafe_code)]
-    fn prop_test() {
-        let test_throttler = test_throttler_buffered();
+    fn test_throttler_process_id_returns_ustr() {
+        // This test verifies that ThrottlerProcess::id() correctly returns Ustr
+        // by dereferencing MStr<Endpoint> (tests *self.endpoint -> Ustr conversion)
+        let actor_id = Ustr::from("test_throttler");
+        let process = ThrottlerProcess::<String, fn(String)>::new(actor_id);
 
-        proptest!(move |(inputs in throttler_test_strategy())| {
-            test_throttler_with_inputs(inputs, test_throttler.clone());
-            // Reset throttler state between runs
-            let throttler = unsafe { &mut *test_throttler.throttler.get() };
-            throttler.reset();
-            throttler.clock.borrow_mut().reset();
-        });
+        // Call id() which does *self.endpoint
+        let handler_id: Ustr = process.id();
+
+        // Verify it's a valid Ustr with expected format
+        assert!(handler_id.as_str().contains("test_throttler_process"));
+        assert!(!handler_id.is_empty());
+
+        // Verify type - this wouldn't compile if id() didn't return Ustr
+        let _type_check: Ustr = handler_id;
     }
 }

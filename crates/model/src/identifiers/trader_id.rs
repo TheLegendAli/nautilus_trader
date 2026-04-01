@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,9 +15,9 @@
 
 //! Represents a valid trader ID.
 
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display};
 
-use nautilus_core::correctness::{FAILED, check_string_contains, check_valid_string};
+use nautilus_core::correctness::{FAILED, check_string_contains, check_valid_string_ascii};
 use ustr::Ustr;
 
 /// Represents a valid trader ID.
@@ -25,7 +25,11 @@ use ustr::Ustr;
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct TraderId(Ustr);
 
@@ -43,15 +47,30 @@ impl TraderId {
     ///
     /// # Errors
     ///
-    /// Returns an error if `value` is not a valid string, or does not contain a hyphen '-' separator.
+    /// Returns an error if:
+    /// - `value` is not a valid ASCII string.
+    /// - `value` does not contain a hyphen '-' separator.
+    /// - Either the name or tag part (before/after the hyphen) is empty.
     ///
     /// # Notes
     ///
     /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     pub fn new_checked<T: AsRef<str>>(value: T) -> anyhow::Result<Self> {
         let value = value.as_ref();
-        check_valid_string(value, stringify!(value))?;
+        check_valid_string_ascii(value, stringify!(value))?;
         check_string_contains(value, "-", stringify!(value))?;
+
+        if let Some((name, tag)) = value.rsplit_once('-') {
+            anyhow::ensure!(
+                !name.is_empty(),
+                "`value` name part (before '-') cannot be empty"
+            );
+            anyhow::ensure!(
+                !tag.is_empty(),
+                "`value` tag part (after '-') cannot be empty"
+            );
+        }
+
         Ok(Self(Ustr::from(value)))
     }
 
@@ -65,7 +84,7 @@ impl TraderId {
     }
 
     /// Sets the inner identifier value.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn set_inner(&mut self, value: &str) {
         self.0 = Ustr::from(value);
     }
@@ -89,26 +108,41 @@ impl TraderId {
     /// Panics if the internal ID string does not contain a '-' separator.
     #[must_use]
     pub fn get_tag(&self) -> &str {
-        // SAFETY: Unwrap safe as value previously validated
         self.0.split('-').next_back().unwrap()
+    }
+
+    /// Creates an external trader ID used for orders from external sources.
+    #[must_use]
+    pub fn external() -> Self {
+        Self::new("EXTERNAL-0")
+    }
+
+    /// Returns whether this trader ID is external.
+    #[must_use]
+    pub fn is_external(&self) -> bool {
+        self.0.as_str() == "EXTERNAL-0"
+    }
+}
+
+impl Default for TraderId {
+    /// Returns the default trader ID "TRADER-001".
+    fn default() -> Self {
+        Self::from("TRADER-001")
     }
 }
 
 impl Debug for TraderId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\"{}\"", self.0)
     }
 }
 
 impl Display for TraderId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -124,5 +158,27 @@ mod tests {
     #[rstest]
     fn test_get_tag(trader_id: TraderId) {
         assert_eq!(trader_id.get_tag(), "001");
+    }
+
+    #[rstest]
+    #[should_panic(expected = "name part (before '-') cannot be empty")]
+    fn test_new_with_empty_name_panics() {
+        let _ = TraderId::new("-001");
+    }
+
+    #[rstest]
+    #[should_panic(expected = "tag part (after '-') cannot be empty")]
+    fn test_new_with_empty_tag_panics() {
+        let _ = TraderId::new("TRADER-");
+    }
+
+    #[rstest]
+    fn test_new_checked_with_empty_name_returns_error() {
+        assert!(TraderId::new_checked("-001").is_err());
+    }
+
+    #[rstest]
+    fn test_new_checked_with_empty_tag_returns_error() {
+        assert!(TraderId::new_checked("TRADER-").is_err());
     }
 }

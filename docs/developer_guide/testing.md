@@ -1,30 +1,69 @@
 # Testing
 
-The test suite is divided into broad categories of tests including:
+Our automated tests serve as executable specifications for the trading platform.
+A healthy suite documents intended behaviour, gives contributors confidence to refactor, and catches regressions before they reach production.
+Tests also double as living examples that clarify complex flows and provide rapid CI feedback so issues surface early.
+
+The suite covers these categories:
 
 - Unit tests
 - Integration tests
 - Acceptance tests
 - Performance tests
+- Property-based tests
+- Fuzzing
 - Memory leak tests
 
-The performance tests exist to aid development of performance-critical components.
+## Property-based testing
 
-Tests can be run using [pytest](https://docs.pytest.org), which is our primary test runner. We recommend using parametrized tests and fixtures (e.g., `@pytest.mark.parametrize`) to avoid repetitive code and improve clarity.
+Property testing verifies that logic holds for *all* valid inputs, not just hand-picked examples.
+We use [`proptest`](https://altsysrq.github.io/proptest-book/intro.html) in Rust to enforce invariants.
+
+- **Use cases:** Core domain types (`Price`, `Quantity`, `UnixNanos`), accounting engines, matching engines, and state machines.
+- **Example invariants:**
+  - Round-trip serialization: `parse(to_string(value)) == value`
+  - Inverse operations: `(A + B) - B == A`
+  - Transitivity: `If A < B and B < C, then A < C`
+
+## Fuzzing
+
+Fuzzing introduces unstructured or malicious data to the system to verify it fails gracefully.
+
+- **Use cases:** Network boundaries, exchange data parsers (JSON, FIX, WebSocket feeds), and complex state machines.
+- **Goal:** The system returns a `Result::Err` and never panics, hangs, or leaks memory when encountering malformed data.
+
+When building or modifying core types, write property tests to cover the mathematical boundaries.
+
+Performance tests help evolve performance-critical components.
+
+Run tests with [pytest](https://docs.pytest.org), our primary test runner.
+Use parametrized tests and fixtures (e.g., `@pytest.mark.parametrize`) to avoid repetitive code and improve clarity.
 
 ## Running tests
 
-### Python tests
+### v1 legacy Python tests
 
-From the repository root:
+The v1 legacy test suite lives under `tests/` at the repository root and tests
+the Cython-based package. From the repository root:
 
 ```bash
 make pytest
 # or
 uv run --active --no-sync pytest --new-first --failed-first
-# or simply
-pytest
 ```
+
+### Python tests
+
+The Python test suite lives under `python/tests/` and tests the Rust-backed PyO3
+package. It requires a built extension module (`make build-debug-v2`) and uses its
+own virtualenv under `python/.venv/`.
+
+```bash
+make pytest-v2
+```
+
+The Makefile target isolates certain test modules in separate pytest processes to avoid
+global Rust state conflicts. Use `make pytest-v2` rather than invoking pytest directly.
 
 For performance tests:
 
@@ -34,6 +73,8 @@ make test-performance
 uv run --active --no-sync pytest tests/performance_tests --benchmark-disable-gc --codspeed
 ```
 
+The `--benchmark-disable-gc` flag prevents garbage collection from skewing results. Run performance tests in isolation (not with unit tests) to avoid interference.
+
 ### Rust tests
 
 ```bash
@@ -42,64 +83,252 @@ make cargo-test
 cargo nextest run --workspace --features "python,ffi,high-precision,defi" --cargo-profile nextest
 ```
 
+#### Testing with optional features
+
+Use `EXTRA_FEATURES` to include optional features like `capnp` or `hypersync`:
+
+```bash
+# Test with capnp feature
+make cargo-test EXTRA_FEATURES="capnp"
+
+# Test with multiple features
+make cargo-test EXTRA_FEATURES="capnp hypersync"
+
+# Legacy shorthand for hypersync
+make cargo-test HYPERSYNC=true
+
+# Test specific crate with features
+make cargo-test-crate-nautilus-serialization FEATURES="capnp"
+```
+
 ### IDE integration
 
-- **PyCharm**: Right-click on tests folder or file → "Run pytest"
-- **VS Code**: Use the Python Test Explorer extension
+- **PyCharm**: Right-click the tests folder or file → "Run pytest".
+- **VS Code**: Use the Python Test Explorer extension.
+
+## Test style
+
+### General
+
+- Name test functions after what they exercise; you do not need to encode the expected
+  assertions in the name.
+- Add docstrings when they clarify setup, scenarios, or expectations.
+- **Group assertions** when possible: perform all setup/act steps first, then assert
+  together to avoid the act-assert-act smell.
+- Use `unwrap`, `expect`, or direct `panic!`/`assert` calls inside tests; clarity and
+  conciseness matter more than defensive error handling here.
+- Do not capture log output to assert on log messages. Log capture in tests is fragile
+  because loggers are global state, test execution order is non-deterministic, and the
+  assertions break when log wording changes. Instead, verify the observable behavior
+  (return values, state changes, side effects) that the log message reflects.
+
+### Python tests (`python/tests/`)
+
+Use **pytest-style free functions and fixtures**. Do not use test classes.
+
+- Write each test as a standalone `def test_*()` function.
+- Use `@pytest.fixture` for shared setup (instruments, engine instances, data).
+  Prefer `yield` fixtures when teardown is needed (e.g., `engine.dispose()`).
+- Use `@pytest.mark.parametrize` to cover multiple inputs without duplicating
+  test bodies.
+- Import model types from `nautilus_trader.model`, not from
+  `nautilus_trader.core.nautilus_pyo3`.
+- Test providers live in `python/tests/providers.py`. Use `TestInstrumentProvider`
+  and `TestDataProvider` for common instruments and data.
+- Mark tests that depend on unfinished features with
+  `@pytest.mark.skip(reason="WIP: <description>")` rather than deleting them.
+
+### v1 legacy Python tests (`tests/`)
+
+The v1 legacy test suite uses a mix of test classes and free functions. New tests
+added to this suite may follow either pattern, but free functions with fixtures
+are preferred for new files.
+
+### Rust
+
+For Rust-specific test conventions (module structure, `#[rstest]`, parameterization),
+see the [Rust guide](rust.md#testing-conventions).
+
+## Waiting for asynchronous effects
+
+When waiting for background work to complete, prefer the polling helpers `await eventually(...)` from `nautilus_trader.test_kit.functions` and `wait_until_async(...)` from `nautilus_common::testing` instead of arbitrary sleeps. They surface failures faster and reduce flakiness in CI because they stop as soon as the condition is satisfied or time out with a useful error.
 
 ## Mocks
 
-Unit tests will often include other components acting as mocks. The intent of this is to simplify
-the test suite to avoid extensive use of a mocking framework, although `MagicMock` objects are
-currently used in particular cases.
+Prefer hand-written stubs that return fixed values over mocking frameworks. Use `MagicMock` only when you need to assert call counts/arguments or simulate complex state changes. Avoid mocking the objects you're actually testing.
 
 ## Code coverage
 
-Code coverage output is generated using `coverage` and reported using [codecov](https://about.codecov.io/).
+We generate coverage reports with `coverage` and publish them to [codecov](https://about.codecov.io/).
 
-High test coverage is a goal for the project however not at the expense of appropriate error
-handling, or causing “test induced damage” to the architecture.
+Aim for high coverage without sacrificing appropriate error handling or causing "test induced damage" to the architecture.
 
-There are currently areas of the codebase which are impossible to test unless there is a change to
-the production code. For example the last condition check of an if-else block which would catch an
-unrecognized value, these should be left in place in case there is a change to the production code - which these checks could then catch.
+Some branches remain untestable without modifying production behaviour.
+For example, a final condition in a defensive if-else block may only trigger for unexpected values; leave these checks in place so future changes can exercise them if needed.
 
-Other design-time exceptions may also be impossible to test for, and so 100% test coverage is not
-the ultimate goal.
-
-### Style guidance
-
-- **Group assertions** where possible – perform all setup/act steps first, then assert expectations together at
-  the end of the test to avoid the *act-assert-act* smell.
-- Using `unwrap`, `expect`, or direct `panic!`/`assert` calls inside **tests** is acceptable. The
-  clarity and conciseness of the test suite outweigh defensive error-handling that is required in
-  production code.
+Design-time exceptions can also be impractical to test, so 100% coverage is not the target.
 
 ## Excluded code coverage
 
-The `pragma: no cover` comments found throughout the codebase [exclude code from test coverage](https://coverage.readthedocs.io/en/coverage-4.3.3/excluding.html).
-The reason for their use is to reduce redundant/needless tests just to keep coverage high, such as:
+We use `pragma: no cover` comments to [exclude code from coverage](https://coverage.readthedocs.io/en/coverage-4.3.3/excluding.html) when tests would be redundant.
+Typical examples include:
 
 - Asserting an abstract method raises `NotImplementedError` when called.
 - Asserting the final condition check of an if-else block when impossible to test (as above).
 
-These tests are expensive to maintain (as they must be kept in line with any refactorings), and
-offer little to no benefit in return. The intention is for all abstract method
-implementations to be fully covered by tests. Therefore `pragma: no cover` should be judiciously
-removed when no longer appropriate, and its use *restricted* to the above cases.
+Such tests are expensive to maintain because they must track refactors while providing little value.
+Keep concrete implementations of abstract methods fully covered.
+Remove `pragma: no cover` when it no longer applies and restrict its use to the cases above.
 
 ## Debugging Rust tests
 
-Rust tests can be debugged using the default test configuration.
+Use the default test configuration to debug Rust tests.
 
-If you want to run all tests while compiling with debug symbols for later debugging some tests individually,
-run `make cargo-test-debug` instead of `make cargo-test`.
+To run the full suite with debug symbols for later, run `make cargo-test-debug` instead of `make cargo-test`.
 
-In IntellijIdea, to debug parametrised tests starting with `#[rstest]` with arguments defined in the header of the test
-you need to modify the run configuration of the test so it looks like
-`test --package nautilus-model --lib data::bar::tests::test_get_time_bar_start::case_1`
-(remove `-- --exact` at the end of the string and append `::case_n` where `n` is an integer corresponding to
-the n-th parametrised test starting at 1).
-The reason for this is [here](https://github.com/rust-lang/rust-analyzer/issues/8964#issuecomment-871592851)
-(the test is expanded into a module with several functions named `case_n`).
-In VSCode, it is possible to directly select which test case to debug.
+In IntelliJ IDEA, adjust the run configuration for parametrised `#[rstest]` cases so it reads `test --package nautilus-model --lib data::bar::tests::test_get_time_bar_start::case_1`
+(remove `-- --exact` and append `::case_n` where `n` starts at 1). This workaround matches the behaviour explained [here](https://github.com/rust-lang/rust-analyzer/issues/8964#issuecomment-871592851).
+
+In VS Code you can pick the specific test case to debug directly.
+
+## Python + Rust Mixed Debugging
+
+This workflow lets you debug Python and Rust code simultaneously from a Jupyter notebook inside VS Code.
+
+### Setup
+
+Install these VS Code extensions: Rust Analyzer, CodeLLDB, Python, Jupyter.
+
+### Step 0: Compile `nautilus_trader` with debug symbols
+
+   ```bash
+   cd nautilus_trader && make build-debug-pyo3
+   ```
+
+### Step 1: Set up debugging configuration
+
+```python
+from nautilus_trader.test_kit.debug_helpers import setup_debugging
+
+setup_debugging()
+```
+
+This command creates the required VS Code debugging configurations and starts a `debugpy` server for the Python debugger.
+
+By default `setup_debugging()` expects the `.vscode` folder one level above the `nautilus_trader` root directory.
+Adjust the target location if your workspace layout differs.
+
+### Step 2: Set breakpoints
+
+- **Python breakpoints:** Set in VS Code in the Python source files.
+- **Rust breakpoints:** Set in VS Code in the Rust source files.
+
+### Step 3: Start mixed debugging
+
+1. In VS Code select the **"Debug Jupyter + Rust (Mixed)"** configuration.
+2. Start debugging (F5) or press the green run arrow.
+3. Both Python and Rust debuggers attach to your Jupyter session.
+
+### Step 4: Execute code
+
+Run Jupyter notebook cells that call Rust functions. The debugger stops at breakpoints in both Python and Rust code.
+
+### Available configurations
+
+`setup_debugging()` creates these VS Code configurations:
+
+- **`Debug Jupyter + Rust (Mixed)`** - Mixed debugging for Jupyter notebooks.
+- **`Jupyter Mixed Debugging (Python)`** - Python-only debugging for notebooks.
+- **`Rust Debugger (for Jupyter debugging)`** - Rust-only debugging for notebooks.
+
+### Example
+
+Open and run the example notebook: `debug_mixed_jupyter.ipynb`.
+
+### Reference
+
+- [PyO3 debugging](https://pyo3.rs/v0.25.1/debugging.html?highlight=deb#debugging-from-jupyter-notebooks)
+
+## Data type testing
+
+Each data type flows through multiple layers of the platform. The table below shows where
+existing types are tested, so new types can follow the same pattern.
+
+### Test layer matrix
+
+| Layer                  | Location                                    | What it covers                                             |
+|------------------------|---------------------------------------------|------------------------------------------------------------|
+| DataEngine subscribe   | `crates/data/tests/engine.rs`               | Engine processes subscribe/unsubscribe commands correctly. |
+| DataEngine publish     | `crates/data/tests/engine.rs`               | Engine routes published data to the message bus.           |
+| DataActor subscribe    | `crates/common/src/actor/tests.rs`          | Actor subscribes and receives data via typed publish.      |
+| DataActor unsubscribe  | `crates/common/src/actor/tests.rs`          | Actor stops receiving data after unsubscribe.              |
+| PyO3 actor dispatch    | `crates/common/src/python/actor.rs`         | Rust handler dispatches to Python `on_*` method.           |
+| Python Actor subscribe | `tests/unit_tests/common/test_actor.py`     | Python actor subscribes; command count increments.         |
+| Python Actor unsub     | `tests/unit_tests/common/test_actor.py`     | Python actor unsubscribes; subscription list clears.       |
+| Backtest client        | `nautilus_trader/backtest/data_client.pyx`  | Backtest client overrides base subscribe/unsubscribe.      |
+| Adapter live tests     | `docs/developer_guide/spec_data_testing.md` | Live data acceptance tests (DataTester).                   |
+
+### Coverage per data type
+
+The following table shows which layers have test coverage for each data type.
+Use this as a checklist when adding a new type.
+
+| Data type           | Engine | Actor (Rust) | PyO3 dispatch | Actor (Python) | Backtest client | Adapter spec |
+|---------------------|--------|--------------|---------------|----------------|-----------------|--------------|
+| `InstrumentAny`     | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `OrderBookDeltas`   | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `OrderBook`         | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `QuoteTick`         | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `TradeTick`         | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `Bar`               | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `MarkPriceUpdate`   | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `IndexPriceUpdate`  | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `FundingRateUpdate` | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `InstrumentStatus`  | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `InstrumentClose`   | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `OptionGreeks`      | ✓      | ✓            | ✓             | ✓              | ✓               | ✓            |
+| `OptionChainSlice`  | -      | ✓            | ✓             | ✓              | -               | ✓            |
+| `CustomData`        | ✓      | ✓            | ✓             | ✓              | ✓               | -            |
+
+`OptionChainSlice` is assembled by the DataEngine's `OptionChainManager` from per-instrument
+greeks and quote subscriptions. It does not have its own engine subscribe command or
+backtest client override.
+
+### Adding a new data type
+
+When introducing a new data type, add tests at each layer:
+
+1. **DataEngine** (`crates/data/tests/engine.rs`): Add `test_execute_subscribe_<type>` and
+   `test_execute_unsubscribe_<type>` tests. Follow the pattern in existing subscribe tests:
+   register client, build command, call `engine.execute`, assert subscription list.
+
+2. **DataActor Rust** (`crates/common/src/actor/tests.rs`):
+   - Add `received_<type>: Vec<Type>` field to `TestDataActor`.
+   - Implement the `on_<type>` handler in the `DataActor` trait impl.
+   - Add `test_subscribe_and_receive_<type>` and `test_unsubscribe_<type>` tests.
+   - Use the typed publish function (`msgbus::publish_<type>`), not `publish_any`,
+     for types that use `TypedHandler` routing.
+
+3. **PyO3 actor dispatch** (`crates/common/src/python/actor.rs`):
+   - Add `dispatch_on_<type>` method that calls `py_self.call_method1("on_<type>", ...)`.
+   - Add `on_<type>` in the `DataActor` trait impl that calls the dispatch method.
+   - Add `#[pyo3(name = "on_<type>")]` method in the `#[pymethods]` block.
+   - Add `on_<type>` to `RustTestDataActor` wrapper and the inline Python test class.
+   - Add handler test and dispatch test.
+
+4. **Python Actor** (`tests/unit_tests/common/test_actor.py`):
+   - Add `test_subscribe_<type>` and `test_unsubscribe_<type>` tests.
+   - Assert `actor.subscribed_<type>()` returns expected entries after subscribe and
+     is empty after unsubscribe.
+
+5. **Backtest client** (`nautilus_trader/backtest/data_client.pyx`): Override
+   `subscribe_<type>` and `unsubscribe_<type>` if the base `MarketDataClient` raises
+   `NotImplementedError` for the method.
+
+6. **Documentation**: Add entries to `actors.md` callback table, `strategies.md` handler
+   signatures, `adapters.md` subscribe method stubs, and `spec_data_testing.md` test cards.
+
+:::tip
+Search for an existing type like `instrument_close` or `funding_rate` across all six layers
+to find concrete examples of the patterns described above.
+:::

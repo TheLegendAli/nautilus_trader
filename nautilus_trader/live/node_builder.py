@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -155,7 +155,7 @@ class TradingNodeBuilder:
         """
         PyCondition.not_none(config, "config")
 
-        if not config:
+        if not config and not self._data_engine.get_external_client_ids():
             self._log.warning("No `data_clients` configuration found")
 
         for parts, cfg in config.items():
@@ -198,7 +198,7 @@ class TradingNodeBuilder:
 
                 self._data_engine.register_venue_routing(client, venue)
 
-    def build_exec_clients(  # noqa: C901 (too complex)
+    def build_exec_clients(
         self,
         config: dict[str, LiveExecClientConfig],
     ) -> None:
@@ -213,7 +213,7 @@ class TradingNodeBuilder:
         """
         PyCondition.not_none(config, "config")
 
-        if not config:
+        if not config and not self._exec_engine.get_external_client_ids():
             self._log.warning("No `exec_clients` configuration found")
 
         for parts, cfg in config.items():
@@ -261,8 +261,3 @@ class TradingNodeBuilder:
                     venue = Venue(venue)
 
                 self._exec_engine.register_venue_routing(client, venue)
-
-            # Temporary handling for setting specific 'venue' for portfolio
-            if factory.__name__ == "InteractiveBrokersLiveExecClientFactory":
-                # We initialize a new IB venue to avoid importing from the adapter subpackage
-                self._cache.set_specific_venue(Venue("INTERACTIVE_BROKERS"))

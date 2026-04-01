@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,9 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Live system node for [NautilusTrader](http://nautilustrader.io).
+//! Live system node for [NautilusTrader](https://nautilustrader.io).
 //!
-//! The *live* crate provides high-level abstractions and infrastructure for running live trading
+//! The `nautilus-live` crate provides high-level abstractions and infrastructure for running live trading
 //! systems, including data streaming, execution management, and system lifecycle handling.
 //! It builds on top of the system kernel to provide simplified interfaces for live deployment:
 //!
@@ -25,7 +25,7 @@
 //!
 //! # Platform
 //!
-//! [NautilusTrader](http://nautilustrader.io) is an open-source, high-performance, production-grade
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, high-performance, production-grade
 //! algorithmic trading platform, providing quantitative traders with the ability to backtest
 //! portfolios of automated trading strategies on historical data with an event-driven engine,
 //! and also deploy those same strategies live, with no code changes.
@@ -33,7 +33,7 @@
 //! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
 //! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
 //!
-//! # Feature flags
+//! # Feature Flags
 //!
 //! This crate provides feature flags to control source code inclusion during compilation,
 //! depending on the intended use case, i.e. whether to provide Python bindings
@@ -41,21 +41,31 @@
 //! or as part of a Rust only build.
 //!
 //! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `streaming`: Enables `persistence` dependency for streaming configuration.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `streaming`).
 //! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
 #![deny(missing_debug_implementations)]
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod builder;
 pub mod config;
-pub mod data;
+pub mod emitter;
+pub mod manager;
 pub mod node;
 pub mod runner;
+
+// Re-exports for adapters
+pub use emitter::ExecutionEventEmitter;
+pub use nautilus_common::factories::OrderEventFactory;
+pub use nautilus_execution::client::core::ExecutionClientCore;
 
 #[cfg(feature = "python")]
 pub mod python;

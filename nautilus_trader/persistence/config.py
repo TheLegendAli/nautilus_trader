@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -21,6 +21,7 @@ import fsspec
 import pandas as pd
 
 from nautilus_trader.common.config import NautilusConfig
+from nautilus_trader.persistence.catalog.base import BaseDataCatalog
 from nautilus_trader.persistence.writer import RotationMode
 
 
@@ -36,6 +37,8 @@ class StreamingConfig(NautilusConfig, frozen=True):
         The `fsspec` filesystem protocol for the catalog.
     fs_storage_options : dict, optional
         The `fsspec` storage options.
+    fs_rust_storage_options : dict, optional
+        The `fsspec` storage options for the Rust backend.
     flush_interval_ms : int, optional
         The flush interval (milliseconds) for writing chunks.
     replace_existing: bool, default False
@@ -59,6 +62,7 @@ class StreamingConfig(NautilusConfig, frozen=True):
     catalog_path: str
     fs_protocol: str | None = None
     fs_storage_options: dict | None = None
+    fs_rust_storage_options: dict | None = None
     flush_interval_ms: int | None = None
     replace_existing: bool = False
     include_types: list[type] | None = None
@@ -72,13 +76,14 @@ class StreamingConfig(NautilusConfig, frozen=True):
     def fs(self):
         return fsspec.filesystem(protocol=self.fs_protocol, **(self.fs_storage_options or {}))
 
-    def as_catalog(self):
+    def as_catalog(self) -> BaseDataCatalog:
         from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 
-        return ParquetDataCatalog(
-            path=self.catalog_path,
-            fs_protocol=self.fs_protocol,
+        uri = f"{self.fs_protocol}://{self.catalog_path}" if self.fs_protocol else self.catalog_path
+        return ParquetDataCatalog.from_uri(
+            uri,
             fs_storage_options=self.fs_storage_options,
+            fs_rust_storage_options=self.fs_rust_storage_options,
         )
 
 
@@ -94,10 +99,23 @@ class DataCatalogConfig(NautilusConfig, frozen=True):
         The fsspec file system protocol for the data catalog.
     fs_storage_options : dict, optional
         The fsspec storage options for the data catalog.
+    fs_rust_storage_options : dict, optional
+        The fsspec storage options for the Rust backend.
 
     """
 
     path: str
     fs_protocol: str | None = None
     fs_storage_options: dict | None = None
+    fs_rust_storage_options: dict | None = None
     name: str | None = None
+
+    def as_catalog(self) -> BaseDataCatalog:
+        from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
+
+        uri = f"{self.fs_protocol}://{self.path}" if self.fs_protocol else self.path
+        return ParquetDataCatalog.from_uri(
+            uri,
+            fs_storage_options=self.fs_storage_options,
+            fs_rust_storage_options=self.fs_rust_storage_options,
+        )

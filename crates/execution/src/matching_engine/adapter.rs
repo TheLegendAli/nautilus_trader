@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -25,13 +25,8 @@ use nautilus_model::{
 };
 
 use crate::{
-    matching_core::handlers::{
-        FillLimitOrderHandlerAny, FillMarketOrderHandlerAny, ShareableFillLimitOrderHandler,
-        ShareableFillMarketOrderHandler, ShareableTriggerStopOrderHandler,
-        TriggerStopOrderHandlerAny,
-    },
     matching_engine::{config::OrderMatchingEngineConfig, engine::OrderMatchingEngine},
-    models::{fee::FeeModelAny, fill::FillModel},
+    models::{fee::FeeModelAny, fill::FillModelAny},
 };
 
 #[derive(Debug)]
@@ -44,7 +39,7 @@ impl OrderEngineAdapter {
     pub fn new(
         instrument: InstrumentAny,
         raw_id: u32,
-        fill_model: FillModel,
+        fill_model: FillModelAny,
         fee_model: FeeModelAny,
         book_type: BookType,
         oms_type: OmsType,
@@ -66,41 +61,7 @@ impl OrderEngineAdapter {
             config,
         )));
 
-        Self::initialize_fill_order_handler(engine.clone());
-        Self::initialize_fill_market_order_handler(engine.clone());
-        Self::initialize_trigger_stop_order_handler(engine.clone());
-
         Self { engine }
-    }
-
-    fn initialize_fill_order_handler(engine: Rc<RefCell<OrderMatchingEngine>>) {
-        let handler = ShareableFillLimitOrderHandler(
-            FillLimitOrderHandlerAny::OrderMatchingEngine(engine.clone()),
-        );
-        engine
-            .borrow_mut()
-            .core
-            .set_fill_limit_order_handler(handler);
-    }
-
-    fn initialize_fill_market_order_handler(engine: Rc<RefCell<OrderMatchingEngine>>) {
-        let handler = ShareableFillMarketOrderHandler(
-            FillMarketOrderHandlerAny::OrderMatchingEngine(engine.clone()),
-        );
-        engine
-            .borrow_mut()
-            .core
-            .set_fill_market_order_handler(handler);
-    }
-
-    fn initialize_trigger_stop_order_handler(engine: Rc<RefCell<OrderMatchingEngine>>) {
-        let handler = ShareableTriggerStopOrderHandler(
-            TriggerStopOrderHandlerAny::OrderMatchingEngine(engine.clone()),
-        );
-        engine
-            .borrow_mut()
-            .core
-            .set_trigger_stop_order_handler(handler);
     }
 
     #[must_use]

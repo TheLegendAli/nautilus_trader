@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -22,10 +22,10 @@ It could also be possible to write clients for specialized data providers.
 
 import asyncio
 import functools
-import traceback
 from asyncio import Task
 from collections.abc import Callable
 from collections.abc import Coroutine
+from weakref import WeakSet
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
@@ -39,32 +39,42 @@ from nautilus_trader.data.client import DataClient
 from nautilus_trader.data.client import MarketDataClient
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.data.messages import RequestData
+from nautilus_trader.data.messages import RequestForwardPrices
+from nautilus_trader.data.messages import RequestFundingRates
 from nautilus_trader.data.messages import RequestInstrument
 from nautilus_trader.data.messages import RequestInstruments
+from nautilus_trader.data.messages import RequestOrderBookDeltas
+from nautilus_trader.data.messages import RequestOrderBookDepth
 from nautilus_trader.data.messages import RequestOrderBookSnapshot
 from nautilus_trader.data.messages import RequestQuoteTicks
 from nautilus_trader.data.messages import RequestTradeTicks
 from nautilus_trader.data.messages import SubscribeBars
 from nautilus_trader.data.messages import SubscribeData
+from nautilus_trader.data.messages import SubscribeFundingRates
 from nautilus_trader.data.messages import SubscribeIndexPrices
 from nautilus_trader.data.messages import SubscribeInstrument
 from nautilus_trader.data.messages import SubscribeInstrumentClose
 from nautilus_trader.data.messages import SubscribeInstruments
 from nautilus_trader.data.messages import SubscribeInstrumentStatus
 from nautilus_trader.data.messages import SubscribeMarkPrices
+from nautilus_trader.data.messages import SubscribeOptionGreeks
 from nautilus_trader.data.messages import SubscribeOrderBook
 from nautilus_trader.data.messages import SubscribeQuoteTicks
 from nautilus_trader.data.messages import SubscribeTradeTicks
 from nautilus_trader.data.messages import UnsubscribeBars
 from nautilus_trader.data.messages import UnsubscribeData
+from nautilus_trader.data.messages import UnsubscribeFundingRates
+from nautilus_trader.data.messages import UnsubscribeIndexPrices
 from nautilus_trader.data.messages import UnsubscribeInstrument
 from nautilus_trader.data.messages import UnsubscribeInstrumentClose
 from nautilus_trader.data.messages import UnsubscribeInstruments
 from nautilus_trader.data.messages import UnsubscribeInstrumentStatus
 from nautilus_trader.data.messages import UnsubscribeMarkPrices
+from nautilus_trader.data.messages import UnsubscribeOptionGreeks
 from nautilus_trader.data.messages import UnsubscribeOrderBook
 from nautilus_trader.data.messages import UnsubscribeQuoteTicks
 from nautilus_trader.data.messages import UnsubscribeTradeTicks
+from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import Venue
 
@@ -116,6 +126,7 @@ class LiveDataClient(DataClient):
         )
 
         self._loop = loop
+        self._tasks: WeakSet[asyncio.Task] = WeakSet()
 
     async def run_after_delay(
         self,
@@ -166,11 +177,11 @@ class LiveDataClient(DataClient):
         asyncio.Task
 
         """
-        log_msg = log_msg or coro.__name__
-        self._log.debug(f"Creating task '{log_msg}'")
+        task_name = log_msg or getattr(coro, "__name__", None) or coro.__class__.__name__
+        self._log.debug(f"Creating task '{task_name}'")
         task = self._loop.create_task(
             coro,
-            name=coro.__name__,
+            name=task_name,
         )
         task.add_done_callback(
             functools.partial(
@@ -180,6 +191,7 @@ class LiveDataClient(DataClient):
                 success_color,
             ),
         )
+        self._tasks.add(task)
         return task
 
     def _on_task_completed(
@@ -189,12 +201,14 @@ class LiveDataClient(DataClient):
         success_color: LogColor,
         task: Task,
     ) -> None:
-        e: BaseException | None = task.exception()
+        try:
+            e: BaseException | None = task.exception()
+        except asyncio.CancelledError:
+            self._log.warning(f"Task '{task.get_name()}' was canceled")
+            return
+
         if e:
-            tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            self._log.error(
-                f"Error on '{task.get_name()}': {task.exception()!r}\n{tb_str}",
-            )
+            self._log.exception(f"Error on '{task.get_name()}'", e)
         else:
             if actions:
                 try:
@@ -224,12 +238,14 @@ class LiveDataClient(DataClient):
         Disconnect the client.
         """
         self._log.info("Disconnecting...")
-        self.create_task(
-            self._disconnect(),
-            actions=lambda: self._set_connected(False),
-            success_msg="Disconnected",
-            success_color=LogColor.GREEN,
-        )
+
+        async def _disconnect_with_cleanup():
+            await self._disconnect()
+            await self.cancel_pending_tasks()
+            self._set_connected(False)
+            self._log.info("Disconnected", LogColor.GREEN)
+
+        self._loop.create_task(_disconnect_with_cleanup())
 
     # -- SUBSCRIPTIONS ----------------------------------------------------------------------------
 
@@ -288,6 +304,18 @@ class LiveDataClient(DataClient):
             "implement the `_request` coroutine",  # pragma: no cover
         )
 
+    async def cancel_pending_tasks(self, timeout_secs: float = 5.0) -> None:
+        """
+        Cancel all pending tasks and await their cancellation.
+
+        Parameters
+        ----------
+        timeout_secs : float, default 5.0
+            The timeout in seconds to wait for tasks to cancel.
+
+        """
+        await cancel_tasks_with_timeout(self._tasks, self._log, timeout_secs)
+
 
 class LiveMarketDataClient(MarketDataClient):
     """
@@ -340,14 +368,17 @@ class LiveMarketDataClient(MarketDataClient):
             clock=clock,
             config=config,
         )
+
         self._loop = loop
         self._instrument_provider = instrument_provider
         self._is_sync = is_sync
+        self._tasks: WeakSet[asyncio.Task] = WeakSet()
+        self._disconnect_task: asyncio.Task | None = None
 
         if self._is_sync:
             self._log.warning(
-                "Client initialized in synchronous mode. "
-                "Ensure nest_asyncio.apply() is called if running in an async environment like a jupyter notebook.",
+                "Client initialized in synchronous mode; "
+                "ensure nest_asyncio.apply() is called if running in an async environment like a jupyter notebook",
             )
 
     async def run_after_delay(
@@ -420,7 +451,7 @@ class LiveMarketDataClient(MarketDataClient):
             )
 
             if exception:
-                self._log.error(f"Synchronous execution of '{task_name}' failed.")
+                self._log.error(f"Synchronous execution of '{task_name}' failed")
                 return None
             else:
                 return result
@@ -428,7 +459,7 @@ class LiveMarketDataClient(MarketDataClient):
         self._log.debug(f"Creating async task '{task_name}'")
 
         if not self._loop or not self._loop.is_running():
-            self._log.error(f"Async task '{task_name}' created but event loop is not running.")
+            self._log.error(f"Async task '{task_name}' created but event loop is not running")
             return None
 
         task = self._loop.create_task(
@@ -444,6 +475,7 @@ class LiveMarketDataClient(MarketDataClient):
             ),
         )
 
+        self._tasks.add(task)
         return task
 
     def _on_task_completed(
@@ -459,7 +491,7 @@ class LiveMarketDataClient(MarketDataClient):
         try:
             task.result()
         except asyncio.CancelledError:
-            self._log.warning(f"Task '{coro_name}' was cancelled.")
+            self._log.warning(f"Task '{coro_name}' was cancelled")
             return
         except Exception as e:
             exception = e
@@ -481,14 +513,9 @@ class LiveMarketDataClient(MarketDataClient):
         exception: BaseException | None = None,
     ) -> None:
         if exception:
-            tb_str = "".join(
-                traceback.format_exception(type(exception), exception, exception.__traceback__),
-            )
-            self._log.error(
-                f"Error running '{coro_name}': {exception!r}\n{tb_str}",
-            )
+            self._log.exception(f"Error running '{coro_name}'", exception)
         else:
-            self._log.debug(f"Coroutine '{coro_name}' completed successfully.")
+            self._log.debug(f"Coroutine '{coro_name}' completed")
 
             if actions:
                 try:
@@ -519,12 +546,16 @@ class LiveMarketDataClient(MarketDataClient):
         Disconnect the client.
         """
         self._log.info("Disconnecting...")
-        self.create_task(
-            self._disconnect(),
-            actions=lambda: self._set_connected(False),
-            success_msg="Disconnected",
-            success_color=LogColor.GREEN,
-        )
+
+        async def _disconnect_with_cleanup():
+            await self._disconnect()
+            await self.cancel_pending_tasks()
+            self._set_connected(False)
+            self._log.info("Disconnected", LogColor.GREEN)
+
+        # Create disconnect task directly without using create_task helper
+        # so it won't be cancelled by cancel_pending_tasks()
+        self._loop.create_task(_disconnect_with_cleanup())
 
     # -- SUBSCRIPTIONS ----------------------------------------------------------------------------
 
@@ -561,16 +592,16 @@ class LiveMarketDataClient(MarketDataClient):
         self.create_task(
             self._subscribe_order_book_deltas(command),
             log_msg=f"subscribe: order_book_deltas {command.instrument_id}",
-            success_msg=f"Subscribed {command.instrument_id} order book deltas depth={command.depth}",
+            success_msg=f"Subscribed {command.instrument_id} order book deltas; depth={command.depth}",
             success_color=LogColor.BLUE,
         )
 
-    def subscribe_order_book_snapshots(self, command: SubscribeOrderBook) -> None:
-        self._add_subscription_order_book_snapshots(command.instrument_id)
+    def subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
+        self._add_subscription_order_book_depth(command.instrument_id)
         self.create_task(
-            self._subscribe_order_book_snapshots(command),
-            log_msg=f"subscribe: order_book_snapshots {command.instrument_id}",
-            success_msg=f"Subscribed {command.instrument_id} order book snapshots depth={command.depth}",
+            self._subscribe_order_book_depth(command),
+            log_msg=f"subscribe: order_book_depth {command.instrument_id}",
+            success_msg=f"Subscribed {command.instrument_id} order book depth; depth={command.depth}",
             success_color=LogColor.BLUE,
         )
 
@@ -610,6 +641,15 @@ class LiveMarketDataClient(MarketDataClient):
             success_color=LogColor.BLUE,
         )
 
+    def subscribe_funding_rates(self, command: SubscribeFundingRates) -> None:
+        self._add_subscription_funding_rates(command.instrument_id)
+        self.create_task(
+            self._subscribe_funding_rates(command),
+            log_msg=f"subscribe: funding_rates {command.instrument_id}",
+            success_msg=f"Subscribed {command.instrument_id} funding rates",
+            success_color=LogColor.BLUE,
+        )
+
     def subscribe_bars(self, command: SubscribeBars) -> None:
         PyCondition.is_true(
             command.bar_type.is_externally_aggregated(),
@@ -639,6 +679,15 @@ class LiveMarketDataClient(MarketDataClient):
             self._subscribe_instrument_close(command),
             log_msg=f"subscribe: instrument_close {command.instrument_id}",
             success_msg=f"Subscribed {command.instrument_id} instrument close",
+            success_color=LogColor.BLUE,
+        )
+
+    def subscribe_option_greeks(self, command: SubscribeOptionGreeks) -> None:
+        self._add_subscription_option_greeks(command.instrument_id)
+        self.create_task(
+            self._subscribe_option_greeks(command),
+            log_msg=f"subscribe: option_greeks {command.instrument_id}",
+            success_msg=f"Subscribed {command.instrument_id} option greeks",
             success_color=LogColor.BLUE,
         )
 
@@ -679,12 +728,12 @@ class LiveMarketDataClient(MarketDataClient):
             success_color=LogColor.BLUE,
         )
 
-    def unsubscribe_order_book_snapshots(self, command: UnsubscribeOrderBook) -> None:
-        self._remove_subscription_order_book_snapshots(command.instrument_id)
+    def unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
+        self._remove_subscription_order_book_depth(command.instrument_id)
         self.create_task(
-            self._unsubscribe_order_book_snapshots(command),
-            log_msg=f"unsubscribe: order_book_snapshots {command.instrument_id}",
-            success_msg=f"Unsubscribed {command.instrument_id} order book snapshots",
+            self._unsubscribe_order_book_depth(command),
+            log_msg=f"unsubscribe: order_book_depth {command.instrument_id}",
+            success_msg=f"Unsubscribed {command.instrument_id} order book depth",
             success_color=LogColor.BLUE,
         )
 
@@ -707,20 +756,29 @@ class LiveMarketDataClient(MarketDataClient):
         )
 
     def unsubscribe_mark_prices(self, command: UnsubscribeMarkPrices) -> None:
-        self._remove_subscription_trade_ticks(command.instrument_id)
+        self._remove_subscription_mark_prices(command.instrument_id)
         self.create_task(
-            self._unsubscribe_trade_ticks(command),
+            self._unsubscribe_mark_prices(command),
             log_msg=f"unsubscribe: mark_prices {command.instrument_id}",
             success_msg=f"Unsubscribed {command.instrument_id} mark prices",
             success_color=LogColor.BLUE,
         )
 
-    def unsubscribe_index_prices(self, command: UnsubscribeMarkPrices) -> None:
-        self._remove_subscription_trade_ticks(command.instrument_id)
+    def unsubscribe_index_prices(self, command: UnsubscribeIndexPrices) -> None:
+        self._remove_subscription_index_prices(command.instrument_id)
         self.create_task(
-            self._unsubscribe_trade_ticks(command),
+            self._unsubscribe_index_prices(command),
             log_msg=f"unsubscribe: index_prices {command.instrument_id}",
             success_msg=f"Unsubscribed {command.instrument_id} index prices",
+            success_color=LogColor.BLUE,
+        )
+
+    def unsubscribe_funding_rates(self, command: UnsubscribeFundingRates) -> None:
+        self._remove_subscription_funding_rates(command.instrument_id)
+        self.create_task(
+            self._unsubscribe_funding_rates(command),
+            log_msg=f"unsubscribe: funding_rates {command.instrument_id}",
+            success_msg=f"Unsubscribed {command.instrument_id} funding rates",
             success_color=LogColor.BLUE,
         )
 
@@ -748,6 +806,15 @@ class LiveMarketDataClient(MarketDataClient):
             self._unsubscribe_instrument_close(command),
             log_msg=f"unsubscribe: instrument_close {command.instrument_id}",
             success_msg=f"Unsubscribed {command.instrument_id} instrument close",
+            success_color=LogColor.BLUE,
+        )
+
+    def unsubscribe_option_greeks(self, command: UnsubscribeOptionGreeks) -> None:
+        self._remove_subscription_option_greeks(command.instrument_id)
+        self.create_task(
+            self._unsubscribe_option_greeks(command),
+            log_msg=f"unsubscribe: option_greeks {command.instrument_id}",
+            success_msg=f"Unsubscribed {command.instrument_id} option greeks",
             success_color=LogColor.BLUE,
         )
 
@@ -779,6 +846,42 @@ class LiveMarketDataClient(MarketDataClient):
             log_msg=f"request: instruments for {request.venue}",
         )
 
+    def request_order_book_deltas(self, request: RequestOrderBookDeltas) -> None:
+        time_range_str = format_utc_timerange(request.start, request.end)
+        limit_str = f" limit={request.limit}" if request.limit != 0 else ""
+        self._log.info(
+            f"Request {request.instrument_id} order_book_deltas{time_range_str}{limit_str}",
+            LogColor.BLUE,
+        )
+        self.create_task(
+            self._request_order_book_deltas(request),
+            log_msg=f"request: order_book_deltas {request.instrument_id}",
+        )
+
+    def request_order_book_depth(self, request: RequestOrderBookDepth) -> None:
+        time_range_str = format_utc_timerange(request.start, request.end)
+        limit_str = f" limit={request.limit}" if request.limit != 0 else ""
+        depth_str = f" depth={request.depth}"
+        self._log.info(
+            f"Request {request.instrument_id} order_book_depth{time_range_str}{limit_str}{depth_str}",
+            LogColor.BLUE,
+        )
+        self.create_task(
+            self._request_order_book_depth(request),
+            log_msg=f"request: order_book_depth {request.instrument_id}",
+        )
+
+    def request_order_book_snapshot(self, request: RequestOrderBookSnapshot) -> None:
+        limit_str = f" limit={request.limit}" if request.limit != 0 else ""
+        self._log.info(
+            f"Request {request.instrument_id} order_book_snapshot{limit_str}",
+            LogColor.BLUE,
+        )
+        self.create_task(
+            self._request_order_book_snapshot(request),
+            log_msg=f"request: order_book_snapshot {request.instrument_id}",
+        )
+
     def request_quote_ticks(self, request: RequestQuoteTicks) -> None:
         time_range_str = format_utc_timerange(request.start, request.end)
         limit_str = f" limit={request.limit}" if request.limit != 0 else ""
@@ -803,6 +906,18 @@ class LiveMarketDataClient(MarketDataClient):
             log_msg=f"request: trades {request.instrument_id}",
         )
 
+    def request_funding_rates(self, request: RequestFundingRates) -> None:
+        time_range_str = format_utc_timerange(request.start, request.end)
+        limit_str = f" limit={request.limit}" if request.limit != 0 else ""
+        self._log.info(
+            f"Request {request.instrument_id} funding rates{time_range_str}{limit_str}",
+            LogColor.BLUE,
+        )
+        self.create_task(
+            self._request_funding_rates(request),
+            log_msg=f"request: funding rates {request.instrument_id}",
+        )
+
     def request_bars(self, request: RequestBars) -> None:
         time_range_str = format_utc_timerange(request.start, request.end)
         limit_str = f" limit={request.limit}" if request.limit != 0 else ""
@@ -812,15 +927,15 @@ class LiveMarketDataClient(MarketDataClient):
             log_msg=f"request: bars {request.bar_type}",
         )
 
-    def request_order_book_snapshot(self, request: RequestOrderBookSnapshot) -> None:
-        limit_str = f" limit={request.limit}" if request.limit != 0 else ""
+    def request_forward_prices(self, request: RequestForwardPrices) -> None:
         self._log.info(
-            f"Request {request.instrument_id} order_book_snapshot{limit_str}",
+            f"Request forward prices for {request.underlying}"
+            f" (sample={request.sample_instrument_id})",
             LogColor.BLUE,
         )
         self.create_task(
-            self._request_order_book_snapshot(request),
-            log_msg=f"request: order_book_snapshot {request.instrument_id}",
+            self._request_forward_prices(request),
+            log_msg=f"request: forward_prices {request.underlying}",
         )
 
     ############################################################################
@@ -856,9 +971,9 @@ class LiveMarketDataClient(MarketDataClient):
             "implement the `_subscribe_order_book_deltas` coroutine",  # pragma: no cover
         )
 
-    async def _subscribe_order_book_snapshots(self, command: SubscribeOrderBook) -> None:
+    async def _subscribe_order_book_depth(self, command: SubscribeOrderBook) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "implement the `_subscribe_order_book_snapshots` coroutine",  # pragma: no cover
+            "implement the `_subscribe_order_book_depth` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
@@ -881,6 +996,11 @@ class LiveMarketDataClient(MarketDataClient):
             "implement the `_subscribe_index_prices` coroutine",  # pragma: no cover
         )
 
+    async def _subscribe_funding_rates(self, command: SubscribeFundingRates) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_subscribe_funding_rates` coroutine",  # pragma: no cover
+        )
+
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_subscribe_bars` coroutine",  # pragma: no cover
@@ -894,6 +1014,11 @@ class LiveMarketDataClient(MarketDataClient):
     async def _subscribe_instrument_close(self, command: SubscribeInstrumentClose) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_subscribe_instrument_close` coroutine",  # pragma: no cover
+        )
+
+    async def _subscribe_option_greeks(self, command: SubscribeOptionGreeks) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_subscribe_option_greeks` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe(self, command: UnsubscribeData) -> None:
@@ -916,9 +1041,9 @@ class LiveMarketDataClient(MarketDataClient):
             "implement the `_unsubscribe_order_book_deltas` coroutine",  # pragma: no cover
         )
 
-    async def _unsubscribe_order_book_snapshots(self, command: UnsubscribeOrderBook) -> None:
+    async def _unsubscribe_order_book_depth(self, command: UnsubscribeOrderBook) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "implement the `_unsubscribe_order_book_snapshots` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_order_book_depth` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
@@ -931,14 +1056,19 @@ class LiveMarketDataClient(MarketDataClient):
             "implement the `_unsubscribe_trade_ticks` coroutine",  # pragma: no cover
         )
 
-    async def _unsubscribe_mark_prices(self, command: SubscribeMarkPrices) -> None:
+    async def _unsubscribe_mark_prices(self, command: UnsubscribeMarkPrices) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_unsubscribe_mark_prices` coroutine",  # pragma: no cover
         )
 
-    async def _unsubscribe_index_prices(self, command: SubscribeIndexPrices) -> None:
+    async def _unsubscribe_index_prices(self, command: UnsubscribeIndexPrices) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_unsubscribe_index_prices` coroutine",  # pragma: no cover
+        )
+
+    async def _unsubscribe_funding_rates(self, command: UnsubscribeFundingRates) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_unsubscribe_funding_rates` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
@@ -954,6 +1084,11 @@ class LiveMarketDataClient(MarketDataClient):
     async def _unsubscribe_instrument_close(self, command: UnsubscribeInstrumentClose) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_unsubscribe_instrument_close` coroutine",  # pragma: no cover
+        )
+
+    async def _unsubscribe_option_greeks(self, command: UnsubscribeOptionGreeks) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_unsubscribe_option_greeks` coroutine",  # pragma: no cover
         )
 
     async def _request(self, request: RequestData) -> None:
@@ -981,12 +1116,44 @@ class LiveMarketDataClient(MarketDataClient):
             "implement the `_request_trade_ticks` coroutine",  # pragma: no cover
         )
 
+    async def _request_funding_rates(self, request: RequestFundingRates) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_request_funding_rates` coroutine",  # pragma: no cover
+        )
+
     async def _request_bars(self, request: RequestBars) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_request_bars` coroutine",  # pragma: no cover
+        )
+
+    async def _request_forward_prices(self, request: RequestForwardPrices) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_request_forward_prices` coroutine",  # pragma: no cover
+        )
+
+    async def _request_order_book_deltas(self, request: RequestOrderBookDeltas) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_request_order_book_deltas` coroutine",  # pragma: no cover
+        )
+
+    async def _request_order_book_depth(self, request: RequestOrderBookDepth) -> None:
+        raise NotImplementedError(  # pragma: no cover
+            "implement the `_request_order_book_depth` coroutine",  # pragma: no cover
         )
 
     async def _request_order_book_snapshot(self, request: RequestOrderBookSnapshot) -> None:
         raise NotImplementedError(
             "implement the `_request_order_book_snapshot` coroutine",  # pragma: no cover
         )
+
+    async def cancel_pending_tasks(self, timeout_secs: float = 5.0) -> None:
+        """
+        Cancel all pending tasks and await their cancellation.
+
+        Parameters
+        ----------
+        timeout_secs : float, default 5.0
+            The timeout in seconds to wait for tasks to cancel.
+
+        """
+        await cancel_tasks_with_timeout(self._tasks, self._log, timeout_secs)

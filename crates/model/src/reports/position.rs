@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    enums::PositionSide,
+    enums::PositionSideSpecified,
     identifiers::{AccountId, InstrumentId, PositionId},
     types::Quantity,
 };
@@ -30,7 +30,11 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct PositionStatusReport {
     /// The account ID associated with the position.
@@ -38,7 +42,7 @@ pub struct PositionStatusReport {
     /// The instrument ID associated with the event.
     pub instrument_id: InstrumentId,
     /// The position side.
-    pub position_side: PositionSide,
+    pub position_side: PositionSideSpecified,
     /// The current open quantity.
     pub quantity: Quantity,
     /// The current signed quantity as a decimal (positive for position side `LONG`, negative for `SHORT`).
@@ -51,6 +55,8 @@ pub struct PositionStatusReport {
     pub ts_init: UnixNanos,
     /// The position ID (assigned by the venue).
     pub venue_position_id: Option<PositionId>,
+    /// The reported average open price for the position.
+    pub avg_px_open: Option<Decimal>,
 }
 
 impl PositionStatusReport {
@@ -60,19 +66,19 @@ impl PositionStatusReport {
     pub fn new(
         account_id: AccountId,
         instrument_id: InstrumentId,
-        position_side: PositionSide,
+        position_side: PositionSideSpecified,
         quantity: Quantity,
-        venue_position_id: Option<PositionId>,
         ts_last: UnixNanos,
         ts_init: UnixNanos,
         report_id: Option<UUID4>,
+        venue_position_id: Option<PositionId>,
+        avg_px_open: Option<Decimal>,
     ) -> Self {
         // Calculate signed decimal quantity based on position side
         let signed_decimal_qty = match position_side {
-            PositionSide::Long => quantity.as_decimal(),
-            PositionSide::Short => -quantity.as_decimal(),
-            PositionSide::Flat => Decimal::ZERO,
-            PositionSide::NoPositionSide => Decimal::ZERO, // TODO: Consider disallowing this?
+            PositionSideSpecified::Long => quantity.as_decimal(),
+            PositionSideSpecified::Short => -quantity.as_decimal(),
+            PositionSideSpecified::Flat => Decimal::ZERO,
         };
 
         Self {
@@ -85,6 +91,7 @@ impl PositionStatusReport {
             ts_last,
             ts_init,
             venue_position_id,
+            avg_px_open,
         }
     }
 
@@ -96,23 +103,20 @@ impl PositionStatusReport {
 
     /// Checks if this is a flat position (quantity is zero).
     #[must_use]
-    pub const fn is_flat(&self) -> bool {
-        matches!(
-            self.position_side,
-            PositionSide::Flat | PositionSide::NoPositionSide
-        )
+    pub fn is_flat(&self) -> bool {
+        self.position_side == PositionSideSpecified::Flat
     }
 
     /// Checks if this is a long position.
     #[must_use]
     pub fn is_long(&self) -> bool {
-        self.position_side == PositionSide::Long
+        self.position_side == PositionSideSpecified::Long
     }
 
     /// Checks if this is a short position.
     #[must_use]
     pub fn is_short(&self) -> bool {
-        self.position_side == PositionSide::Short
+        self.position_side == PositionSideSpecified::Short
     }
 }
 
@@ -120,30 +124,30 @@ impl Display for PositionStatusReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PositionStatusReport(account={}, instrument={}, side={}, qty={}, venue_pos_id={:?}, ts_last={}, ts_init={})",
+            "PositionStatusReport(account={}, instrument={}, side={}, qty={}, venue_pos_id={:?}, avg_px_open={:?}, ts_last={}, ts_init={})",
             self.account_id,
             self.instrument_id,
             self.position_side,
             self.signed_decimal_qty,
             self.venue_position_id,
+            self.avg_px_open,
             self.ts_last,
             self.ts_init
         )
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use nautilus_core::UnixNanos;
     use rstest::*;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
-        enums::PositionSide,
         identifiers::{AccountId, InstrumentId, PositionId},
         types::Quantity,
     };
@@ -152,12 +156,13 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Long,
+            PositionSideSpecified::Long,
             Quantity::from("100"),
-            Some(PositionId::from("P-001")),
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
-            None,
+            None,                            // report_id
+            Some(PositionId::from("P-001")), // venue_position_id
+            None,                            // avg_px_open
         )
     }
 
@@ -165,11 +170,12 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Short,
+            PositionSideSpecified::Short,
             Quantity::from("50"),
-            None,
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
+            None,
+            None,
             None,
         )
     }
@@ -178,11 +184,12 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Flat,
+            PositionSideSpecified::Flat,
             Quantity::from("0"),
-            None,
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
+            None,
+            None,
             None,
         )
     }
@@ -193,9 +200,9 @@ mod tests {
 
         assert_eq!(report.account_id, AccountId::from("SIM-001"));
         assert_eq!(report.instrument_id, InstrumentId::from("AUDUSD.SIM"));
-        assert_eq!(report.position_side, PositionSide::Long);
+        assert_eq!(report.position_side, PositionSideSpecified::Long);
         assert_eq!(report.quantity, Quantity::from("100"));
-        assert_eq!(report.signed_decimal_qty, Decimal::from(100));
+        assert_eq!(report.signed_decimal_qty, dec!(100));
         assert_eq!(report.venue_position_id, Some(PositionId::from("P-001")));
         assert_eq!(report.ts_last, UnixNanos::from(1_000_000_000));
         assert_eq!(report.ts_init, UnixNanos::from(2_000_000_000));
@@ -205,9 +212,9 @@ mod tests {
     fn test_position_status_report_new_short() {
         let report = test_position_status_report_short();
 
-        assert_eq!(report.position_side, PositionSide::Short);
+        assert_eq!(report.position_side, PositionSideSpecified::Short);
         assert_eq!(report.quantity, Quantity::from("50"));
-        assert_eq!(report.signed_decimal_qty, Decimal::from(-50));
+        assert_eq!(report.signed_decimal_qty, dec!(-50));
         assert_eq!(report.venue_position_id, None);
     }
 
@@ -215,25 +222,8 @@ mod tests {
     fn test_position_status_report_new_flat() {
         let report = test_position_status_report_flat();
 
-        assert_eq!(report.position_side, PositionSide::Flat);
+        assert_eq!(report.position_side, PositionSideSpecified::Flat);
         assert_eq!(report.quantity, Quantity::from("0"));
-        assert_eq!(report.signed_decimal_qty, Decimal::ZERO);
-    }
-
-    #[rstest]
-    fn test_position_status_report_no_position_side() {
-        let report = PositionStatusReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::NoPositionSide,
-            Quantity::from("0"),
-            None,
-            UnixNanos::from(1_000_000_000),
-            UnixNanos::from(2_000_000_000),
-            None,
-        );
-
-        assert_eq!(report.position_side, PositionSide::NoPositionSide);
         assert_eq!(report.signed_decimal_qty, Decimal::ZERO);
     }
 
@@ -242,12 +232,13 @@ mod tests {
         let report = PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Long,
+            PositionSideSpecified::Long,
             Quantity::from("100"),
-            None,
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
             None, // No report ID provided, should generate one
+            None,
+            None,
         );
 
         // Should have a generated UUID
@@ -275,11 +266,12 @@ mod tests {
         let no_position_report = PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::NoPositionSide,
+            PositionSideSpecified::Flat,
             Quantity::from("0"),
-            None,
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
+            None,
+            None,
             None,
         );
 
@@ -322,6 +314,7 @@ mod tests {
         assert!(display_str.contains("LONG"));
         assert!(display_str.contains("100"));
         assert!(display_str.contains("P-001"));
+        assert!(display_str.contains("avg_px_open=None"));
     }
 
     #[rstest]
@@ -348,33 +341,29 @@ mod tests {
         let long_100 = PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Long,
+            PositionSideSpecified::Long,
             Quantity::from("100.5"),
-            None,
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
+            None,
+            None,
             None,
         );
 
         let short_200 = PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Short,
+            PositionSideSpecified::Short,
             Quantity::from("200.75"),
-            None,
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
             None,
+            None,
+            None,
         );
 
-        assert_eq!(
-            long_100.signed_decimal_qty,
-            Decimal::from_f64_retain(100.5).unwrap()
-        );
-        assert_eq!(
-            short_200.signed_decimal_qty,
-            Decimal::from_f64_retain(-200.75).unwrap()
-        );
+        assert_eq!(long_100.signed_decimal_qty, dec!(100.5));
+        assert_eq!(short_200.signed_decimal_qty, dec!(-200.75));
     }
 
     #[rstest]
@@ -383,12 +372,13 @@ mod tests {
         let short_report = PositionStatusReport::new(
             AccountId::from("SIM-001"),
             InstrumentId::from("AUDUSD.SIM"),
-            PositionSide::Short,
+            PositionSideSpecified::Short,
             Quantity::from("100"), // Same quantity but different side
-            Some(PositionId::from("P-001")),
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(2_000_000_000),
-            None,
+            None,                            // report_id
+            Some(PositionId::from("P-001")), // venue_position_id
+            None,                            // avg_px_open
         );
 
         assert_ne!(long_report, short_report);
@@ -396,5 +386,99 @@ mod tests {
             long_report.signed_decimal_qty,
             short_report.signed_decimal_qty
         );
+    }
+
+    #[rstest]
+    fn test_with_avg_px_open() {
+        let report = PositionStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            PositionSideSpecified::Long,
+            Quantity::from("100"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            None,
+            Some(PositionId::from("P-001")),
+            Some(Decimal::from_str("1.23456").unwrap()),
+        );
+
+        assert_eq!(
+            report.avg_px_open,
+            Some(rust_decimal::Decimal::from_str("1.23456").unwrap())
+        );
+        assert!(format!("{report}").contains("avg_px_open=Some(1.23456)"));
+    }
+
+    #[rstest]
+    fn test_avg_px_open_none_default() {
+        let report = PositionStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            PositionSideSpecified::Long,
+            Quantity::from("100"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            None,
+            None,
+            None, // avg_px_open is None
+        );
+
+        assert_eq!(report.avg_px_open, None);
+    }
+
+    #[rstest]
+    fn test_avg_px_open_with_different_sides() {
+        let long_with_price = PositionStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            PositionSideSpecified::Long,
+            Quantity::from("100"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            None,
+            None,
+            Some(Decimal::from_str("1.50000").unwrap()),
+        );
+
+        let short_with_price = PositionStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            PositionSideSpecified::Short,
+            Quantity::from("100"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            None,
+            None,
+            Some(Decimal::from_str("1.60000").unwrap()),
+        );
+
+        assert_eq!(
+            long_with_price.avg_px_open,
+            Some(rust_decimal::Decimal::from_str("1.50000").unwrap())
+        );
+        assert_eq!(
+            short_with_price.avg_px_open,
+            Some(rust_decimal::Decimal::from_str("1.60000").unwrap())
+        );
+    }
+
+    #[rstest]
+    fn test_avg_px_open_serialization() {
+        let report = PositionStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            PositionSideSpecified::Long,
+            Quantity::from("100"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            None,
+            None,
+            Some(Decimal::from_str("1.99999").unwrap()),
+        );
+
+        let json = serde_json::to_string(&report).unwrap();
+        let deserialized: PositionStatusReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(report.avg_px_open, deserialized.avg_px_open);
     }
 }

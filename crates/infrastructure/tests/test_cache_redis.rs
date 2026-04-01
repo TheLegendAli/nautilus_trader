@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,8 +17,9 @@
 #[cfg(feature = "redis")]
 #[cfg(target_os = "linux")] // Databases only tested and supported on Linux
 mod serial_tests {
-    use std::time::Duration;
+    use std::{sync::OnceLock, time::Duration};
 
+    use bytes::Bytes;
     use nautilus_common::{
         cache::{CacheConfig, database::CacheDatabaseAdapter},
         enums::SerializationEncoding,
@@ -28,12 +29,22 @@ mod serial_tests {
     use nautilus_core::UUID4;
     use nautilus_infrastructure::redis::cache::{RedisCacheDatabase, RedisCacheDatabaseAdapter};
     use nautilus_model::{
+        data::{
+            DataType,
+            stubs::{ensure_stub_custom_data_registered, stub_custom_data},
+        },
         enums::{OrderSide, OrderType},
-        identifiers::{AccountId, ClientOrderId, PositionId, TraderId},
+        identifiers::{ClientOrderId, PositionId, TraderId},
         instruments::stubs::crypto_perpetual_ethusdt,
         orders::{Order, builder::OrderTestBuilder},
         types::Quantity,
     };
+    use redis::AsyncCommands;
+
+    fn redis_test_mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
     async fn get_redis_cache_adapter()
     -> Result<RedisCacheDatabaseAdapter, Box<dyn std::error::Error>> {
@@ -41,21 +52,23 @@ mod serial_tests {
         let instance_id = UUID4::new();
 
         // Create a Redis database config
-        let mut config = CacheConfig::default();
-        config.database = Some(DatabaseConfig {
-            database_type: "redis".to_string(),
-            host: Some("localhost".to_string()),
-            port: Some(6379),
-            username: None,
-            password: None,
-            ssl: false,
-            connection_timeout: 20,
-            response_timeout: 20,
-            number_of_retries: 100,
-            exponent_base: 2,
-            max_delay: 1000,
-            factor: 2,
-        });
+        let config = CacheConfig {
+            database: Some(DatabaseConfig {
+                database_type: "redis".to_string(),
+                host: Some("localhost".to_string()),
+                port: Some(6379),
+                username: None,
+                password: None,
+                ssl: false,
+                connection_timeout: 20,
+                response_timeout: 20,
+                number_of_retries: 100,
+                exponent_base: 2,
+                max_delay: 1000,
+                factor: 2,
+            }),
+            ..Default::default()
+        };
 
         let mut database = RedisCacheDatabase::new(trader_id, instance_id, config).await?;
 
@@ -72,6 +85,7 @@ mod serial_tests {
 
     #[tokio::test]
     async fn test_delete_order() {
+        let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
@@ -87,7 +101,6 @@ mod serial_tests {
         let expected_key = format!("{}:orders:{}", adapter.database.trader_key, client_order_id);
 
         // Set up test data in Redis to verify deletion
-        use redis::AsyncCommands;
         let mut conn = adapter.database.con.clone();
         let _: () = conn.set(&expected_key, "test_data").await.unwrap();
 
@@ -138,6 +151,7 @@ mod serial_tests {
 
     #[tokio::test]
     async fn test_delete_position() {
+        let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
@@ -146,7 +160,6 @@ mod serial_tests {
         let expected_key = format!("{}:positions:{}", adapter.database.trader_key, position_id);
 
         // Set up test data in Redis to verify deletion
-        use redis::AsyncCommands;
         let mut conn = adapter.database.con.clone();
         let _: () = conn.set(&expected_key, "test_data").await.unwrap();
 
@@ -196,187 +209,8 @@ mod serial_tests {
     }
 
     #[tokio::test]
-    async fn test_delete_account_event() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        let account_id = AccountId::new("ACCOUNT-001");
-        let event_id = "event-123";
-
-        adapter.delete_account_event(&account_id, event_id).unwrap();
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_delete_account_event_from_list() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        // Use a unique account ID to avoid interference from other tests
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let account_id = AccountId::new(format!("ACCOUNT-LIST-{timestamp}"));
-        let event_id_to_delete = "event-456";
-        let event_id_to_keep = "event-789";
-        let trader_key = &adapter.database.trader_key;
-
-        // Create test account event data (simulate serialized account events)
-        let test_data_with_target = format!(
-            r#"{{"event_id":"{event_id_to_delete}","account_id":"{account_id}","data":"test1"}}"#
-        );
-        let test_data_without_target = format!(
-            r#"{{"event_id":"{event_id_to_keep}","account_id":"{account_id}","data":"test2"}}"#
-        );
-        let another_test_data_with_target = format!(
-            r#"{{"event_id":"{event_id_to_delete}","account_id":"{account_id}","data":"test3"}}"#
-        );
-
-        use redis::AsyncCommands;
-        let mut conn = adapter.database.con.clone();
-        let list_key = format!("{trader_key}:accounts:{account_id}");
-
-        // Ensure the list is clean before starting
-        let _: () = conn.del(&list_key).await.unwrap();
-
-        // Add test data to the Redis list
-        let _: () = conn.rpush(&list_key, &test_data_with_target).await.unwrap();
-        let _: () = conn
-            .rpush(&list_key, &test_data_without_target)
-            .await
-            .unwrap();
-        let _: () = conn
-            .rpush(&list_key, &another_test_data_with_target)
-            .await
-            .unwrap();
-
-        // Wait for Redis list operations to complete
-        let conn_clone = conn.clone();
-        let list_key_clone = list_key.clone();
-        wait_until_async(
-            move || {
-                let mut conn = conn_clone.clone();
-                let list_key = list_key_clone.clone();
-                async move {
-                    let count: i32 = conn.llen(&list_key).await.unwrap();
-                    count == 3
-                }
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-
-        // Verify initial state - should have 3 items
-        let initial_count: i32 = conn.llen(&list_key).await.unwrap();
-        assert_eq!(initial_count, 3);
-
-        // Get initial list contents
-        let initial_items: Vec<String> = conn.lrange(&list_key, 0, -1).await.unwrap();
-        assert_eq!(initial_items.len(), 3);
-        assert!(
-            initial_items
-                .iter()
-                .any(|item| item.contains(event_id_to_delete))
-        );
-        assert!(
-            initial_items
-                .iter()
-                .any(|item| item.contains(event_id_to_keep))
-        );
-
-        // Delete account events with the target event_id
-        adapter
-            .delete_account_event(&account_id, event_id_to_delete)
-            .unwrap();
-
-        // Wait until the account event is deleted
-        let conn_clone = conn.clone();
-        let list_key_clone = list_key.clone();
-        wait_until_async(
-            move || {
-                let mut conn = conn_clone.clone();
-                let list_key = list_key_clone.clone();
-                async move {
-                    let count: i32 = conn.llen(&list_key).await.unwrap();
-                    count == 1 // Should have 1 item remaining after deletion
-                }
-            },
-            Duration::from_secs(2),
-        )
-        .await;
-
-        // Verify the list now only contains items without the target event_id
-        let final_count: i32 = conn.llen(&list_key).await.unwrap();
-        assert_eq!(
-            final_count, 1,
-            "Should have 1 item remaining after deletion"
-        );
-
-        let final_items: Vec<String> = conn.lrange(&list_key, 0, -1).await.unwrap();
-        assert_eq!(final_items.len(), 1);
-
-        // The remaining item should be the one with event_id_to_keep
-        assert!(final_items[0].contains(event_id_to_keep));
-        assert!(!final_items[0].contains(event_id_to_delete));
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_delete_nonexistent_order() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        let fake_order_id = ClientOrderId::new("O-nonexistent");
-        adapter.delete_order(&fake_order_id).unwrap();
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_delete_nonexistent_position() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        let fake_position_id = PositionId::new("P-nonexistent");
-        adapter.delete_position(&fake_position_id).unwrap();
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_delete_nonexistent_account_event() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        let fake_account_id = AccountId::new("ACCOUNT-nonexistent");
-        adapter
-            .delete_account_event(&fake_account_id, "fake-event")
-            .unwrap();
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
     async fn test_flush_database() {
+        let _guard = redis_test_mutex().lock().await;
         let mut adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
@@ -386,20 +220,17 @@ mod serial_tests {
 
     #[tokio::test]
     async fn test_delete_operations_are_idempotent() {
+        let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
 
         let order_id = ClientOrderId::new("O-IDEMPOTENT-TEST");
         let position_id = PositionId::new("P-IDEMPOTENT-TEST");
-        let account_id = AccountId::new("ACCOUNT-IDEMPOTENT-TEST");
 
         for _ in 0..3 {
             adapter.delete_order(&order_id).unwrap();
             adapter.delete_position(&position_id).unwrap();
-            adapter
-                .delete_account_event(&account_id, "test-event")
-                .unwrap();
         }
 
         // Final cleanup
@@ -408,28 +239,8 @@ mod serial_tests {
     }
 
     #[tokio::test]
-    async fn test_delete_account_event_functionality() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        let account_id = AccountId::new("ACCOUNT-TEST");
-        let event_id = "event-123";
-
-        // First verify that the delete command can be sent without error
-        adapter.delete_account_event(&account_id, event_id).unwrap();
-
-        // Note: This now uses DeleteFromList operation to target the account list:
-        // "trader-{id}:accounts:ACCOUNT-TEST"
-        // The implementation is now fully functional using a Lua script.
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
     async fn test_delete_order_cleans_up_indexes() {
+        let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
@@ -446,7 +257,6 @@ mod serial_tests {
         let trader_key = &adapter.database.trader_key;
 
         // Set up test data in Redis indexes to verify deletion
-        use redis::AsyncCommands;
         let mut conn = adapter.database.con.clone();
 
         // Add to various indexes
@@ -572,6 +382,7 @@ mod serial_tests {
 
     #[tokio::test]
     async fn test_delete_position_cleans_up_indexes() {
+        let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
@@ -581,7 +392,6 @@ mod serial_tests {
         let trader_key = &adapter.database.trader_key;
 
         // Set up test data in Redis indexes to verify deletion
-        use redis::AsyncCommands;
         let mut conn = adapter.database.con.clone();
 
         // Add to position indexes
@@ -608,6 +418,7 @@ mod serial_tests {
                     for index_key in &index_keys {
                         let exists: bool =
                             conn.sismember(index_key, &position_id_str).await.unwrap();
+
                         if !exists {
                             return false;
                         }
@@ -641,6 +452,7 @@ mod serial_tests {
                     for index_key in &index_keys {
                         let exists: bool =
                             conn.sismember(index_key, &position_id_str).await.unwrap();
+
                         if exists {
                             return false;
                         }
@@ -667,80 +479,8 @@ mod serial_tests {
     }
 
     #[tokio::test]
-    async fn test_delete_account_event_edge_cases() {
-        let adapter = get_redis_cache_adapter()
-            .await
-            .expect("Failed to create adapter");
-
-        // Use unique account IDs to avoid interference
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let account_id1 = AccountId::new(format!("ACCOUNT-EDGE-1-{timestamp}"));
-        let account_id2 = AccountId::new(format!("ACCOUNT-EDGE-2-{timestamp}"));
-
-        use redis::AsyncCommands;
-        let mut conn = adapter.database.con.clone();
-
-        // Test 1: Delete from non-existent list (should not error)
-        adapter
-            .delete_account_event(&account_id1, "nonexistent-event")
-            .unwrap();
-
-        // Wait a moment for the operation to complete
-        wait_until_async(
-            || async { true }, // No-op wait since this should complete immediately
-            Duration::from_millis(100),
-        )
-        .await;
-
-        // Verify no list was created
-        let list_key1 = format!("{}:accounts:{}", adapter.database.trader_key, account_id1);
-        let list_exists: bool = conn.exists(&list_key1).await.unwrap();
-        assert!(
-            !list_exists,
-            "No list should be created for non-existent deletion"
-        );
-
-        // Test 2: Delete non-existent event ID from populated list
-        let list_key2 = format!("{}:accounts:{}", adapter.database.trader_key, account_id2);
-
-        // Ensure clean start
-        let _: () = conn.del(&list_key2).await.unwrap();
-
-        // Add some test data
-        let test_data = r#"{"event_id":"real-event","data":"test"}"#;
-        let _: () = conn.rpush(&list_key2, test_data).await.unwrap();
-
-        // Verify we have 1 item
-        let initial_count: i32 = conn.llen(&list_key2).await.unwrap();
-        assert_eq!(initial_count, 1);
-
-        // Try to delete non-existent event
-        adapter
-            .delete_account_event(&account_id2, "does-not-exist")
-            .unwrap();
-
-        // Wait for the operation to complete (should be a no-op)
-        wait_until_async(
-            || async { true }, // No-op wait since this should complete immediately
-            Duration::from_millis(100),
-        )
-        .await;
-
-        // Should still have 1 item (nothing should be deleted)
-        let final_count: i32 = conn.llen(&list_key2).await.unwrap();
-        assert_eq!(final_count, 1);
-
-        // Final cleanup
-        let mut adapter = adapter;
-        adapter.flush().unwrap();
-    }
-
-    #[tokio::test]
     async fn test_debug_real_index_deletion() {
+        let _guard = redis_test_mutex().lock().await;
         let adapter = get_redis_cache_adapter()
             .await
             .expect("Failed to create adapter");
@@ -756,7 +496,6 @@ mod serial_tests {
         let order_id_str = client_order_id.to_string();
         let trader_key = &adapter.database.trader_key;
 
-        use redis::AsyncCommands;
         let mut conn = adapter.database.con.clone();
 
         // Set up test data exactly like real usage - just one index to test
@@ -783,8 +522,23 @@ mod serial_tests {
         println!("\n=== DELETING ORDER ===");
         adapter.delete_order(&client_order_id).unwrap();
 
-        // Give some time for async operations
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Wait for deletion to be processed
+        wait_until_async(
+            || {
+                let mut conn = conn.clone();
+                let test_index_key = test_index_key.clone();
+                let order_id_str = order_id_str.clone();
+                async move {
+                    let exists: bool = conn
+                        .sismember(&test_index_key, &order_id_str)
+                        .await
+                        .unwrap_or(true);
+                    !exists
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
 
         println!("\n=== AFTER DELETION ===");
         let exists_after: bool = conn
@@ -809,204 +563,275 @@ mod serial_tests {
         adapter.flush().unwrap();
     }
 
+    /// Tests that the buffer flushes on a timer even when no new messages arrive.
+    /// This verifies the fix for issue #3426 where blocking on channel receive
+    /// prevented time-based buffer flushing during idle periods.
     #[tokio::test]
-    async fn test_delete_account_events_batch() {
-        let adapter = get_redis_cache_adapter().await.unwrap();
+    async fn test_buffer_flushes_on_interval_when_idle() {
+        let _guard = redis_test_mutex().lock().await;
+        let trader_id = TraderId::from("test-trader");
+        let instance_id = UUID4::new();
 
-        // Use unique account ID to avoid interference
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let account_id = AccountId::new(format!("ACCOUNT-BATCH-{timestamp}"));
+        let config = CacheConfig {
+            database: Some(DatabaseConfig {
+                database_type: "redis".to_string(),
+                host: Some("localhost".to_string()),
+                port: Some(6379),
+                username: None,
+                password: None,
+                ssl: false,
+                connection_timeout: 20,
+                response_timeout: 20,
+                number_of_retries: 100,
+                exponent_base: 2,
+                max_delay: 1000,
+                factor: 2,
+            }),
+            buffer_interval_ms: Some(50),
+            ..Default::default()
+        };
 
-        // Create test account events (simulate serialized account events)
-        let event_id_1 = "event-1";
-        let event_id_2 = "event-2";
-        let event_id_3 = "event-3";
-        let event_id_keep = "event-keep";
-
-        let event_data_1 =
-            format!(r#"{{"event_id":"{event_id_1}","account_id":"{account_id}","data":"test1"}}"#);
-        let event_data_2 =
-            format!(r#"{{"event_id":"{event_id_2}","account_id":"{account_id}","data":"test2"}}"#);
-        let event_data_3 =
-            format!(r#"{{"event_id":"{event_id_3}","account_id":"{account_id}","data":"test3"}}"#);
-        let event_data_keep = format!(
-            r#"{{"event_id":"{event_id_keep}","account_id":"{account_id}","data":"keep"}}"#
-        );
-
-        // Set up Redis list with test data
-        let list_key = format!("{}:accounts:{}", adapter.database.trader_key, account_id);
-        use redis::AsyncCommands;
-        let mut conn = adapter.database.con.clone();
-
-        // Add events to the list
-        let _: () = conn
-            .rpush(
-                &list_key,
-                &[
-                    &event_data_1,
-                    &event_data_2,
-                    &event_data_3,
-                    &event_data_keep,
-                ],
-            )
+        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
             .await
+            .expect("Failed to create database");
+        database.flushdb().await;
+
+        let trader_key = database.trader_key.clone();
+        let test_key = "general:test_key";
+
+        let expected_key = format!("{trader_key}:{test_key}");
+
+        database
+            .insert(test_key.to_string(), Some(vec![Bytes::from("test_data")]))
             .unwrap();
 
-        // Verify initial state
-        let initial_count: i32 = conn.llen(&list_key).await.unwrap();
-        assert_eq!(initial_count, 4);
-
-        // Delete multiple events in batch
-        let events_to_delete = [event_id_1, event_id_2, event_id_3];
-        adapter
-            .database
-            .delete_account_events_batch(&account_id, &events_to_delete)
-            .unwrap();
-
-        // Wait for operation to complete
-        let list_key_clone = list_key.clone();
-        let conn_clone = conn.clone();
-
+        // Buffer should flush on timer even with no further messages
+        let conn = database.con.clone();
+        let expected_key_clone = expected_key.clone();
         wait_until_async(
             move || {
-                let list_key = list_key_clone.clone();
-                let mut conn = conn_clone.clone();
+                let mut conn = conn.clone();
+                let expected_key = expected_key_clone.clone();
+                async move { conn.exists(&expected_key).await.unwrap_or(false) }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let mut conn = database.con.clone();
+        let exists: bool = conn.exists(&expected_key).await.unwrap();
+
+        assert!(
+            exists,
+            "Data should be flushed to Redis after buffer interval even when idle"
+        );
+    }
+
+    /// Tests that with `buffer_interval_ms = 0`, data is flushed immediately
+    /// without waiting for a timer.
+    #[tokio::test]
+    async fn test_buffer_flushes_immediately_with_zero_interval() {
+        let _guard = redis_test_mutex().lock().await;
+        let trader_id = TraderId::from("test-trader");
+        let instance_id = UUID4::new();
+
+        let config = CacheConfig {
+            database: Some(DatabaseConfig {
+                database_type: "redis".to_string(),
+                host: Some("localhost".to_string()),
+                port: Some(6379),
+                username: None,
+                password: None,
+                ssl: false,
+                connection_timeout: 20,
+                response_timeout: 20,
+                number_of_retries: 100,
+                exponent_base: 2,
+                max_delay: 1000,
+                factor: 2,
+            }),
+            buffer_interval_ms: Some(0),
+            ..Default::default()
+        };
+
+        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
+            .await
+            .expect("Failed to create database");
+        database.flushdb().await;
+
+        let trader_key = database.trader_key.clone();
+        let test_key = "general:immediate_test";
+
+        let expected_key = format!("{trader_key}:{test_key}");
+
+        database
+            .insert(test_key.to_string(), Some(vec![Bytes::from("test_data")]))
+            .unwrap();
+
+        // Brief delay for async task processing
+        let conn = database.con.clone();
+        let expected_key_clone = expected_key.clone();
+        wait_until_async(
+            move || {
+                let mut conn = conn.clone();
+                let expected_key = expected_key_clone.clone();
+                async move { conn.exists(&expected_key).await.unwrap_or(false) }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let mut conn = database.con.clone();
+        let exists: bool = conn.exists(&expected_key).await.unwrap();
+
+        assert!(
+            exists,
+            "Data should be flushed immediately with zero buffer interval"
+        );
+    }
+
+    /// Tests that pending buffered data is drained when close is called.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_buffer_drains_on_close() {
+        let _guard = redis_test_mutex().lock().await;
+        let trader_id = TraderId::from("test-trader");
+        let instance_id = UUID4::new();
+
+        let config = CacheConfig {
+            database: Some(DatabaseConfig {
+                database_type: "redis".to_string(),
+                host: Some("localhost".to_string()),
+                port: Some(6379),
+                username: None,
+                password: None,
+                ssl: false,
+                connection_timeout: 20,
+                response_timeout: 20,
+                number_of_retries: 100,
+                exponent_base: 2,
+                max_delay: 1000,
+                factor: 2,
+            }),
+            buffer_interval_ms: Some(10000),
+            ..Default::default()
+        };
+
+        let mut database = RedisCacheDatabase::new(trader_id, instance_id, config)
+            .await
+            .expect("Failed to create database");
+        database.flushdb().await;
+
+        let trader_key = database.trader_key.clone();
+        let test_key = "general:close_test";
+        let expected_key = format!("{trader_key}:{test_key}");
+
+        database
+            .insert(test_key.to_string(), Some(vec![Bytes::from("test_data")]))
+            .unwrap();
+
+        // Data should NOT be in Redis yet (buffer interval is 10 seconds)
+        let mut conn = database.con.clone();
+        let exists_before: bool = conn.exists(&expected_key).await.unwrap();
+        assert!(
+            !exists_before,
+            "Data should be buffered, not yet flushed to Redis"
+        );
+
+        database.close();
+
+        let exists_after: bool = conn.exists(&expected_key).await.unwrap();
+        assert!(
+            exists_after,
+            "Data should be flushed to Redis when close is called"
+        );
+    }
+
+    /// Tests add_custom_data and load_custom_data roundtrip with filtering by type_name and identifier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_and_load_custom_data_roundtrip() {
+        let _guard = redis_test_mutex().lock().await;
+        ensure_stub_custom_data_registered();
+        let adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
+
+        let data = stub_custom_data(1000, 42, None, Some("id1".to_string()));
+        let data_type = DataType::new("StubCustomData", None, Some("id1".to_string()));
+
+        adapter
+            .add_custom_data(&data)
+            .expect("add_custom_data failed");
+
+        let conn = adapter.database.con.clone();
+        let custom_pattern = format!("{}:custom:*", adapter.database.trader_key);
+        wait_until_async(
+            move || {
+                let mut conn = conn.clone();
+                let custom_pattern = custom_pattern.clone();
                 async move {
-                    let count: i32 = conn.llen(&list_key).await.unwrap();
-                    count == 1
+                    let keys: Vec<String> = conn.keys(custom_pattern).await.unwrap_or_default();
+                    keys.len() == 1
                 }
             },
             Duration::from_secs(5),
         )
         .await;
 
-        // Verify batch deletion worked
-        let final_count: i32 = conn.llen(&list_key).await.unwrap();
-        assert_eq!(final_count, 1);
+        let loaded = adapter
+            .load_custom_data(&data_type)
+            .expect("load_custom_data failed");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], data);
 
-        // Verify the kept event is still there
-        let remaining_events: Vec<String> = conn.lrange(&list_key, 0, -1).await.unwrap();
-
-        assert_eq!(remaining_events.len(), 1);
-        assert!(remaining_events[0].contains(event_id_keep));
-        assert!(!remaining_events[0].contains(event_id_1));
-        assert!(!remaining_events[0].contains(event_id_2));
-        assert!(!remaining_events[0].contains(event_id_3));
-
-        // Clean up
-        let _: () = conn.del(&list_key).await.unwrap();
+        let mut adapter = adapter;
+        adapter.flush().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_delete_account_events_batch_empty() {
-        let adapter = get_redis_cache_adapter().await.unwrap();
-        let account_id = AccountId::new("ACCOUNT-BATCH-EMPTY");
+    /// Tests that load_custom_data returns only items matching the requested DataType (identifier filter).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_load_custom_data_filters_by_identifier() {
+        let _guard = redis_test_mutex().lock().await;
+        ensure_stub_custom_data_registered();
+        let adapter = get_redis_cache_adapter()
+            .await
+            .expect("Failed to create adapter");
 
-        // Test with empty event list - should not fail
-        let empty_vec: Vec<&str> = vec![];
-        let result = adapter
-            .database
-            .delete_account_events_batch(&account_id, &empty_vec);
-        assert!(result.is_ok());
-    }
+        let data1 = stub_custom_data(2000, 1, None, Some("id1".to_string()));
+        let data2 = stub_custom_data(2001, 2, None, Some("id2".to_string()));
+        adapter.add_custom_data(&data1).unwrap();
+        adapter.add_custom_data(&data2).unwrap();
 
-    #[tokio::test]
-    async fn test_delete_account_events_batch_nonexistent() {
-        let adapter = get_redis_cache_adapter().await.unwrap();
-        let account_id = AccountId::new("ACCOUNT-BATCH-NONEXISTENT");
+        let data_type1 = DataType::new("StubCustomData", None, Some("id1".to_string()));
+        let data_type2 = DataType::new("StubCustomData", None, Some("id2".to_string()));
 
-        // Test with nonexistent events - should not fail
-        let result = adapter
-            .database
-            .delete_account_events_batch(&account_id, &["fake-event-1", "fake-event-2"]);
-        assert!(result.is_ok());
-    }
+        let conn = adapter.database.con.clone();
+        let custom_pattern = format!("{}:custom:*", adapter.database.trader_key);
+        wait_until_async(
+            move || {
+                let mut conn = conn.clone();
+                let custom_pattern = custom_pattern.clone();
+                async move {
+                    let keys: Vec<String> = conn.keys(custom_pattern).await.unwrap_or_default();
+                    keys.len() == 2
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-    #[tokio::test]
-    async fn test_delete_account_events_batch_stress() {
-        let adapter = get_redis_cache_adapter().await.unwrap();
+        let loaded_id1 = adapter
+            .load_custom_data(&data_type1)
+            .expect("load_custom_data failed");
+        assert_eq!(loaded_id1.len(), 1);
+        assert_eq!(loaded_id1[0].data_type.identifier(), Some("id1"));
 
-        // Use unique account ID
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let account_id = AccountId::new(format!("ACCOUNT-STRESS-{timestamp}"));
+        let loaded_id2 = adapter
+            .load_custom_data(&data_type2)
+            .expect("load_custom_data failed");
+        assert_eq!(loaded_id2.len(), 1);
+        assert_eq!(loaded_id2[0].data_type.identifier(), Some("id2"));
 
-        let list_key = format!("{}:accounts:{}", adapter.database.trader_key, account_id);
-        use redis::AsyncCommands;
-        let mut conn = adapter.database.con.clone();
-
-        // Create 2,000 events (reasonable stress test)
-        println!("Creating 2,000 test events...");
-        let start_setup = std::time::Instant::now();
-
-        let mut events_data = Vec::new();
-        let mut events_to_delete = Vec::new();
-
-        // Create events with realistic timestamps (simulating time-based purging)
-        let base_timestamp = 1000000000000000000u64; // Base nanosecond timestamp
-        for i in 0..2_000 {
-            let event_id = format!("event-{i}");
-            let timestamp = base_timestamp + (i * 60_000_000_000); // Events every minute
-            let event_data = format!(
-                r#"{{"event_id":"{event_id}","account_id":"{account_id}","ts_event":{timestamp},"data":"stress_test_{i}"}}"#
-            );
-            events_data.push(event_data);
-
-            // Simulate time-based purging: delete first 1000 events (oldest)
-            // This creates a realistic contiguous head deletion pattern
-            if i < 1_000 {
-                events_to_delete.push(event_id);
-            }
-        }
-
-        // Batch insert all events
-        let _: () = conn.rpush(&list_key, &events_data).await.unwrap();
-        let setup_duration = start_setup.elapsed();
-        println!("Setup took: {setup_duration:?}");
-
-        // Verify initial count
-        let initial_count: i32 = conn.llen(&list_key).await.unwrap();
-        assert_eq!(initial_count, 2_000);
-
-        // Perform batch deletion with timing
-        println!("Starting batch deletion of 1,000 events...");
-        let start_delete = std::time::Instant::now();
-
-        let result = adapter
-            .database
-            .delete_account_events_batch(&account_id, &events_to_delete);
-
-        let delete_duration = start_delete.elapsed();
-        println!("Batch deletion took: {delete_duration:?}");
-
-        assert!(result.is_ok(), "Batch deletion should succeed");
-
-        // Check what actually happened without waiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let actual_count: i32 = conn.llen(&list_key).await.unwrap();
-        println!("Actual count after deletion: {actual_count}");
-
-        // Get some of the remaining items to debug
-        let remaining_items: Vec<String> = conn.lrange(&list_key, 0, 10).await.unwrap();
-        println!("First 10 remaining items: {remaining_items:?}");
-        println!("Events we tried to delete: {:?}", &events_to_delete[0..10]);
-
-        // Verify final count matches expectation
-        assert_eq!(
-            actual_count, 1_000,
-            "Should have 1,000 events remaining after deletion"
-        );
-
-        println!("Stress test completed successfully!");
-        println!("Total time: {:?}", setup_duration + delete_duration);
-
-        // Clean up
-        let _: () = conn.del(&list_key).await.unwrap();
+        let mut adapter = adapter;
+        adapter.flush().unwrap();
     }
 }

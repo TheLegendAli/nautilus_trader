@@ -1,17 +1,29 @@
 [package]
 name = "nautilus-serialization"
 readme = "README.md"
+build = "build.rs"
+include = [
+  "src/**/*",
+  "schemas/**/*",
+  "generated/**/*",
+  "build.rs",
+  "Cargo.toml",
+  "README.md",
+]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "Serialization functionality for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "nautilus_serialization"
@@ -19,12 +31,21 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
 default = []
+arrow = ["dep:arrow"]
+capnp = ["dep:capnp"]
+sbe = []
 extension-module = [
-  "pyo3/extension-module",
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
+  "python",
+  "pyo3/extension-module",
 ]
-python = ["pyo3", "nautilus-core/python", "nautilus-model/python"]
+python = [
+  "nautilus-core/python",
+  "nautilus-model/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
 high-precision = ["nautilus-model/high-precision"]
 
 [package.metadata.docs.rs]
@@ -36,16 +57,48 @@ nautilus-core = { workspace = true }
 nautilus-model = { workspace = true, features = ["stubs"] }
 
 anyhow = { workspace = true }
-arrow = { workspace = true }
-parquet = { workspace = true }
-pyo3 = { workspace = true, optional = true }
+indexmap = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
-strum = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+ustr = { workspace = true }
+uuid = { workspace = true }
+
+arrow = { workspace = true, optional = true }
+capnp = { workspace = true, optional = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-testkit = { workspace = true }
+criterion = { workspace = true }
 pretty_assertions = { workspace = true }
 rstest = { workspace = true }
+
+[build-dependencies]
+capnpc = { workspace = true }
+walkdir = { workspace = true }
+
+[[bench]]
+name = "capnp_serialization"
+path = "benches/capnp_serialization.rs"
+harness = false
+required-features = ["capnp"]
+
+[[bench]]
+name = "serialization_comparison"
+path = "benches/serialization_comparison.rs"
+harness = false
+
+[[bench]]
+name = "sbe_decoding"
+path = "benches/sbe_decoding.rs"
+harness = false
+required-features = ["sbe"]
+
+[[bench]]
+name = "quote_tick_capnp_vs_sbe"
+path = "benches/quote_tick_capnp_vs_sbe.rs"
+harness = false
+required-features = ["capnp", "sbe"]

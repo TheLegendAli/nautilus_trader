@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,9 +14,12 @@
 # -------------------------------------------------------------------------------------------------
 
 from decimal import Decimal
-from typing import Final, Literal
+from typing import Final
+from typing import Literal
 
+import msgspec.structs
 from ibapi.const import UNSET_DECIMAL
+from ibapi.const import UNSET_DOUBLE
 from ibapi.contract import FundAssetType
 from ibapi.contract import FundDistributionPolicyIndicator
 from ibapi.tag_value import TagValue
@@ -35,21 +38,6 @@ class ContractId(int):
     """
     ContractId type.
     """
-
-
-# https://interactivebrokers.github.io/tws-api/tick_types.html
-TickTypeMapping = {
-    0: "Bid Size",
-    1: "Bid Price",
-    2: "Ask Price",
-    3: "Ask Size",
-    4: "Last Price",
-    5: "Last Size",
-    6: "High",
-    7: "Low",
-    8: "Volume",
-    9: "Close Price",
-}
 
 
 class ComboLeg(NautilusConfig, frozen=True, omit_defaults=True, repr_omit_defaults=True):
@@ -121,6 +109,7 @@ class IBContract(NautilusConfig, frozen=True, repr_omit_defaults=True):
         "CFD",
         "CMDTY",
         "IND",
+        "BAG",
         "",
     ] = ""
     conId: int = 0
@@ -137,7 +126,7 @@ class IBContract(NautilusConfig, frozen=True, repr_omit_defaults=True):
     multiplier: str = ""
 
     # options
-    strike: float = 0.0
+    strike: float = UNSET_DOUBLE
     right: str = ""
 
     # If set to true, contract details requests and historical data queries can be performed pertaining
@@ -161,6 +150,17 @@ class IBContract(NautilusConfig, frozen=True, repr_omit_defaults=True):
     options_chain_exchange: str | None = None
     min_expiry_days: int | None = None
     max_expiry_days: int | None = None
+
+    def __post_init__(self):
+        # ibapi 10.43 introduced a dual protocol: legacy string-based and protobuf.
+        # TWS/Gateway now responds in protobuf format regardless of request format.
+        # The protobuf decoder decodes unset double fields as 0.0 rather than
+        # UNSET_DOUBLE (sys.float_info.max). When strike=0.0 leaks into a subsequent
+        # reqContractDetails call, IB silently ignores the request (zero bytes back).
+        # We normalize here in __post_init__ so that all IBContract construction paths
+        # (direct `IBContract(**contract.__dict__)` and deserialization) are safe.
+        if self.strike == 0.0:
+            msgspec.structs.force_setattr(self, "strike", UNSET_DOUBLE)
 
 
 class IBOrderTags(NautilusConfig, frozen=True, repr_omit_defaults=True):
@@ -191,6 +191,15 @@ class IBOrderTags(NautilusConfig, frozen=True, repr_omit_defaults=True):
     # If set to true, the order will not be visible when viewing the market depth.
     # This option only applies to orders routed to the NASDAQ exchange.
     hidden: bool = False
+
+    # Order conditions
+    conditions: list[dict] = []  # List of condition dictionaries
+    conditionsCancelOrder: bool = (
+        False  # True = cancel order when condition met, False = transmit order
+    )
+
+    # Smart combo routing parameters (for combo orders)
+    NonGuaranteed: bool = False  # True = non-guaranteed combo order, False = guaranteed combo order
 
     @property
     def value(self):
@@ -238,6 +247,7 @@ class IBContractDetails(NautilusConfig, frozen=True, repr_omit_defaults=True):
     minSize: Decimal = UNSET_DECIMAL
     sizeIncrement: Decimal = UNSET_DECIMAL
     suggestedSizeIncrement: Decimal = UNSET_DECIMAL
+    minAlgoSize: Decimal = UNSET_DECIMAL
 
     # BOND values
     cusip: str = ""
@@ -277,6 +287,38 @@ class IBContractDetails(NautilusConfig, frozen=True, repr_omit_defaults=True):
     )
     fundAssetType: FundAssetType = FundAssetType.NoneItem
     ineligibilityReasonList: list = None
+    eventContract1: str = ""
+    eventContractDescription1: str = ""
+    eventContractDescription2: str = ""
+
+    @classmethod
+    def from_contract_details(cls, contract_details) -> "IBContractDetails":
+        """
+        Create from a raw ibapi ContractDetails, normalizing ibapi 10.43 protobuf
+        issues.
+
+        ibapi 10.43's protobuf decoder (decoder.py:decodeContractDetails) has a typo:
+        it writes ``contractDetails.underConid`` (lowercase 'i') instead of the
+        canonical ``contractDetails.underConId`` (uppercase 'I'). This causes
+        ``IBContractDetails(**details.__dict__)`` to fail with "Unexpected keyword
+        argument 'underConid'". We normalize the key here before construction.
+
+        Unlike IBContract.strike (where 0.0 is a valid kwarg we fix in __post_init__),
+        "underConid" is an invalid kwarg that must be renamed in the dict before
+        the constructor sees it — hence this is a classmethod rather than __post_init__.
+
+        """
+        if not isinstance(contract_details.contract, IBContract):
+            contract_dict = contract_details.contract.__dict__.copy()
+            contract_details.contract = IBContract(**contract_dict)
+
+        d = contract_details.__dict__.copy()
+        if "underConid" in d:
+            if not d.get("underConId"):
+                d["underConId"] = d.pop("underConid")
+            else:
+                d.pop("underConid")
+        return cls(**d)
 
 
 def dict_to_contract_details(dict_details: dict) -> IBContractDetails:
@@ -291,4 +333,55 @@ def dict_to_contract_details(dict_details: dict) -> IBContractDetails:
         ]
         details_copy["secIdList"] = tag_values
 
+    # Deserialize Decimal fields from strings back to Decimal objects
+    # These fields are known to be Decimal type in IBContractDetails
+    decimal_fields = ["minSize", "sizeIncrement", "suggestedSizeIncrement", "minAlgoSize"]
+    for field in decimal_fields:
+        if field in details_copy and isinstance(details_copy[field], str):
+            try:
+                decimal_value = Decimal(details_copy[field])
+
+                # Check if this is the UNSET_DECIMAL value
+                if decimal_value == UNSET_DECIMAL:
+                    details_copy[field] = UNSET_DECIMAL
+                else:
+                    details_copy[field] = decimal_value
+            except (ValueError, TypeError):
+                # If conversion fails, keep the original value
+                pass
+
+    # Deserialize Enum fields from their values back to Enum members
+    # These fields are known to be Enum type in IBContractDetails
+    if "fundDistributionPolicyIndicator" in details_copy:
+        details_copy["fundDistributionPolicyIndicator"] = _deserialize_enum_from_value(
+            FundDistributionPolicyIndicator,
+            details_copy["fundDistributionPolicyIndicator"],
+        )
+
+    if "fundAssetType" in details_copy:
+        details_copy["fundAssetType"] = _deserialize_enum_from_value(
+            FundAssetType,
+            details_copy["fundAssetType"],
+        )
+
     return IBContractDetails(**details_copy)
+
+
+def _deserialize_enum_from_value(enum_class, value):
+    """
+    Convert an enum value (tuple or string) back to the enum member.
+    """
+    if value is None:
+        return None
+
+    # If already an enum member, return as-is
+    if isinstance(value, enum_class):
+        return value
+
+    # Try to find enum member by matching value
+    for member in enum_class:
+        if member.value == value:
+            return member
+
+    # If not found, return the original value (might be invalid)
+    return value

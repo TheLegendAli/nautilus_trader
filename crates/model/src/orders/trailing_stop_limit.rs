@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -42,7 +42,11 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct TrailingStopLimitOrder {
     core: OrderCore,
@@ -246,6 +250,12 @@ impl TrailingStopLimitOrder {
     }
 }
 
+impl PartialEq for TrailingStopLimitOrder {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_order_id == other.client_order_id
+    }
+}
+
 impl Deref for TrailingStopLimitOrder {
     type Target = OrderCore;
     fn deref(&self) -> &Self::Target {
@@ -427,6 +437,10 @@ impl Order for TrailingStopLimitOrder {
         self.leaves_qty
     }
 
+    fn overfill_qty(&self) -> Quantity {
+        self.overfill_qty
+    }
+
     fn avg_px(&self) -> Option<f64> {
         self.avg_px
     }
@@ -476,12 +490,24 @@ impl Order for TrailingStopLimitOrder {
     }
 
     fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
+        let is_order_filled = matches!(event, OrderEventAny::Filled(_));
+        let is_order_triggered = matches!(event, OrderEventAny::Triggered(_));
+        let ts_event = if is_order_triggered {
+            Some(event.ts_event())
+        } else {
+            None
+        };
+
+        self.core.apply(event.clone())?;
+
         if let OrderEventAny::Updated(ref event) = event {
             self.update(event);
         }
-        let is_order_filled = matches!(event, OrderEventAny::Filled(_));
 
-        self.core.apply(event)?;
+        if is_order_triggered {
+            self.is_triggered = true;
+            self.ts_triggered = ts_event;
+        }
 
         if is_order_filled {
             self.core.set_slippage(self.price);
@@ -494,11 +520,12 @@ impl Order for TrailingStopLimitOrder {
         if let Some(price) = event.price {
             self.price = price;
         }
+
         if let Some(trigger_price) = event.trigger_price {
             self.trigger_price = trigger_price;
         }
         self.quantity = event.quantity;
-        self.leaves_qty = self.quantity - self.filled_qty;
+        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
     }
 
     fn is_triggered(&self) -> Option<bool> {
@@ -526,7 +553,7 @@ impl Order for TrailingStopLimitOrder {
     }
 
     fn set_liquidity_side(&mut self, liquidity_side: LiquiditySide) {
-        self.liquidity_side = Some(liquidity_side)
+        self.liquidity_side = Some(liquidity_side);
     }
 
     fn would_reduce_only(&self, side: PositionSide, position_qty: Quantity) -> bool {
@@ -608,9 +635,6 @@ impl From<OrderInitialized> for TrailingStopLimitOrder {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-//  Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -722,7 +746,7 @@ mod tests {
             .build();
     }
 
-    #[test]
+    #[rstest]
     fn test_trailing_stop_limit_order_update() {
         let order = OrderTestBuilder::new(OrderType::TrailingStopLimit)
             .instrument_id(InstrumentId::from("BTC-USDT.BINANCE"))
@@ -753,7 +777,7 @@ mod tests {
         assert_eq!(accepted_order.trigger_price(), Some(updated_trigger_price));
     }
 
-    #[test]
+    #[rstest]
     fn test_trailing_stop_limit_order_trigger_instrument_id() {
         let trigger_instrument_id = InstrumentId::from("ETH-USDT.BINANCE");
         let order = OrderTestBuilder::new(OrderType::TrailingStopLimit)
@@ -770,7 +794,7 @@ mod tests {
         assert_eq!(order.trigger_instrument_id(), Some(trigger_instrument_id));
     }
 
-    #[test]
+    #[rstest]
     fn test_trailing_stop_limit_order_from_order_initialized() {
         let order_initialized = OrderInitializedBuilder::default()
             .order_type(OrderType::TrailingStopLimit)

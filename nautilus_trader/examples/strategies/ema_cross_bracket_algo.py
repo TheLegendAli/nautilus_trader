@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -24,8 +24,8 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.data import Data
 from nautilus_trader.core.message import Event
-from nautilus_trader.indicators.atr import AverageTrueRange
-from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
+from nautilus_trader.indicators import AverageTrueRange
+from nautilus_trader.indicators import ExponentialMovingAverage
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import QuoteTick
@@ -153,7 +153,10 @@ class EMACrossBracketAlgo(Strategy):
         self.register_indicator_for_bars(self.config.bar_type, self.slow_ema)
 
         # Get historical data
-        self.request_bars(self.config.bar_type)
+        self.request_bars(
+            self.config.bar_type,
+            start=self._clock.utc_now() - timedelta(days=1),
+        )
 
         # Subscribe to live data
         self.subscribe_bars(self.config.bar_type)
@@ -226,16 +229,22 @@ class EMACrossBracketAlgo(Strategy):
         tick_size: Price = self.instrument.price_increment
         bracket_distance: float = self.config.bracket_distance_atr * self.atr.value
 
+        # Calculate entry and bracket prices relative to entry
+        entry_price_raw = float(last_bar.close) + float(tick_size)
+        entry_trigger_price = self.instrument.make_price(entry_price_raw)
+        sl_trigger_price = self.instrument.make_price(entry_price_raw - bracket_distance)
+        tp_price = self.instrument.make_price(entry_price_raw + bracket_distance)
+
         order_list: OrderList = self.order_factory.bracket(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=self.instrument.make_qty(self.config.trade_size),
-            time_in_force=TimeInForce.GTD,
-            expire_time=self.clock.utc_now() + timedelta(seconds=30),
-            entry_trigger_price=self.instrument.make_price(last_bar.close + tick_size),
-            sl_trigger_price=self.instrument.make_price(last_bar.close - bracket_distance),
-            tp_price=self.instrument.make_price(last_bar.close + bracket_distance),
-            entry_order_type=OrderType.MARKET_IF_TOUCHED,
+            time_in_force=TimeInForce.GTC,
+            entry_order_type=OrderType.STOP_LIMIT,
+            entry_price=entry_trigger_price,
+            entry_trigger_price=entry_trigger_price,
+            sl_trigger_price=sl_trigger_price,
+            tp_price=tp_price,
             emulation_trigger=TriggerType[self.config.emulation_trigger],
             entry_exec_algorithm_id=self.config.entry_exec_algorithm_id,
             entry_exec_algorithm_params=self.config.entry_exec_algorithm_params,
@@ -258,16 +267,22 @@ class EMACrossBracketAlgo(Strategy):
         tick_size: Price = self.instrument.price_increment
         bracket_distance: float = self.config.bracket_distance_atr * self.atr.value
 
+        # Calculate entry and bracket prices relative to entry
+        entry_price_raw = float(last_bar.low) - float(tick_size)
+        entry_trigger_price = self.instrument.make_price(entry_price_raw)
+        sl_trigger_price = self.instrument.make_price(entry_price_raw + bracket_distance)
+        tp_price = self.instrument.make_price(entry_price_raw - bracket_distance)
+
         order_list: OrderList = self.order_factory.bracket(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,
             quantity=self.instrument.make_qty(self.config.trade_size),
-            time_in_force=TimeInForce.GTD,
-            expire_time=self.clock.utc_now() + timedelta(seconds=30),
-            entry_trigger_price=self.instrument.make_price(last_bar.low - tick_size),
-            sl_trigger_price=self.instrument.make_price(last_bar.close + bracket_distance),
-            tp_price=self.instrument.make_price(last_bar.close - bracket_distance),
-            entry_order_type=OrderType.MARKET_IF_TOUCHED,
+            time_in_force=TimeInForce.GTC,
+            entry_order_type=OrderType.STOP_LIMIT,
+            entry_price=entry_trigger_price,
+            entry_trigger_price=entry_trigger_price,
+            sl_trigger_price=sl_trigger_price,
+            tp_price=tp_price,
             emulation_trigger=TriggerType[self.config.emulation_trigger],
             entry_exec_algorithm_id=self.config.entry_exec_algorithm_id,
             entry_exec_algorithm_params=self.config.entry_exec_algorithm_params,

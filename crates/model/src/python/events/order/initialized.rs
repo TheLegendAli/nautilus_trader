@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -37,7 +37,14 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderInitialized {
+    /// Represents an event where an order has been initialized.
+    ///
+    /// This is a seed event which can instantiate any order through a creation
+    /// method. This event should contain enough information to be able to send it
+    /// 'over the wire' and have a valid order created with exactly the same
+    /// properties as if it had been instantiated locally.
     #[allow(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, order_side, order_type, quantity, time_in_force, post_only, reduce_only, quote_quantity, reconciliation, event_id, ts_event, ts_init, price=None, trigger_price=None, trigger_type=None, limit_offset=None, trailing_offset=None, trailing_offset_type=None, expire_time=None, display_qty=None, emulation_trigger=None, trigger_instrument_id=None, contingency_type=None, order_list_id=None, linked_order_ids=None, parent_order_id=None, exec_algorithm_id=None, exec_algorithm_params=None, exec_spawn_id=None, tags=None))]
@@ -142,9 +149,9 @@ impl OrderInitialized {
     }
 
     #[pyo3(name = "to_dict")]
-    fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
-        dict.set_item("type", stringify!(OrderInitiliazed))?;
+        dict.set_item("type", stringify!(OrderInitialized))?;
         dict.set_item("trader_id", self.trader_id.to_string())?;
         dict.set_item("strategy_id", self.strategy_id.to_string())?;
         dict.set_item("instrument_id", self.instrument_id.to_string())?;
@@ -159,6 +166,7 @@ impl OrderInitialized {
         dict.set_item("reconciliation", self.reconciliation)?;
         // TODO remove options as in legacy cython only
         let options = PyDict::new(py);
+
         if self.order_type == OrderType::StopMarket {
             options.set_item("trigger_type", self.trigger_type.map(|x| x.to_string()))?;
             options.set_item("trigger_price", self.trigger_price.map(|x| x.to_string()))?;

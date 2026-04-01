@@ -6,12 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-description.workspace = true
+description = "Network communication machinery for the Nautilus trading engine"
 categories.workspace = true
 keywords.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "nautilus_network"
@@ -20,11 +23,17 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [features]
 default = []
 extension-module = [
-  "pyo3/extension-module",
   "nautilus-core/extension-module",
+  "python",
+  "pyo3/extension-module",
 ]
-python = ["pyo3", "pyo3-async-runtimes", "nautilus-core/python"]
-std = []
+python = [
+  "nautilus-core/python",
+  "pyo3",
+  "pyo3-async-runtimes",
+  "pyo3-stub-gen",
+]
+turmoil = ["dep:turmoil"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -34,7 +43,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 nautilus-core = { workspace = true }
 nautilus-cryptography = { workspace = true }
 
+ahash = { workspace = true }
 anyhow = { workspace = true }
+bon = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
@@ -42,28 +53,44 @@ futures-util = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 memchr = { workspace = true }
-nonzero_ext = { workspace = true }
-pyo3 = { workspace = true, optional = true }
-pyo3-async-runtimes = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_urlencoded = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
-tracing = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+ustr = { workspace = true }
 webpki-roots = { workspace = true }
 
+pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+turmoil = { workspace = true, optional = true }
+
 [dev-dependencies]
-nautilus-common = { workspace = true }
+nautilus-common = { workspace = true, features = ["live"] }
 
 axum = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
 serde_json = { workspace = true }
-tracing-test = { workspace = true }
+tempfile = { workspace = true }
 turmoil = { workspace = true }
+
+[[bench]]
+name = "ratelimiter"
+path = "benches/ratelimiter.rs"
+harness = false
+
+[[bench]]
+name = "http_response"
+path = "benches/http_response.rs"
+harness = false

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -166,6 +166,7 @@ cpdef LogGuard init_logging(
     str file_name=*,
     str file_format=*,
     dict component_levels=*,
+    bint log_components_only=*,
     bint colors=*,
     bint bypass=*,
     bint print_config=*,

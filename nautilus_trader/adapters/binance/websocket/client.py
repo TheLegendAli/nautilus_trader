@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,6 +17,7 @@ import asyncio
 from collections.abc import Awaitable
 from collections.abc import Callable
 from typing import Any
+from weakref import WeakSet
 
 import msgspec
 
@@ -27,6 +28,7 @@ from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClient
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
 from nautilus_trader.core.nautilus_pyo3 import WebSocketConfig
+from nautilus_trader.live.cancellation import cancel_tasks_with_timeout
 
 
 class BinanceWebSocketClient:
@@ -73,6 +75,7 @@ class BinanceWebSocketClient:
         self._handler: Callable[[bytes], None] = handler
         self._handler_reconnect: Callable[..., Awaitable[None]] | None = handler_reconnect
         self._loop = loop
+        self._tasks: WeakSet[asyncio.Task] = WeakSet()
 
         self._streams: list[str] = []
         self._clients: dict[int, WebSocketClient | None] = {}  # Client ID -> WebSocket client
@@ -201,7 +204,7 @@ class BinanceWebSocketClient:
         ----------
         client_id : int
             ID of the client to connect
-        streams : List[str]
+        streams : list[str]
             List of streams for this client
 
         """
@@ -221,14 +224,15 @@ class BinanceWebSocketClient:
 
         config = WebSocketConfig(
             url=ws_url,
-            handler=self._handler,
-            heartbeat=60,
             headers=[],
-            ping_handler=lambda raw: self._handle_ping(client_id, raw),
+            heartbeat=60,
         )
 
         self._clients[client_id] = await WebSocketClient.connect(
+            loop_=self._loop,
             config=config,
+            handler=self._handler,
+            ping_handler=lambda raw: self._handle_ping(client_id, raw),
             post_reconnection=lambda: self._handle_reconnect(client_id),
         )
         self._is_connecting[client_id] = False
@@ -244,7 +248,8 @@ class BinanceWebSocketClient:
             )
 
     def _handle_ping(self, client_id: int, raw: bytes) -> None:
-        self._loop.create_task(self.send_pong(client_id, raw))
+        task = self._loop.create_task(self.send_pong(client_id, raw))
+        self._tasks.add(task)
 
     async def send_pong(self, client_id: int, raw: bytes) -> None:
         """
@@ -271,10 +276,12 @@ class BinanceWebSocketClient:
 
         # Re-subscribe to all streams for this client
         streams = self._client_streams[client_id]
-        self._loop.create_task(self._resubscribe_client(client_id, streams))
+        task = self._loop.create_task(self._resubscribe_client(client_id, streams))
+        self._tasks.add(task)
 
         if self._handler_reconnect:
-            self._loop.create_task(self._handler_reconnect())  # type: ignore
+            task = self._loop.create_task(self._handler_reconnect())  # type: ignore
+            self._tasks.add(task)
 
     async def _resubscribe_client(self, client_id: int, streams: list[str]) -> None:
         """
@@ -291,6 +298,8 @@ class BinanceWebSocketClient:
         """
         Disconnect all clients from the server.
         """
+        await cancel_tasks_with_timeout(self._tasks, self._log)
+
         tasks = []
         for client_id in list(self._clients.keys()):
             tasks.append(self._disconnect_client(client_id))
@@ -307,6 +316,11 @@ class BinanceWebSocketClient:
         if client is None:
             return
 
+        # Check Rust-level state to make this idempotent
+        if client.is_disconnecting() or client.is_closed():
+            self._log.debug(f"ws-client {client_id}: Already disconnecting/closed, skipping")
+            return
+
         self._log.debug(f"ws-client {client_id}: Disconnecting...")
         try:
             await client.disconnect()
@@ -315,18 +329,6 @@ class BinanceWebSocketClient:
 
         self._clients[client_id] = None  # Dispose (will go out of scope)
         self._log.debug(f"ws-client {client_id}: Disconnected from {self._base_url}")
-
-    async def subscribe_listen_key(self, listen_key: str) -> None:
-        """
-        Subscribe to user data stream.
-        """
-        await self._subscribe(listen_key)
-
-    async def unsubscribe_listen_key(self, listen_key: str) -> None:
-        """
-        Unsubscribe from user data stream.
-        """
-        await self._unsubscribe(listen_key)
 
     async def subscribe_agg_trades(self, symbol: str) -> None:
         """
@@ -646,9 +648,8 @@ class BinanceWebSocketClient:
         self._streams.remove(stream)
 
         # Remove from client's streams list
-        if client_id in self._client_streams:
-            if stream in self._client_streams[client_id]:
-                self._client_streams[client_id].remove(stream)
+        if client_id in self._client_streams and stream in self._client_streams[client_id]:
+            self._client_streams[client_id].remove(stream)
 
         # Send unsubscribe message
         msg = self._create_unsubscribe_msg(streams=[stream])

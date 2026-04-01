@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,6 +17,7 @@ import copy
 import sys
 from typing import Any
 
+import pyarrow as pa
 import pytest
 
 from nautilus_trader.common.component import TestClock
@@ -24,9 +25,11 @@ from nautilus_trader.common.factories import OrderFactory
 from nautilus_trader.common.messages import ComponentStateChanged
 from nautilus_trader.common.messages import ShutdownSystem
 from nautilus_trader.common.messages import TradingStateChanged
+from nautilus_trader.core.data import Data
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.currencies import USDT
+from nautilus_trader.model.custom import customdataclass
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.enums import AccountType
@@ -58,6 +61,7 @@ from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import ComponentId
 from nautilus_trader.model.identifiers import ExecAlgorithmId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import OrderListId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
@@ -73,6 +77,7 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.position import Position
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+from nautilus_trader.serialization.arrow.serializer import make_dict_serializer
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -87,20 +92,10 @@ ETHUSDT_BINANCE = TestInstrumentProvider.ethusdt_binance()
 CATALOG_PATH = TESTS_PACKAGE_ROOT / "unit_tests" / "persistence" / "catalog"
 
 
-def _reset(catalog: ParquetDataCatalog) -> None:
-    """
-    Cleanup resources before each test run.
-    """
-    assert catalog.path.endswith("tests/unit_tests/persistence/catalog")
-    if catalog.fs.exists(catalog.path):
-        catalog.fs.rm(catalog.path, recursive=True)
-    catalog.fs.mkdir(catalog.path)
-    assert catalog.fs.exists(catalog.path)
-
-
 @pytest.mark.skipif(sys.platform == "win32", reason="Failing on windows")
 class TestArrowSerializer:
-    def setup(self):
+    @pytest.fixture(autouse=True)
+    def setup_method(self, tmp_path):
         # Fixture Setup
         self.trader_id = TestIdStubs.trader_id()
         self.strategy_id = TestIdStubs.strategy_id()
@@ -109,8 +104,7 @@ class TestArrowSerializer:
 
         self.serializer = ArrowSerializer
 
-        self.catalog = ParquetDataCatalog(path=str(CATALOG_PATH), fs_protocol="file")
-        _reset(self.catalog)
+        self.catalog = ParquetDataCatalog(path=str(tmp_path / "catalog"), fs_protocol="file")
         self.order_factory = OrderFactory(
             trader_id=TraderId("T-001"),
             strategy_id=StrategyId("S-001"),
@@ -518,6 +512,40 @@ class TestArrowSerializer:
                 ),
             ],
             margins=[],
+            info={},
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=1_000_000_000,
+        )
+
+        # Act
+        serialized = self.serializer.serialize(event)
+        deserialized = self.serializer.deserialize(AccountState, serialized)
+
+        # Assert
+        assert deserialized == [event]
+
+    def test_serialize_and_deserialize_account_state_with_margin_none_instrument_id(self):
+        # Arrange
+        event = AccountState(
+            account_id=AccountId("BINANCE-001"),
+            account_type=AccountType.MARGIN,
+            base_currency=None,
+            reported=True,
+            balances=[
+                AccountBalance(
+                    Money(10000, USDT),
+                    Money(100, USDT),
+                    Money(9900, USDT),
+                ),
+            ],
+            margins=[
+                MarginBalance(
+                    Money(500, USDT),
+                    Money(250, USDT),
+                    instrument_id=None,
+                ),
+            ],
             info={},
             event_id=UUID4(),
             ts_event=0,
@@ -1049,6 +1077,38 @@ class TestArrowSerializer:
         # Assert
         assert deserialized == [event]
 
+    def test_serialize_and_deserialize_order_filled_with_price_in_info(self):
+        # Arrange (Issue #3515)
+        event = OrderFilled(
+            self.trader_id,
+            self.strategy_id,
+            AUDUSD_SIM.id,
+            ClientOrderId("O-123456"),
+            VenueOrderId("1"),
+            self.account_id,
+            TradeId("E123456"),
+            PositionId("T123456"),
+            OrderSide.SELL,
+            OrderType.MARKET,
+            Quantity(100_000, precision=0),
+            Price(1.00000, precision=5),
+            AUDUSD_SIM.quote_currency,
+            Money(0, USD),
+            LiquiditySide.TAKER,
+            UUID4(),
+            0,
+            0,
+            info={"avg_px": Price.from_str("1.00050")},
+        )
+
+        # Act
+        serialized = self.serializer.serialize(event)
+        deserialized = self.serializer.deserialize(OrderFilled, batch=serialized)
+
+        # Assert
+        assert len(deserialized) == 1
+        assert deserialized[0].info == {"avg_px": "1.00050"}
+
     @pytest.mark.parametrize(
         "position_func",
         [
@@ -1101,6 +1161,11 @@ class TestArrowSerializer:
             TestInstrumentProvider.aapl_option(),
             TestInstrumentProvider.betting_instrument(),
             TestInstrumentProvider.binary_option(),
+            TestInstrumentProvider.crypto_option(),
+            TestInstrumentProvider.futures_spread(),
+            TestInstrumentProvider.option_spread(),
+            TestInstrumentProvider.commodity(),
+            TestInstrumentProvider.index_instrument(),
         ],
     )
     def test_serialize_and_deserialize_instruments(self, instrument):
@@ -1121,3 +1186,36 @@ class TestArrowSerializer:
             assert self._test_serialization(obj)
         except NotImplementedError as e:
             print(e)
+
+    def test_make_dict_serializer_with_instance_method_to_dict(self):
+        # Arrange
+        @customdataclass
+        class _InstanceMethodData(Data):
+            instrument_id: InstrumentId
+            value: float
+
+        schema = pa.schema(
+            [
+                pa.field("instrument_id", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("type", pa.string()),
+                pa.field("ts_event", pa.uint64()),
+                pa.field("ts_init", pa.uint64()),
+            ],
+        )
+        encoder = make_dict_serializer(schema)
+        obj = _InstanceMethodData(
+            instrument_id=InstrumentId.from_str("TEST.VENUE"),
+            value=1.5,
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Act
+        batch = encoder([obj])
+
+        # Assert
+        assert isinstance(batch, pa.RecordBatch)
+        assert batch.num_rows == 1
+        assert batch.column("value")[0].as_py() == 1.5
+        assert batch.column("instrument_id")[0].as_py() == "TEST.VENUE"

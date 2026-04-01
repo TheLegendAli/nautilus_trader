@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -20,30 +20,14 @@ use alloy_primitives::U256;
 use crate::types::{Currency, Money};
 
 impl Money {
-    /// Creates a new [`Money`] instance from raw WEI value with 18-decimal precision.
+    /// Creates a new [`Money`] instance from raw wei value with 18-decimal precision.
     ///
     /// This method is specifically designed for DeFi applications where values are
-    /// represented in WEI (the smallest unit of Ether, 1 ETH = 10^18 WEI).
+    /// represented in wei (the smallest unit of Ether, 1 ETH = 10^18 wei).
     ///
     /// # Panics
     ///
-    /// Panics if the raw WEI value exceeds 128-bit range.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use nautilus_model::types::{Money, Currency};
-    /// use nautilus_model::enums::CurrencyType;
-    /// use alloy_primitives::U256;
-    /// use rust_decimal_macros::dec;
-    ///
-    /// # #[cfg(feature = "defi")]
-    /// # {
-    /// let eth = Currency::new("ETH", 18, 0, "Ethereum", CurrencyType::Crypto);
-    /// let money = Money::from_wei(U256::from(1_000_000_000_000_000_000_u64), eth); // 1 ETH
-    /// assert_eq!(money.as_decimal(), dec!(1.0));
-    /// # }
-    /// ```
+    /// Panics if the raw wei value exceeds 128-bit range.
     pub fn from_wei<U>(raw_wei: U, currency: Currency) -> Self
     where
         U: Into<U256>,
@@ -51,54 +35,35 @@ impl Money {
         let raw_u256: U256 = raw_wei.into();
         let raw_u128: u128 = raw_u256
             .try_into()
-            .expect("raw WEI value exceeds 128-bit range");
+            .expect("raw wei value exceeds 128-bit range");
 
         assert!(
             raw_u128 <= i128::MAX as u128,
-            "raw WEI value exceeds signed 128-bit range"
+            "raw wei value exceeds signed 128-bit range"
         );
 
         let raw_i128: i128 = raw_u128 as i128;
         Self::from_raw(raw_i128, currency)
     }
 
-    /// Converts this [`Money`] instance to raw WEI value.
+    /// Converts this [`Money`] instance to raw wei value.
     ///
     /// Only valid for prices with precision 18. For other precisions convert to precision 18 first.
     ///
     /// # Returns
     ///
-    /// The raw WEI value as a U256.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use nautilus_model::types::{Money, Currency};
-    /// use nautilus_model::enums::CurrencyType;
-    /// use alloy_primitives::U256;
-    ///
-    /// # #[cfg(feature = "defi")]
-    /// # {
-    /// let eth = Currency::new("ETH", 18, 0, "Ethereum", CurrencyType::Crypto);
-    /// // Construct via raw WEI to ensure correct 18-dec precision.
-    /// let money = Money::from_wei(U256::from(1_000_000_000_000_000_000_u64), eth); // 1 ETH
-    /// let wei_value = money.to_wei();
-    /// assert_eq!(wei_value, U256::from(1_000_000_000_000_000_000_u64));
-    /// # }
-    /// ```
+    /// The raw wei value as a U256.
     pub fn to_wei(&self) -> U256 {
         U256::from(self.raw as u128)
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::enums::CurrencyType;
@@ -110,7 +75,7 @@ mod tests {
         let money = Money::from_wei(one_eth_wei, eth);
 
         // Use decimal comparison for high precision values
-        assert_eq!(money.as_decimal(), Decimal::from(1));
+        assert_eq!(money.as_decimal(), dec!(1));
         assert_eq!(money.currency.precision, 18);
     }
 
@@ -121,7 +86,7 @@ mod tests {
         let money = Money::from_wei(small_wei, eth);
 
         // Use decimal comparison for high precision values
-        assert_eq!(money.as_decimal(), Decimal::new(1, 6)); // 0.000001
+        assert_eq!(money.as_decimal(), dec!(0.000001)); // 0.000001
     }
 
     #[rstest]
@@ -165,7 +130,7 @@ mod tests {
     // The largest `u128` value does not fit into an *signed* 128-bit integer and therefore must
     // trigger a safety panic.
     #[rstest]
-    #[should_panic(expected = "raw WEI value exceeds signed 128-bit range")]
+    #[should_panic(expected = "raw wei value exceeds signed 128-bit range")]
     fn test_from_wei_maximum_u128() {
         let eth = Currency::new("ETH", 18, 0, "Ethereum", CurrencyType::Crypto);
         let max_wei = U256::from(u128::MAX);
@@ -173,7 +138,7 @@ mod tests {
     }
 
     #[rstest]
-    #[should_panic(expected = "raw WEI value exceeds 128-bit range")]
+    #[should_panic(expected = "raw wei value exceeds 128-bit range")]
     fn test_from_wei_overflow() {
         let eth = Currency::new("ETH", 18, 0, "Ethereum", CurrencyType::Crypto);
         let overflow_wei = U256::from(u128::MAX) + U256::from(1u64);
@@ -201,11 +166,11 @@ mod tests {
         let money2 = Money::from_wei(U256::from(500_000_000_000_000_000_u64), eth); // 0.5 ETH
 
         let sum = money1 + money2;
-        assert_eq!(sum.as_decimal(), Decimal::new(15, 1)); // 1.5
+        assert_eq!(sum.as_decimal(), dec!(1.5)); // 1.5
         assert_eq!(sum.to_wei(), U256::from(1_500_000_000_000_000_000_u64));
 
         let diff = money1 - money2;
-        assert_eq!(diff.as_decimal(), Decimal::new(5, 1)); // 0.5
+        assert_eq!(diff.as_decimal(), dec!(0.5)); // 0.5
         assert_eq!(diff.to_wei(), U256::from(500_000_000_000_000_000_u64));
     }
 

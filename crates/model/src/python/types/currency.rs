@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,19 +15,17 @@
 
 use std::str::FromStr;
 
-use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyruntime_err, to_pyvalue_err};
-use pyo3::{
-    IntoPyObjectExt,
-    prelude::*,
-    pyclass::CompareOp,
-    types::{PyInt, PyString, PyTuple},
-};
-use ustr::Ustr;
+use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
+use pyo3::{IntoPyObjectExt, prelude::*};
 
 use crate::{enums::CurrencyType, types::Currency};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Currency {
+    /// Represents a medium of exchange in a specified denomination with a fixed decimal precision.
+    ///
+    /// Handles up to `FIXED_PRECISION` decimals of precision.
     #[new]
     fn py_new(
         code: &str,
@@ -39,67 +37,29 @@ impl Currency {
         Self::new_checked(code, precision, iso4217, name, currency_type).map_err(to_pyvalue_err)
     }
 
-    fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
-        self.code = Ustr::from(
-            py_tuple
-                .get_item(0)?
-                .downcast::<PyString>()?
-                .extract::<&str>()?,
-        );
-        self.precision = py_tuple.get_item(1)?.downcast::<PyInt>()?.extract::<u8>()?;
-        self.iso4217 = py_tuple
-            .get_item(2)?
-            .downcast::<PyInt>()?
-            .extract::<u16>()?;
-        self.name = Ustr::from(
-            py_tuple
-                .get_item(3)?
-                .downcast::<PyString>()?
-                .extract::<&str>()?,
-        );
-        self.currency_type = CurrencyType::from_str(
-            py_tuple
-                .get_item(4)?
-                .downcast::<PyString>()?
-                .extract::<&str>()?,
-        )
-        .map_err(to_pyvalue_err)?;
-        Ok(())
-    }
-
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
-        (
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let unpickle = py.get_type::<Self>().getattr("_unpickle")?;
+        let args = (
             self.code.to_string(),
             self.precision,
             self.iso4217,
             self.name.to_string(),
             self.currency_type.to_string(),
         )
-            .into_py_any(py)
-    }
-
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
-        let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
-        let state = self.__getstate__(py)?;
-        (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
+            .into_py_any(py)?;
+        (unpickle, args).into_py_any(py)
     }
 
     #[staticmethod]
-    fn _safe_constructor() -> PyResult<Self> {
-        Ok(Self::AUD()) // Safe default
-    }
-
-    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
-        match op {
-            CompareOp::Eq => self.eq(other).into_py_any_unwrap(py),
-            CompareOp::Ne => self.ne(other).into_py_any_unwrap(py),
-            _ => py.NotImplemented(),
-        }
-    }
-
-    fn __hash__(&self) -> isize {
-        self.code.precomputed_hash() as isize
+    fn _unpickle(
+        code: &str,
+        precision: u8,
+        iso4217: u16,
+        name: &str,
+        currency_type_str: &str,
+    ) -> PyResult<Self> {
+        let currency_type = CurrencyType::from_str(currency_type_str).map_err(to_pyvalue_err)?;
+        Self::new_checked(code, precision, iso4217, name, currency_type).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -140,12 +100,26 @@ impl Currency {
         self.currency_type
     }
 
+    /// Checks if the currency identified by the given `code` is a fiat currency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A currency with the given `code` does not exist.
+    /// - There is a failure acquiring the lock on the currency map.
     #[staticmethod]
     #[pyo3(name = "is_fiat")]
     fn py_is_fiat(code: &str) -> PyResult<bool> {
         Self::is_fiat(code).map_err(to_pyvalue_err)
     }
 
+    /// Checks if the currency identified by the given `code` is a cryptocurrency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - If a currency with the given `code` does not exist.
+    /// - If there is a failure acquiring the lock on the currency map.
     #[staticmethod]
     #[pyo3(name = "is_crypto")]
     fn py_is_crypto(code: &str) -> PyResult<bool> {
@@ -175,6 +149,14 @@ impl Currency {
         }
     }
 
+    /// Register the given `currency` in the internal currency map.
+    ///
+    /// - If `overwrite` is `true`, any existing currency will be replaced.
+    /// - If `overwrite` is `false` and the currency already exists, the operation is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a failure acquiring the lock on the currency map.
     #[staticmethod]
     #[pyo3(name = "register")]
     #[pyo3(signature = (currency, overwrite = false))]

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,37 +17,51 @@ use std::{
     any::Any,
     cell::{RefCell, UnsafeCell},
     num::NonZeroUsize,
-    ops::{Deref, DerefMut},
     rc::Rc,
     str::FromStr,
     sync::Arc,
 };
 
 use bytes::Bytes;
+use indexmap::IndexMap;
 use log::LevelFilter;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
-        Bar, BarType, BookOrder, DataType, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick, close::InstrumentClose, stubs::*,
+        Bar, BarType, BookOrder, CustomData, DataType, FundingRateUpdate, HasTsInit,
+        IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
+        QuoteTick, TradeTick,
+        close::InstrumentClose,
+        custom::CustomDataTrait,
+        greeks::OptionGreekValues,
+        option_chain::{OptionChainSlice, OptionGreeks, StrikeRange},
+        stubs::*,
     },
     enums::{BookAction, BookType, OrderSide},
-    identifiers::{ClientId, TraderId, Venue},
-    instruments::{CurrencyPair, InstrumentAny, stubs::*},
+    identifiers::{ClientId, InstrumentId, OptionSeriesId, TraderId, Venue},
+    instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::*},
     orderbook::OrderBook,
+    stubs::TestDefault,
     types::{Price, Quantity},
 };
 use rstest::*;
+use rust_decimal_macros::dec;
+use serde::Serialize;
 use ustr::Ustr;
 #[cfg(feature = "defi")]
 use {
-    alloy_primitives::Address,
-    nautilus_model::defi::{Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap},
+    alloy_primitives::{Address, I256, U160},
+    nautilus_model::defi::{
+        Block, Blockchain, Dex, DexType, Pool, PoolIdentifier, PoolLiquidityUpdate, PoolSwap,
+        Token, chain::chains, dex::AmmType,
+    },
 };
 
 use super::{Actor, DataActor, DataActorCore, data_actor::DataActorConfig};
 #[cfg(feature = "defi")]
-use crate::msgbus::switchboard::{get_defi_blocks_topic, get_defi_pool_swaps_topic};
+use crate::defi::switchboard::{
+    get_defi_blocks_topic, get_defi_pool_swaps_topic, get_defi_pool_topic,
+};
 use crate::{
     actor::registry::{get_actor, get_actor_unchecked, register_actor},
     cache::Cache,
@@ -55,22 +69,71 @@ use crate::{
     component::Component,
     logging::{logger::LogGuard, logging_is_initialized},
     messages::data::{
-        BarsResponse, BookResponse, CustomDataResponse, InstrumentResponse, InstrumentsResponse,
-        QuotesResponse, TradesResponse,
+        BarsResponse, BookResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
+        InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
     },
     msgbus::{
         self, MessageBus, get_message_bus,
         switchboard::{
             MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_snapshots_topic,
-            get_custom_topic, get_index_price_topic, get_instrument_close_topic,
-            get_instrument_status_topic, get_instrument_topic, get_instruments_topic,
-            get_mark_price_topic, get_quotes_topic, get_trades_topic,
+            get_custom_topic, get_funding_rate_topic, get_index_price_topic,
+            get_instrument_close_topic, get_instrument_status_topic, get_instrument_topic,
+            get_mark_price_topic, get_option_chain_topic, get_option_greeks_topic,
+            get_quotes_topic, get_trades_topic,
         },
     },
+    nautilus_actor,
     runner::{SyncDataCommandSender, set_data_cmd_sender},
     testing::init_logger_for_testing,
     timer::TimeEvent,
 };
+
+/// Minimal custom data type for actor tests.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct TestActorCustomData {
+    label: String,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl HasTsInit for TestActorCustomData {
+    fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+}
+
+impl CustomDataTrait for TestActorCustomData {
+    fn type_name(&self) -> &'static str {
+        "TestActorCustomData"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+    fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+    fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+        Arc::new(self.clone())
+    }
+    fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<Self>() {
+            self == other
+        } else {
+            false
+        }
+    }
+}
+
+pub(crate) fn make_test_custom_data(label: &str) -> CustomData {
+    CustomData::from_arc(Arc::new(TestActorCustomData {
+        label: label.to_string(),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    }))
+}
 
 #[derive(Debug)]
 struct TestDataActor {
@@ -85,8 +148,11 @@ struct TestDataActor {
     pub received_bars: Vec<Bar>,
     pub received_mark_prices: Vec<MarkPriceUpdate>,
     pub received_index_prices: Vec<IndexPriceUpdate>,
+    pub received_funding_rates: Vec<FundingRateUpdate>,
     pub received_status: Vec<InstrumentStatus>,
     pub received_closes: Vec<InstrumentClose>,
+    pub received_greeks: Vec<OptionGreeks>,
+    pub received_chain_slices: Vec<OptionChainSlice>,
     #[cfg(feature = "defi")]
     pub received_blocks: Vec<Block>,
     #[cfg(feature = "defi")]
@@ -97,19 +163,7 @@ struct TestDataActor {
     pub received_pool_liquidity_updates: Vec<PoolLiquidityUpdate>,
 }
 
-impl Deref for TestDataActor {
-    type Target = DataActorCore;
-
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-
-impl DerefMut for TestDataActor {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
-    }
-}
+nautilus_actor!(TestDataActor);
 
 impl DataActor for TestDataActor {
     fn on_start(&mut self) -> anyhow::Result<()> {
@@ -127,8 +181,8 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
-    fn on_data(&mut self, data: &dyn Any) -> anyhow::Result<()> {
-        self.received_data.push(format!("{data:?}"));
+    fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
+        self.received_data.push(data.data_type.to_string());
         Ok(())
     }
 
@@ -169,6 +223,14 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
+    fn on_historical_funding_rates(
+        &mut self,
+        funding_rates: &[FundingRateUpdate],
+    ) -> anyhow::Result<()> {
+        self.received_funding_rates.extend(funding_rates);
+        Ok(())
+    }
+
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
         // Push to common received vec
         self.received_bars.extend(bars);
@@ -190,6 +252,11 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
+    fn on_funding_rate(&mut self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
+        self.received_funding_rates.push(*funding_rate);
+        Ok(())
+    }
+
     fn on_instrument_status(&mut self, status: &InstrumentStatus) -> anyhow::Result<()> {
         self.received_status.push(*status);
         Ok(())
@@ -197,6 +264,16 @@ impl DataActor for TestDataActor {
 
     fn on_instrument_close(&mut self, close: &InstrumentClose) -> anyhow::Result<()> {
         self.received_closes.push(*close);
+        Ok(())
+    }
+
+    fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
+        self.received_greeks.push(*greeks);
+        Ok(())
+    }
+
+    fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
+        self.received_chain_slices.push(slice.clone());
         Ok(())
     }
 
@@ -240,8 +317,11 @@ impl TestDataActor {
             received_bars: Vec::new(),
             received_mark_prices: Vec::new(),
             received_index_prices: Vec::new(),
+            received_funding_rates: Vec::new(),
             received_status: Vec::new(),
             received_closes: Vec::new(),
+            received_greeks: Vec::new(),
+            received_chain_slices: Vec::new(),
             #[cfg(feature = "defi")]
             received_blocks: Vec::new(),
             #[cfg(feature = "defi")]
@@ -253,8 +333,8 @@ impl TestDataActor {
         }
     }
 
-    #[allow(dead_code)] // TODO: Under development
-    pub fn custom_function(&mut self) {}
+    #[allow(dead_code)]
+    pub fn custom_function(&self) {}
 }
 
 #[fixture]
@@ -274,7 +354,7 @@ fn switchboard() -> Arc<MessagingSwitchboard> {
 
 #[fixture]
 fn trader_id() -> TraderId {
-    TraderId::from("TRADER-000")
+    TraderId::test_default()
 }
 
 #[fixture]
@@ -295,7 +375,7 @@ struct DummyActor {
 }
 impl DummyActor {
     fn new<S: AsRef<str>>(s: S) -> Self {
-        DummyActor {
+        Self {
             id_str: Ustr::from_str(s.as_ref()).unwrap(),
             count: 0,
         }
@@ -317,8 +397,7 @@ fn register_data_actor(
     trader_id: TraderId,
 ) -> Ustr {
     // Set up sync data command sender for tests
-    let sender = SyncDataCommandSender;
-    set_data_cmd_sender(Arc::new(sender));
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
 
     let config = DataActorConfig::default();
     // Ensure clean message bus state for this actor's subscriptions
@@ -362,7 +441,7 @@ fn test_get_nonexistent() {
 fn test_get_actor_unchecked_panic() {
     let id = Ustr::from_str("unknown").unwrap();
     // Should panic due to missing actor
-    let _: &mut DummyActor = get_actor_unchecked(&id);
+    let _guard = get_actor_unchecked::<DummyActor>(&id);
 }
 
 #[rstest]
@@ -370,11 +449,15 @@ fn test_get_actor_unchecked_mutate() {
     let name = "mutant";
     let _rc = register_dummy(name);
     let id = Ustr::from_str(name).unwrap();
-    // Mutate via unchecked
-    let actor_ref: &mut DummyActor = get_actor_unchecked(&id);
-    actor_ref.count = 42;
-    // Read back via unchecked again
-    let actor_ref2: &mut DummyActor = get_actor_unchecked(&id);
+
+    // Mutate via unchecked - must scope the borrow
+    {
+        let mut actor_ref = get_actor_unchecked::<DummyActor>(&id);
+        actor_ref.count = 42;
+    } // Guard dropped here, releasing borrow
+
+    // Read back via unchecked again (now allowed since previous borrow dropped)
+    let actor_ref2 = get_actor_unchecked::<DummyActor>(&id);
     assert_eq!(actor_ref2.count, 42);
 }
 
@@ -385,17 +468,17 @@ fn test_subscribe_and_receive_custom_data(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let data_type = DataType::new(stringify!(String), None);
+    let data_type = DataType::new(TestActorCustomData::type_name_static(), None, None);
     actor.subscribe_data(data_type.clone(), None, None);
 
     let topic = get_custom_topic(&data_type);
-    let data = String::from("CustomData-01");
-    msgbus::publish(topic, &data);
-    let data = String::from("CustomData-02");
-    msgbus::publish(topic, &data);
+    let data = make_test_custom_data("CustomData-01");
+    msgbus::publish_any(topic, &data);
+    let data = make_test_custom_data("CustomData-02");
+    msgbus::publish_any(topic, &data);
 
     assert_eq!(actor.received_data.len(), 2);
 }
@@ -407,25 +490,25 @@ fn test_unsubscribe_custom_data(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let data_type = DataType::new(stringify!(String), None);
+    let data_type = DataType::new(TestActorCustomData::type_name_static(), None, None);
     actor.subscribe_data(data_type.clone(), None, None);
 
     let topic = get_custom_topic(&data_type);
-    let data = String::from("CustomData-01");
-    msgbus::publish(topic, &data);
-    let data = String::from("CustomData-02");
-    msgbus::publish(topic, &data);
+    let data = make_test_custom_data("CustomData-01");
+    msgbus::publish_any(topic, &data);
+    let data = make_test_custom_data("CustomData-02");
+    msgbus::publish_any(topic, &data);
 
     actor.unsubscribe_data(data_type, None, None);
 
     // Publish more data
-    let data = String::from("CustomData-03");
-    msgbus::publish(topic, &data);
-    let data = String::from("CustomData-04");
-    msgbus::publish(topic, &data);
+    let data = make_test_custom_data("CustomData-03");
+    msgbus::publish_any(topic, &data);
+    let data = make_test_custom_data("CustomData-04");
+    msgbus::publish_any(topic, &data);
 
     // Actor should not receive new data
     assert_eq!(actor.received_data.len(), 2);
@@ -439,7 +522,7 @@ fn test_subscribe_and_receive_book_deltas(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_book_deltas(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
@@ -463,7 +546,7 @@ fn test_subscribe_and_receive_book_deltas(
     );
     let deltas = OrderBookDeltas::new(audusd_sim.id, vec![delta]);
 
-    msgbus::publish(topic, &deltas);
+    msgbus::publish_deltas(topic, &deltas);
 
     assert_eq!(actor.received_deltas.len(), 1);
 }
@@ -476,7 +559,7 @@ fn test_unsubscribe_book_deltas(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_book_deltas(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
@@ -500,7 +583,7 @@ fn test_unsubscribe_book_deltas(
     );
     let deltas = OrderBookDeltas::new(audusd_sim.id, vec![delta]);
 
-    msgbus::publish(topic, &deltas);
+    msgbus::publish_deltas(topic, &deltas);
 
     // Unsubscribe
     actor.unsubscribe_book_deltas(audusd_sim.id, None, None);
@@ -517,7 +600,7 @@ fn test_unsubscribe_book_deltas(
     let deltas2 = OrderBookDeltas::new(audusd_sim.id, vec![delta2]);
 
     // Publish again
-    msgbus::publish(topic, &deltas2);
+    msgbus::publish_deltas(topic, &deltas2);
 
     // Should still only have one delta
     assert_eq!(actor.received_deltas.len(), 1);
@@ -531,7 +614,7 @@ fn test_subscribe_and_receive_book_at_interval(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let book_type = BookType::L2_MBP;
@@ -539,10 +622,10 @@ fn test_subscribe_and_receive_book_at_interval(
 
     actor.subscribe_book_at_interval(audusd_sim.id, book_type, None, interval_ms, None, None);
 
-    let topic = get_book_snapshots_topic(audusd_sim.id);
+    let topic = get_book_snapshots_topic(audusd_sim.id, interval_ms);
     let book = OrderBook::new(audusd_sim.id, book_type);
 
-    msgbus::publish(topic, &book);
+    msgbus::publish_book(topic, &book);
 
     assert_eq!(actor.received_books.len(), 1);
 }
@@ -555,7 +638,7 @@ fn test_unsubscribe_book_at_interval(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let book_type = BookType::L2_MBP;
@@ -563,18 +646,18 @@ fn test_unsubscribe_book_at_interval(
 
     actor.subscribe_book_at_interval(audusd_sim.id, book_type, None, interval_ms, None, None);
 
-    let topic = get_book_snapshots_topic(audusd_sim.id);
+    let topic = get_book_snapshots_topic(audusd_sim.id, interval_ms);
     let book = OrderBook::new(audusd_sim.id, book_type);
 
-    msgbus::publish(topic, &book);
+    msgbus::publish_book(topic, &book);
 
     assert_eq!(actor.received_books.len(), 1);
 
     actor.unsubscribe_book_at_interval(audusd_sim.id, interval_ms, None, None);
 
     // Publish more book refs
-    msgbus::publish(topic, &book);
-    msgbus::publish(topic, &book);
+    msgbus::publish_book(topic, &book);
+    msgbus::publish_book(topic, &book);
 
     // Should still only have one book
     assert_eq!(actor.received_books.len(), 1);
@@ -588,15 +671,15 @@ fn test_subscribe_and_receive_quotes(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_quotes(audusd_sim.id, None, None);
 
     let topic = get_quotes_topic(audusd_sim.id);
     let quote = QuoteTick::default();
-    msgbus::publish(topic, &quote);
-    msgbus::publish(topic, &quote);
+    msgbus::publish_quote(topic, &quote);
+    msgbus::publish_quote(topic, &quote);
 
     assert_eq!(actor.received_quotes.len(), 2);
 }
@@ -609,21 +692,21 @@ fn test_unsubscribe_quotes(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_quotes(audusd_sim.id, None, None);
 
     let topic = get_quotes_topic(audusd_sim.id);
     let quote = QuoteTick::default();
-    msgbus::publish(topic, &quote);
-    msgbus::publish(topic, &quote);
+    msgbus::publish_quote(topic, &quote);
+    msgbus::publish_quote(topic, &quote);
 
     actor.unsubscribe_quotes(audusd_sim.id, None, None);
 
     // Publish more quotes
-    msgbus::publish(topic, &quote);
-    msgbus::publish(topic, &quote);
+    msgbus::publish_quote(topic, &quote);
+    msgbus::publish_quote(topic, &quote);
 
     // Actor should not receive new quotes
     assert_eq!(actor.received_quotes.len(), 2);
@@ -637,15 +720,15 @@ fn test_subscribe_and_receive_trades(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_trades(audusd_sim.id, None, None);
 
     let topic = get_trades_topic(audusd_sim.id);
     let trade = TradeTick::default();
-    msgbus::publish(topic, &trade);
-    msgbus::publish(topic, &trade);
+    msgbus::publish_trade(topic, &trade);
+    msgbus::publish_trade(topic, &trade);
 
     assert_eq!(actor.received_trades.len(), 2);
 }
@@ -658,21 +741,21 @@ fn test_unsubscribe_trades(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_trades(audusd_sim.id, None, None);
 
     let topic = get_trades_topic(audusd_sim.id);
     let trade = TradeTick::default();
-    msgbus::publish(topic, &trade);
-    msgbus::publish(topic, &trade);
+    msgbus::publish_trade(topic, &trade);
+    msgbus::publish_trade(topic, &trade);
 
     actor.unsubscribe_trades(audusd_sim.id, None, None);
 
     // Publish more trades
-    msgbus::publish(topic, &trade);
-    msgbus::publish(topic, &trade);
+    msgbus::publish_trade(topic, &trade);
+    msgbus::publish_trade(topic, &trade);
 
     // Actor should not receive new trades
     assert_eq!(actor.received_trades.len(), 2);
@@ -686,15 +769,15 @@ fn test_subscribe_and_receive_bars(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
-    actor.subscribe_bars(bar_type, None, false, None);
+    actor.subscribe_bars(bar_type, None, None);
 
     let topic = get_bars_topic(bar_type);
     let bar = Bar::default();
-    msgbus::publish(topic, &bar);
+    msgbus::publish_bar(topic, &bar);
 
     assert_eq!(actor.received_bars.len(), 1);
 }
@@ -707,22 +790,22 @@ fn test_unsubscribe_bars(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
-    actor.subscribe_bars(bar_type, None, false, None);
+    actor.subscribe_bars(bar_type, None, None);
 
     let topic = get_bars_topic(bar_type);
     let bar = Bar::default();
-    msgbus::publish(topic, &bar);
+    msgbus::publish_bar(topic, &bar);
 
     // Unsubscribe
     actor.unsubscribe_bars(bar_type, None, None);
 
     // Publish more bars
-    msgbus::publish(topic, &bar);
-    msgbus::publish(topic, &bar);
+    msgbus::publish_bar(topic, &bar);
+    msgbus::publish_bar(topic, &bar);
 
     // Should still only have one bar
     assert_eq!(actor.received_bars.len(), 1);
@@ -736,7 +819,7 @@ fn test_request_instrument(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let request_id = actor
@@ -744,13 +827,22 @@ fn test_request_instrument(
         .unwrap();
 
     let client_id = ClientId::new("TestClient");
-    let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+    let instrument = InstrumentAny::CurrencyPair(audusd_sim.clone());
     let data = instrument.clone();
     let ts_init = UnixNanos::default();
-    let response =
-        InstrumentResponse::new(request_id, client_id, audusd_sim.id, data, ts_init, None);
+    let response = InstrumentResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        data,
+        Some(UnixNanos::from(946_684_800_000_000_000)), // 2000-01-01
+        Some(UnixNanos::from(946_771_200_000_000_000)), // 2000-01-02
+        ts_init,
+        None,
+    );
 
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Instrument(Box::new(response));
+    msgbus::send_response(&request_id, &data_response);
 
     assert_eq!(actor.received_instruments.len(), 1);
     assert_eq!(actor.received_instruments[0], instrument);
@@ -765,10 +857,10 @@ fn test_request_instruments(
     gbpusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let venue = Venue::from("SIM");
+    let venue = Venue::test_default();
     let request_id = actor
         .request_instruments(Some(venue), None, None, None, None)
         .unwrap();
@@ -778,9 +870,19 @@ fn test_request_instruments(
     let instrument2 = InstrumentAny::CurrencyPair(gbpusd_sim);
     let data = vec![instrument1.clone(), instrument2.clone()];
     let ts_init = UnixNanos::default();
-    let response = InstrumentsResponse::new(request_id, client_id, venue, data, ts_init, None);
+    let response = InstrumentsResponse::new(
+        request_id,
+        client_id,
+        venue,
+        data,
+        Some(UnixNanos::from(946_684_800_000_000_000)), // 2000-01-01
+        Some(UnixNanos::from(946_771_200_000_000_000)), // 2000-01-02
+        ts_init,
+        None,
+    );
 
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Instruments(response);
+    msgbus::send_response(&request_id, &data_response);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], instrument1);
@@ -795,7 +897,7 @@ fn test_request_quotes(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let request_id = actor
@@ -806,9 +908,19 @@ fn test_request_quotes(
     let quote = QuoteTick::default();
     let data = vec![quote];
     let ts_init = UnixNanos::default();
-    let response = QuotesResponse::new(request_id, client_id, audusd_sim.id, data, ts_init, None);
+    let response = QuotesResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        data,
+        Some(UnixNanos::from(1_690_000_000_000_000_000)),
+        Some(UnixNanos::from(1_700_000_000_000_000_000)),
+        ts_init,
+        None,
+    );
 
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Quotes(response);
+    msgbus::send_response(&request_id, &data_response);
 
     assert_eq!(actor.received_quotes.len(), 1);
     assert_eq!(actor.received_quotes[0], quote);
@@ -822,7 +934,7 @@ fn test_request_trades(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let request_id = actor
@@ -833,12 +945,66 @@ fn test_request_trades(
     let trade = TradeTick::default();
     let data = vec![trade];
     let ts_init = UnixNanos::default();
-    let response = TradesResponse::new(request_id, client_id, audusd_sim.id, data, ts_init, None);
+    let response = TradesResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        data,
+        Some(UnixNanos::from(1_695_000_000_000_000_000)),
+        Some(UnixNanos::from(1_699_000_000_000_000_000)),
+        ts_init,
+        None,
+    );
 
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Trades(response);
+    msgbus::send_response(&request_id, &data_response);
 
     assert_eq!(actor.received_trades.len(), 1);
     assert_eq!(actor.received_trades[0], trade);
+}
+
+#[rstest]
+fn test_request_funding_rates(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let request_id = actor
+        .request_funding_rates(audusd_sim.id, None, None, None, None, None)
+        .unwrap();
+
+    let client_id = ClientId::new("TestClient");
+    let funding_rate = FundingRateUpdate::new(
+        audusd_sim.id,
+        dec!(0.0001),
+        None,
+        None,
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    let data = vec![funding_rate];
+    let ts_init = UnixNanos::default();
+    let response = FundingRatesResponse::new(
+        request_id,
+        client_id,
+        audusd_sim.id,
+        data,
+        Some(UnixNanos::from(1_695_000_000_000_000_000)),
+        Some(UnixNanos::from(1_699_000_000_000_000_000)),
+        ts_init,
+        None,
+    );
+
+    let data_response = DataResponse::FundingRates(response);
+    msgbus::send_response(&request_id, &data_response);
+
+    assert_eq!(actor.received_funding_rates.len(), 1);
+    assert_eq!(actor.received_funding_rates[0], funding_rate);
 }
 
 #[rstest]
@@ -849,7 +1015,7 @@ fn test_request_bars(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
@@ -862,9 +1028,19 @@ fn test_request_bars(
     let bar = Bar::default();
     let data = vec![bar];
     let ts_init = UnixNanos::default();
-    let response = BarsResponse::new(request_id, client_id, bar_type, data, ts_init, None);
+    let response = BarsResponse::new(
+        request_id,
+        client_id,
+        bar_type,
+        data,
+        Some(UnixNanos::from(1_700_000_000_000_000_000)),
+        Some(UnixNanos::from(1_705_000_000_000_000_000)),
+        ts_init,
+        None,
+    );
 
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Bars(response);
+    msgbus::send_response(&request_id, &data_response);
 
     assert_eq!(actor.received_bars.len(), 1);
     assert_eq!(actor.received_bars[0], bar);
@@ -879,17 +1055,18 @@ fn test_subscribe_and_receive_instruments(
     gbpusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let venue = Venue::from("SIM");
+    let venue = Venue::test_default();
     actor.subscribe_instruments(venue, None, None);
 
-    let topic = get_instruments_topic(venue);
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish(topic, &inst1);
+    let topic1 = get_instrument_topic(inst1.id());
+    msgbus::publish_any(topic1, &inst1);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish(topic, &inst2);
+    let topic2 = get_instrument_topic(inst2.id());
+    msgbus::publish_any(topic2, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], inst1);
@@ -905,7 +1082,7 @@ fn test_subscribe_and_receive_instrument(
     gbpusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_instrument(audusd_sim.id, None, None);
@@ -913,8 +1090,8 @@ fn test_subscribe_and_receive_instrument(
     let topic = get_instrument_topic(audusd_sim.id);
     let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
     let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish(topic, &inst1);
-    msgbus::publish(topic, &inst2);
+    msgbus::publish_any(topic, &inst1);
+    msgbus::publish_any(topic, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
     assert_eq!(actor.received_instruments[0], inst1);
@@ -929,7 +1106,7 @@ fn test_subscribe_and_receive_mark_prices(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_mark_prices(audusd_sim.id, None, None);
@@ -941,14 +1118,14 @@ fn test_subscribe_and_receive_mark_prices(
         UnixNanos::from(1),
         UnixNanos::from(2),
     );
-    msgbus::publish(topic, &mp1);
+    msgbus::publish_mark_price(topic, &mp1);
     let mp2 = MarkPriceUpdate::new(
         audusd_sim.id,
         Price::from("1.00010"),
         UnixNanos::from(3),
         UnixNanos::from(4),
     );
-    msgbus::publish(topic, &mp2);
+    msgbus::publish_mark_price(topic, &mp2);
 
     assert_eq!(actor.received_mark_prices.len(), 2);
     assert_eq!(actor.received_mark_prices[0], mp1);
@@ -963,7 +1140,7 @@ fn test_subscribe_and_receive_index_prices(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_index_prices(audusd_sim.id, None, None);
@@ -975,10 +1152,48 @@ fn test_subscribe_and_receive_index_prices(
         UnixNanos::from(1),
         UnixNanos::from(2),
     );
-    msgbus::publish(topic, &ip);
+    msgbus::publish_index_price(topic, &ip);
 
     assert_eq!(actor.received_index_prices.len(), 1);
     assert_eq!(actor.received_index_prices[0], ip);
+}
+
+#[rstest]
+fn test_subscribe_and_receive_funding_rates(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    actor.subscribe_funding_rates(audusd_sim.id, None, None);
+
+    let topic = get_funding_rate_topic(audusd_sim.id);
+    let fr1 = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0001".parse().unwrap(),
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+    );
+    msgbus::publish_funding_rate(topic, &fr1);
+    let fr2 = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0002".parse().unwrap(),
+        None,
+        None,
+        UnixNanos::from(3),
+        UnixNanos::from(4),
+    );
+    msgbus::publish_funding_rate(topic, &fr2);
+
+    assert_eq!(actor.received_funding_rates.len(), 2);
+    assert_eq!(actor.received_funding_rates[0], fr1);
+    assert_eq!(actor.received_funding_rates[1], fr2);
 }
 
 #[rstest]
@@ -989,14 +1204,14 @@ fn test_subscribe_and_receive_instrument_status(
     stub_instrument_status: InstrumentStatus,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let instrument_id = stub_instrument_status.instrument_id;
     actor.subscribe_instrument_status(instrument_id, None, None);
 
     let topic = get_instrument_status_topic(instrument_id);
-    msgbus::publish(topic, &stub_instrument_status);
+    msgbus::publish_any(topic, &stub_instrument_status);
 
     assert_eq!(actor.received_status.len(), 1);
     assert_eq!(actor.received_status[0], stub_instrument_status);
@@ -1010,17 +1225,93 @@ fn test_subscribe_and_receive_instrument_close(
     stub_instrument_close: InstrumentClose,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let instrument_id = stub_instrument_close.instrument_id;
     actor.subscribe_instrument_close(instrument_id, None, None);
 
     let topic = get_instrument_close_topic(instrument_id);
-    msgbus::publish(topic, &stub_instrument_close);
+    msgbus::publish_any(topic, &stub_instrument_close);
 
     assert_eq!(actor.received_closes.len(), 1);
     assert_eq!(actor.received_closes[0], stub_instrument_close);
+}
+
+#[rstest]
+fn test_subscribe_and_receive_option_greeks(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let instrument_id = InstrumentId::from("AAPL-20250321-200C.OPRA");
+    actor.subscribe_option_greeks(instrument_id, None, None);
+
+    let greeks = OptionGreeks {
+        instrument_id,
+        greeks: OptionGreekValues {
+            delta: 0.55,
+            gamma: 0.03,
+            vega: 0.12,
+            theta: -0.05,
+            rho: 0.01,
+        },
+        mark_iv: Some(0.25),
+        bid_iv: Some(0.24),
+        ask_iv: Some(0.26),
+        underlying_price: Some(195.0),
+        open_interest: Some(1000.0),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+
+    let topic = get_option_greeks_topic(instrument_id);
+    msgbus::publish_option_greeks(topic, &greeks);
+
+    assert_eq!(actor.received_greeks.len(), 1);
+    assert_eq!(actor.received_greeks[0], greeks);
+}
+
+#[rstest]
+fn test_subscribe_and_receive_option_chain(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let series_id = OptionSeriesId::new(
+        Venue::from("OPRA"),
+        Ustr::from("AAPL"),
+        Ustr::from("USD"),
+        UnixNanos::from(1_711_036_800_000_000_000),
+    );
+    let strike_range = StrikeRange::AtmRelative {
+        strikes_above: 5,
+        strikes_below: 5,
+    };
+    actor.subscribe_option_chain(series_id, strike_range, None, None);
+
+    let slice = OptionChainSlice {
+        series_id,
+        atm_strike: Some(Price::from("200.00")),
+        calls: Default::default(),
+        puts: Default::default(),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+
+    let topic = get_option_chain_topic(series_id);
+    msgbus::publish_option_chain(topic, &slice);
+
+    assert_eq!(actor.received_chain_slices.len(), 1);
+    assert_eq!(actor.received_chain_slices[0].series_id, series_id);
 }
 
 #[rstest]
@@ -1032,26 +1323,27 @@ fn test_unsubscribe_instruments(
     gbpusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let venue = Venue::from("SIM");
+    let venue = Venue::test_default();
     actor.subscribe_instruments(venue, None, None);
 
-    let topic = get_instruments_topic(venue);
-    let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish(topic, &inst1);
-    let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish(topic, &inst2);
+    let inst1 = InstrumentAny::CurrencyPair(audusd_sim.clone());
+    let topic1 = get_instrument_topic(inst1.id());
+    msgbus::publish_any(topic1, &inst1);
+    let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
+    let topic2 = get_instrument_topic(inst2.id());
+    msgbus::publish_any(topic2, &inst2);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
     actor.unsubscribe_instruments(venue, None, None);
 
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish(topic, &inst3);
+    msgbus::publish_any(topic1, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish(topic, &inst4);
+    msgbus::publish_any(topic2, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 }
@@ -1065,25 +1357,24 @@ fn test_unsubscribe_instrument(
     gbpusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-
     actor.subscribe_instrument(audusd_sim.id, None, None);
 
     let topic = get_instrument_topic(audusd_sim.id);
-    let inst1 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish(topic, &inst1);
-    let inst2 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish(topic, &inst2);
+    let inst3 = InstrumentAny::CurrencyPair(audusd_sim.clone());
+    msgbus::publish_any(topic, &inst3);
+    let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim.clone());
+    msgbus::publish_any(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 
     actor.unsubscribe_instrument(audusd_sim.id, None, None);
 
     let inst3 = InstrumentAny::CurrencyPair(audusd_sim);
-    msgbus::publish(topic, &inst3);
+    msgbus::publish_any(topic, &inst3);
     let inst4 = InstrumentAny::CurrencyPair(gbpusd_sim);
-    msgbus::publish(topic, &inst4);
+    msgbus::publish_any(topic, &inst4);
 
     assert_eq!(actor.received_instruments.len(), 2);
 }
@@ -1096,7 +1387,7 @@ fn test_unsubscribe_mark_prices(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_mark_prices(audusd_sim.id, None, None);
@@ -1108,14 +1399,14 @@ fn test_unsubscribe_mark_prices(
         UnixNanos::from(1),
         UnixNanos::from(2),
     );
-    msgbus::publish(topic, &mp1);
+    msgbus::publish_mark_price(topic, &mp1);
     let mp2 = MarkPriceUpdate::new(
         audusd_sim.id,
         Price::from("1.00010"),
         UnixNanos::from(3),
         UnixNanos::from(4),
     );
-    msgbus::publish(topic, &mp2);
+    msgbus::publish_mark_price(topic, &mp2);
 
     assert_eq!(actor.received_mark_prices.len(), 2);
 
@@ -1127,14 +1418,14 @@ fn test_unsubscribe_mark_prices(
         UnixNanos::from(5),
         UnixNanos::from(6),
     );
-    msgbus::publish(topic, &mp3);
+    msgbus::publish_mark_price(topic, &mp3);
     let mp4 = MarkPriceUpdate::new(
         audusd_sim.id,
         Price::from("1.00030"),
         UnixNanos::from(7),
         UnixNanos::from(8),
     );
-    msgbus::publish(topic, &mp4);
+    msgbus::publish_mark_price(topic, &mp4);
 
     assert_eq!(actor.received_mark_prices.len(), 2);
 }
@@ -1147,7 +1438,7 @@ fn test_unsubscribe_index_prices(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     actor.subscribe_index_prices(audusd_sim.id, None, None);
@@ -1159,7 +1450,7 @@ fn test_unsubscribe_index_prices(
         UnixNanos::from(1),
         UnixNanos::from(2),
     );
-    msgbus::publish(topic, &ip1);
+    msgbus::publish_index_price(topic, &ip1);
 
     assert_eq!(actor.received_index_prices.len(), 1);
 
@@ -1171,9 +1462,50 @@ fn test_unsubscribe_index_prices(
         UnixNanos::from(3),
         UnixNanos::from(4),
     );
-    msgbus::publish(topic, &ip2);
+    msgbus::publish_index_price(topic, &ip2);
 
     assert_eq!(actor.received_index_prices.len(), 1);
+}
+
+#[rstest]
+fn test_unsubscribe_funding_rates(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    actor.subscribe_funding_rates(audusd_sim.id, None, None);
+
+    let topic = get_funding_rate_topic(audusd_sim.id);
+    let fr1 = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0001".parse().unwrap(),
+        None,
+        None,
+        UnixNanos::from(1),
+        UnixNanos::from(2),
+    );
+    msgbus::publish_funding_rate(topic, &fr1);
+
+    assert_eq!(actor.received_funding_rates.len(), 1);
+
+    actor.unsubscribe_funding_rates(audusd_sim.id, None, None);
+
+    let fr2 = FundingRateUpdate::new(
+        audusd_sim.id,
+        "0.0002".parse().unwrap(),
+        None,
+        None,
+        UnixNanos::from(3),
+        UnixNanos::from(4),
+    );
+    msgbus::publish_funding_rate(topic, &fr2);
+
+    assert_eq!(actor.received_funding_rates.len(), 1);
 }
 
 #[rstest]
@@ -1184,21 +1516,21 @@ fn test_unsubscribe_instrument_status(
     stub_instrument_status: InstrumentStatus,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let instrument_id = stub_instrument_status.instrument_id;
     actor.subscribe_instrument_status(instrument_id, None, None);
 
     let topic = get_instrument_status_topic(instrument_id);
-    msgbus::publish(topic, &stub_instrument_status);
+    msgbus::publish_any(topic, &stub_instrument_status);
 
     assert_eq!(actor.received_status.len(), 1);
 
     actor.unsubscribe_instrument_status(instrument_id, None, None);
 
     let stub2 = stub_instrument_status;
-    msgbus::publish(topic, &stub2);
+    msgbus::publish_any(topic, &stub2);
 
     assert_eq!(actor.received_status.len(), 1);
 }
@@ -1211,23 +1543,109 @@ fn test_unsubscribe_instrument_close(
     stub_instrument_close: InstrumentClose,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let instrument_id = stub_instrument_close.instrument_id;
     actor.subscribe_instrument_close(instrument_id, None, None);
 
     let topic = get_instrument_close_topic(instrument_id);
-    msgbus::publish(topic, &stub_instrument_close);
+    msgbus::publish_any(topic, &stub_instrument_close);
 
     assert_eq!(actor.received_closes.len(), 1);
 
     actor.unsubscribe_instrument_close(instrument_id, None, None);
 
     let stub2 = stub_instrument_close;
-    msgbus::publish(topic, &stub2);
+    msgbus::publish_any(topic, &stub2);
 
     assert_eq!(actor.received_closes.len(), 1);
+}
+
+#[rstest]
+fn test_unsubscribe_option_greeks(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let instrument_id = InstrumentId::from("AAPL-20250321-200C.OPRA");
+    actor.subscribe_option_greeks(instrument_id, None, None);
+
+    let greeks = OptionGreeks {
+        instrument_id,
+        greeks: OptionGreekValues {
+            delta: 0.55,
+            gamma: 0.03,
+            vega: 0.12,
+            theta: -0.05,
+            rho: 0.01,
+        },
+        mark_iv: Some(0.25),
+        bid_iv: None,
+        ask_iv: None,
+        underlying_price: None,
+        open_interest: None,
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+
+    let topic = get_option_greeks_topic(instrument_id);
+    msgbus::publish_option_greeks(topic, &greeks);
+
+    assert_eq!(actor.received_greeks.len(), 1);
+
+    actor.unsubscribe_option_greeks(instrument_id, None, None);
+
+    msgbus::publish_option_greeks(topic, &greeks);
+
+    assert_eq!(actor.received_greeks.len(), 1);
+}
+
+#[rstest]
+fn test_unsubscribe_option_chain(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let series_id = OptionSeriesId::new(
+        Venue::from("OPRA"),
+        Ustr::from("AAPL"),
+        Ustr::from("USD"),
+        UnixNanos::from(1_711_036_800_000_000_000),
+    );
+    let strike_range = StrikeRange::AtmRelative {
+        strikes_above: 5,
+        strikes_below: 5,
+    };
+    actor.subscribe_option_chain(series_id, strike_range, None, None);
+
+    let slice = OptionChainSlice {
+        series_id,
+        atm_strike: None,
+        calls: Default::default(),
+        puts: Default::default(),
+        ts_event: UnixNanos::default(),
+        ts_init: UnixNanos::default(),
+    };
+
+    let topic = get_option_chain_topic(series_id);
+    msgbus::publish_option_chain(topic, &slice);
+
+    assert_eq!(actor.received_chain_slices.len(), 1);
+
+    actor.unsubscribe_option_chain(series_id, None);
+
+    msgbus::publish_option_chain(topic, &slice);
+
+    assert_eq!(actor.received_chain_slices.len(), 1);
 }
 
 #[rstest]
@@ -1238,7 +1656,7 @@ fn test_request_book_snapshot(
     audusd_sim: CurrencyPair,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     // Request a book snapshot
@@ -1257,10 +1675,13 @@ fn test_request_book_snapshot(
         client_id,
         audusd_sim.id,
         book.clone(),
+        Some(UnixNanos::from(946_684_800_000_000_000)), // 2000-01-01
+        Some(UnixNanos::from(946_771_200_000_000_000)), // 2000-01-02
         ts_init,
         None,
     );
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Book(response);
+    msgbus::send_response(&request_id, &data_response);
 
     // Should trigger on_book and record the book
     assert_eq!(actor.received_books.len(), 1);
@@ -1276,11 +1697,11 @@ fn test_request_data(
     test_logging();
 
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     // Request custom data
-    let data_type = DataType::new("TestData", None);
+    let data_type = DataType::new("TestData", None, None);
     let client_id = ClientId::new("TestClient");
     let request_id = actor
         .request_data(data_type.clone(), client_id, None, None, None, None)
@@ -1292,20 +1713,25 @@ fn test_request_data(
 
     // Create response with payload type String
     let response = CustomDataResponse::new(
-        request_id, client_id, None, data_type, payload, ts_init, None,
+        request_id,
+        client_id,
+        None,
+        data_type,
+        payload,
+        Some(UnixNanos::from(946_684_800_000_000_000)), // 2000-01-01
+        Some(UnixNanos::from(946_771_200_000_000_000)), // 2000-01-02
+        ts_init,
+        None,
     );
 
     // Publish the response
-    msgbus::response(&request_id, response.as_any());
+    let data_response = DataResponse::Data(response);
+    msgbus::send_response(&request_id, &data_response);
 
     // Actor should receive the custom data
     assert_eq!(actor.received_data.len(), 1);
     assert_eq!(actor.received_data[0], "Any { .. }");
 }
-
-// ------------------------------------------------------------------------------------------------
-// DeFi Tests
-// ------------------------------------------------------------------------------------------------
 
 #[cfg(feature = "defi")]
 #[rstest]
@@ -1315,7 +1741,7 @@ fn test_subscribe_and_receive_blocks(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let blockchain = Blockchain::Ethereum;
@@ -1332,7 +1758,7 @@ fn test_subscribe_and_receive_blocks(
         UnixNanos::from(1),
         Some(blockchain),
     );
-    msgbus::publish(topic, &block);
+    msgbus::publish_defi_block(topic, &block);
 
     assert_eq!(actor.received_blocks.len(), 1);
     assert_eq!(actor.received_blocks[0], block);
@@ -1346,7 +1772,7 @@ fn test_unsubscribe_blocks(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
     let blockchain = Blockchain::Ethereum;
@@ -1363,7 +1789,7 @@ fn test_unsubscribe_blocks(
         UnixNanos::from(1),
         Some(blockchain),
     );
-    msgbus::publish(topic, &block1);
+    msgbus::publish_defi_block(topic, &block1);
 
     // Unsubscribe
     actor.unsubscribe_blocks(blockchain, None, None);
@@ -1378,7 +1804,7 @@ fn test_unsubscribe_blocks(
         UnixNanos::from(2),
         Some(blockchain),
     );
-    msgbus::publish(topic, &block2);
+    msgbus::publish_defi_block(topic, &block2);
 
     // Should still only have one block
     assert_eq!(actor.received_blocks.len(), 1);
@@ -1393,23 +1819,21 @@ fn test_subscribe_and_receive_pools(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-
-    use nautilus_model::defi::{Dex, Pool, Token, chain::chains, dex::AmmType};
-
-    use crate::msgbus::switchboard::get_defi_pool_topic;
 
     let chain = Arc::new(chains::ETHEREUM.clone());
     let dex = Dex::new(
         chains::ETHEREUM.clone(),
-        "Uniswap V3",
+        DexType::UniswapV3,
         "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        0,
         AmmType::CLAMM,
         "PoolCreated",
         "Swap",
         "Mint",
         "Burn",
+        "Collect",
     );
     let token0 = Token::new(
         chain.clone(),
@@ -1425,15 +1849,17 @@ fn test_subscribe_and_receive_pools(
         "WETH".to_string(),
         18,
     );
+    let pool_address = Address::from([0x12; 20]);
     let pool = Pool::new(
-        chain.clone(),
-        dex,
-        Address::from([0x12; 20]),
+        chain,
+        Arc::new(dex),
+        pool_address,
+        PoolIdentifier::from_address(pool_address),
         1000000,
         token0,
         token1,
-        3000,
-        60,
+        Some(3000),
+        Some(60),
         UnixNanos::from(1),
     );
 
@@ -1442,7 +1868,7 @@ fn test_subscribe_and_receive_pools(
 
     let topic = get_defi_pool_topic(instrument_id);
 
-    msgbus::publish(topic, &pool);
+    msgbus::publish_defi_pool(topic, &pool);
 
     assert_eq!(actor.received_pools.len(), 1);
     assert_eq!(actor.received_pools[0], pool);
@@ -1456,50 +1882,51 @@ fn test_subscribe_and_receive_pool_swaps(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-
-    use nautilus_model::{
-        defi::{AmmType, Dex, chain::chains},
-        identifiers::InstrumentId,
-    };
 
     let chain = Arc::new(chains::ETHEREUM.clone());
     let dex = Dex::new(
         chains::ETHEREUM.clone(),
-        "Uniswap V3",
+        DexType::UniswapV3,
         "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        0,
         AmmType::CLAMM,
         "PoolCreated",
         "Swap",
         "Mint",
         "Burn",
+        "Collect",
     );
 
     let pool_address = Address::from_str("0xC31E54c7A869B9fCbECC14363CF510d1C41Fa443").unwrap();
-    let instrument_id = InstrumentId::from("WETH/USDC-30.UniswapV3:Ethereum");
+    let instrument_id =
+        InstrumentId::from("0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443.Arbitrum:UniswapV3");
 
     let swap = PoolSwap::new(
-        chain.clone(),
+        chain,
         Arc::new(dex),
         instrument_id,
-        pool_address,
+        PoolIdentifier::from_address(pool_address),
         1000u64,
         "0x123".to_string(),
         0,
         0,
-        UnixNanos::from(1),
+        None,
         Address::from([0x12; 20]),
-        OrderSide::Buy,
-        Quantity::from("1000"),
-        Price::from("500"),
+        Address::from([0x12; 20]),
+        I256::from_str("1000000000000000000").unwrap(),
+        I256::from_str("400000000000000").unwrap(),
+        U160::from(59000000000000u128),
+        1000000,
+        100,
     );
 
     actor.subscribe_pool_swaps(instrument_id, None, None);
 
     let topic = get_defi_pool_swaps_topic(instrument_id);
 
-    msgbus::publish(topic, &swap);
+    msgbus::publish_defi_swap(topic, &swap);
 
     assert_eq!(actor.received_pool_swaps.len(), 1);
     assert_eq!(actor.received_pool_swaps[0], swap);
@@ -1513,38 +1940,25 @@ fn test_unsubscribe_pool_swaps(
     trader_id: TraderId,
 ) {
     let actor_id = register_data_actor(clock, cache, trader_id);
-    let actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-
-    use nautilus_model::defi::{Dex, Pool, Token, chain::chains, dex::AmmType};
 
     let chain = Arc::new(chains::ETHEREUM.clone());
     let dex = Dex::new(
         chains::ETHEREUM.clone(),
-        "Uniswap V3",
+        DexType::UniswapV3,
         "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        0,
         AmmType::CLAMM,
         "PoolCreated",
         "Swap",
         "Mint",
         "Burn",
-    );
-    let token0 = Token::new(
-        chain.clone(),
-        Address::from([0x11; 20]),
-        "WETH".to_string(),
-        "WETH".to_string(),
-        18,
-    );
-    let token1 = Token::new(
-        chain.clone(),
-        Address::from([0x22; 20]),
-        "USDC".to_string(),
-        "USDC".to_string(),
-        6,
+        "Collect",
     );
     let pool_address = Address::from_str("0xC31E54c7A869B9fCbECC14363CF510d1C41Fa443").unwrap();
-    let instrument_id = Pool::create_instrument_id(chain.name, &dex, &token0, &token1, 50);
+    let pool_identifier = pool_address.to_string();
+    let instrument_id = Pool::create_instrument_id(chain.name, &dex, &pool_identifier);
 
     actor.subscribe_pool_swaps(instrument_id, None, None);
 
@@ -1554,40 +1968,343 @@ fn test_unsubscribe_pool_swaps(
         chain.clone(),
         Arc::new(dex.clone()),
         instrument_id,
-        pool_address,
+        PoolIdentifier::from_address(pool_address),
         1000u64,
         "0x123".to_string(),
         0,
         0,
-        UnixNanos::from(1),
+        None,
         Address::from([0x12; 20]),
-        OrderSide::Buy,
-        Quantity::from("1000"),
-        Price::from("500"),
+        Address::from([0x12; 20]),
+        I256::from_str("1000000000000000000").unwrap(),
+        I256::from_str("400000000000000").unwrap(),
+        U160::from(59000000000000u128),
+        1000000,
+        100,
     );
-    msgbus::publish(topic, &swap1);
+    msgbus::publish_defi_swap(topic, &swap1);
 
     // Unsubscribe
     actor.unsubscribe_pool_swaps(instrument_id, None, None);
 
     let swap2 = PoolSwap::new(
-        chain.clone(),
+        chain,
         Arc::new(dex),
         instrument_id,
-        pool_address,
+        PoolIdentifier::from_address(pool_address),
         2000u64,
         "0x456".to_string(),
         0,
         0,
-        UnixNanos::from(2),
+        None,
         Address::from([0x12; 20]),
-        OrderSide::Sell,
-        Quantity::from("2000"),
-        Price::from("1000"),
+        Address::from([0x12; 20]),
+        I256::from_str("1000000000000000000").unwrap(),
+        I256::from_str("400000000000000").unwrap(),
+        U160::from(59000000000000u128),
+        1000000,
+        100,
     );
-    msgbus::publish(topic, &swap2);
+    msgbus::publish_defi_swap(topic, &swap2);
 
     // Should still only have one swap
     assert_eq!(actor.received_pool_swaps.len(), 1);
     assert_eq!(actor.received_pool_swaps[0], swap1);
+}
+
+#[rstest]
+fn test_duplicate_subscribe_custom_data(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    // Register actor
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    // Subscribe twice to the same DataType
+    let data_type = DataType::new(TestActorCustomData::type_name_static(), None, None);
+    actor.subscribe_data(data_type.clone(), None, None);
+    actor.subscribe_data(data_type.clone(), None, None);
+
+    // Publish a single message
+    let topic = get_custom_topic(&data_type);
+    let payload = make_test_custom_data("Custom-XYZ");
+    msgbus::publish_any(topic, &payload);
+
+    // Only a single handler should be active despite duplicate subscribe attempt
+    assert_eq!(actor.received_data.len(), 1);
+}
+
+#[rstest]
+fn test_unsubscribe_before_subscribe_custom_data(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let data_type = DataType::new(TestActorCustomData::type_name_static(), None, None);
+
+    // Unsubscribe without prior subscription: should not panic and no data received
+    actor.unsubscribe_data(data_type.clone(), None, None);
+
+    let topic = get_custom_topic(&data_type);
+    let payload = make_test_custom_data("Custom-ABC");
+    msgbus::publish_any(topic, &payload);
+
+    assert!(actor.received_data.is_empty());
+}
+
+#[derive(Debug)]
+struct SaveLoadActor {
+    core: DataActorCore,
+    loaded_state: Option<IndexMap<String, Vec<u8>>>,
+}
+
+impl SaveLoadActor {
+    fn new(config: DataActorConfig) -> Self {
+        Self {
+            core: DataActorCore::new(config),
+            loaded_state: None,
+        }
+    }
+}
+
+nautilus_actor!(SaveLoadActor);
+
+impl DataActor for SaveLoadActor {
+    fn on_save(&self) -> anyhow::Result<IndexMap<String, Vec<u8>>> {
+        let mut map = IndexMap::new();
+        map.insert("answer".to_string(), vec![4, 2]);
+        Ok(map)
+    }
+
+    fn on_load(&mut self, state: IndexMap<String, Vec<u8>>) -> anyhow::Result<()> {
+        self.loaded_state = Some(state);
+        Ok(())
+    }
+}
+
+#[rstest]
+fn test_on_save_and_on_load(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let config = DataActorConfig::default();
+
+    // Prepare actor & register
+    let mut actor = SaveLoadActor::new(config);
+    actor.register(trader_id, clock, cache).unwrap();
+    let actor_id = actor.actor_id();
+    register_actor(actor);
+
+    // Fetch back to mutate
+    let actor_key = actor_id.inner();
+    let mut actor_ref = get_actor_unchecked::<SaveLoadActor>(&actor_key);
+
+    // Invoke on_save – emulate persistence snapshot
+    let snapshot = actor_ref.on_save().unwrap();
+    assert!(snapshot.contains_key("answer"));
+
+    // Invoke on_load with snapshot
+    actor_ref.on_load(snapshot.clone()).unwrap();
+
+    // Verify state stored
+    assert_eq!(actor_ref.loaded_state.as_ref(), Some(&snapshot));
+}
+
+#[rstest]
+fn test_data_actor_core_tracks_quote_handlers(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    assert_eq!(actor.quote_handler_count(), 0);
+
+    actor.subscribe_quotes(audusd_sim.id, None, None);
+
+    assert_eq!(actor.quote_handler_count(), 1);
+
+    let topic = get_quotes_topic(audusd_sim.id);
+    assert!(actor.has_quote_handler(topic.as_str()));
+}
+
+#[rstest]
+fn test_data_actor_core_removes_quote_handler_on_unsubscribe(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    actor.subscribe_quotes(audusd_sim.id, None, None);
+    assert_eq!(actor.quote_handler_count(), 1);
+
+    actor.unsubscribe_quotes(audusd_sim.id, None, None);
+    assert_eq!(actor.quote_handler_count(), 0);
+
+    let topic = get_quotes_topic(audusd_sim.id);
+    assert!(!actor.has_quote_handler(topic.as_str()));
+}
+
+#[rstest]
+fn test_data_actor_core_tracks_trade_handlers(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    assert_eq!(actor.trade_handler_count(), 0);
+
+    actor.subscribe_trades(audusd_sim.id, None, None);
+
+    assert_eq!(actor.trade_handler_count(), 1);
+
+    let topic = get_trades_topic(audusd_sim.id);
+    assert!(actor.has_trade_handler(topic.as_str()));
+}
+
+#[rstest]
+fn test_data_actor_core_removes_trade_handler_on_unsubscribe(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    actor.subscribe_trades(audusd_sim.id, None, None);
+    assert_eq!(actor.trade_handler_count(), 1);
+
+    actor.unsubscribe_trades(audusd_sim.id, None, None);
+    assert_eq!(actor.trade_handler_count(), 0);
+}
+
+#[rstest]
+fn test_data_actor_core_tracks_bar_handlers(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    assert_eq!(actor.bar_handler_count(), 0);
+
+    let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
+    actor.subscribe_bars(bar_type, None, None);
+
+    assert_eq!(actor.bar_handler_count(), 1);
+
+    let topic = get_bars_topic(bar_type);
+    assert!(actor.has_bar_handler(topic.as_str()));
+}
+
+#[rstest]
+fn test_data_actor_core_removes_bar_handler_on_unsubscribe(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
+    actor.subscribe_bars(bar_type, None, None);
+    assert_eq!(actor.bar_handler_count(), 1);
+
+    actor.unsubscribe_bars(bar_type, None, None);
+    assert_eq!(actor.bar_handler_count(), 0);
+}
+
+#[rstest]
+fn test_data_actor_core_tracks_deltas_handlers(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    assert_eq!(actor.deltas_handler_count(), 0);
+
+    actor.subscribe_book_deltas(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
+
+    assert_eq!(actor.deltas_handler_count(), 1);
+
+    let topic = get_book_deltas_topic(audusd_sim.id);
+    assert!(actor.has_deltas_handler(topic.as_str()));
+}
+
+#[rstest]
+fn test_data_actor_core_removes_deltas_handler_on_unsubscribe(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    actor.subscribe_book_deltas(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
+    assert_eq!(actor.deltas_handler_count(), 1);
+
+    actor.unsubscribe_book_deltas(audusd_sim.id, None, None);
+    assert_eq!(actor.deltas_handler_count(), 0);
+}
+
+#[rstest]
+fn test_data_actor_core_multiple_subscriptions_tracked(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+    gbpusd_sim: CurrencyPair,
+) {
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+
+    actor.subscribe_quotes(audusd_sim.id, None, None);
+    actor.subscribe_quotes(gbpusd_sim.id, None, None);
+    actor.subscribe_trades(audusd_sim.id, None, None);
+
+    assert_eq!(actor.quote_handler_count(), 2);
+    assert_eq!(actor.trade_handler_count(), 1);
+
+    actor.unsubscribe_quotes(audusd_sim.id, None, None);
+
+    assert_eq!(actor.quote_handler_count(), 1);
+    assert_eq!(actor.trade_handler_count(), 1);
+
+    let aud_topic = get_quotes_topic(audusd_sim.id);
+    let gbp_topic = get_quotes_topic(gbpusd_sim.id);
+    assert!(!actor.has_quote_handler(aud_topic.as_str()));
+    assert!(actor.has_quote_handler(gbp_topic.as_str()));
 }

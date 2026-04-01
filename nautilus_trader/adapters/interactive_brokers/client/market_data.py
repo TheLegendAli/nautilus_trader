@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2021 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -19,7 +19,8 @@ from collections import defaultdict
 from collections.abc import Callable
 from decimal import Decimal
 from inspect import iscoroutinefunction
-from typing import Any, ClassVar
+from typing import Any
+from typing import ClassVar
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -29,8 +30,8 @@ from ibapi.common import HistoricalTickLast
 from ibapi.common import MarketDataTypeEnum
 from ibapi.common import TickAttribBidAsk
 from ibapi.common import TickAttribLast
+from ibapi.ticktype import TickTypeEnum
 
-# fmt: off
 from nautilus_trader.adapters.interactive_brokers.client.common import BaseMixin
 from nautilus_trader.adapters.interactive_brokers.client.common import IBKRBookLevel
 from nautilus_trader.adapters.interactive_brokers.client.common import Subscription
@@ -41,11 +42,14 @@ from nautilus_trader.adapters.interactive_brokers.parsing.data import bar_spec_t
 from nautilus_trader.adapters.interactive_brokers.parsing.data import generate_trade_id
 from nautilus_trader.adapters.interactive_brokers.parsing.data import timedelta_to_duration_str
 from nautilus_trader.adapters.interactive_brokers.parsing.data import what_to_show
-from nautilus_trader.adapters.interactive_brokers.parsing.price_conversion import ib_price_to_nautilus_price
+from nautilus_trader.adapters.interactive_brokers.parsing.price_conversion import (
+    ib_price_to_nautilus_price,
+)
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import BookOrder
+from nautilus_trader.model.data import IndexPriceUpdate
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
 from nautilus_trader.model.data import QuoteTick
@@ -56,7 +60,11 @@ from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import InstrumentId
 
 
-# fmt: on
+# Used to invalidate abnormal tick sizes that can signal data issues
+MAX_VALID_TICK_SIZE = Decimal("1e12")
+
+# Subscription type identifier for index market data (reqMktData for indices)
+INDEX_MARKET_DATA = "index_market_data"
 
 
 class InteractiveBrokersClientMarketDataMixin(BaseMixin):
@@ -73,6 +81,10 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
     _order_book_depth: ClassVar[dict[int, int]] = {}  # reqId -> depth
     _order_books_initialized: ClassVar[dict[int, bool]] = {}  # reqId -> initialized
+
+    # Instance variables that will be available when mixed into InteractiveBrokersClient
+    _subscription_tick_data: dict[int, dict[int, Any]]
+    _subscription_start_times: dict[int, int]  # reqId -> start_ns (for bar filtering)
 
     _order_books: ClassVar[dict[int, dict[str, dict[int, IBKRBookLevel]]]] = {}
     """
@@ -140,6 +152,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
                 f"Creating and registering a new Subscription instance for {name}",
             )
             req_id = self._next_req_id()
+
             if subscription_method == self.subscribe_historical_bars:
                 handle_func = functools.partial(
                     subscription_method,
@@ -198,8 +211,10 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         """
         if subscription := self._subscriptions.get(name=name):
-            self._subscriptions.remove(subscription.req_id)
-            cancellation_method(subscription.req_id, *args, **kwargs)
+            req_id = subscription.req_id
+            self._subscriptions.remove(req_id)
+            self._subscription_tick_data.pop(req_id, None)
+            cancellation_method(req_id, *args, **kwargs)
             self._log.debug(f"Unsubscribed from {subscription}")
         else:
             self._log.debug(f"Subscription doesn't exist for {name}")
@@ -252,6 +267,98 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         """
         name = (str(instrument_id), tick_type)
         await self._unsubscribe(name, self._eclient.cancelTickByTickData)
+
+    async def subscribe_index_market_data(
+        self,
+        instrument_id: InstrumentId,
+        contract: IBContract,
+        generic_tick_list: str = "",
+    ) -> None:
+        """
+        Subscribe to index market data for a specified instrument using reqMktData. This
+        method is used for index contracts that don't support reqTickByTickData (^SPX.CBOE for example).
+        Note: Per Interactive Brokers some CME exchange indexes do support reqTickByTickData.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The identifier of the instrument for which to subscribe.
+        contract : IBContract
+            The contract details for the instrument.
+        generic_tick_list : str
+            A comma-separated list of generic tick types to request.
+
+        """
+        name = (str(instrument_id), INDEX_MARKET_DATA)
+        await self._subscribe(
+            name,
+            self._eclient.reqMktData,
+            self._eclient.cancelMktData,
+            contract,
+            generic_tick_list,
+            False,  # snapshot
+            False,  # regulatory_snapshot
+            [],  # mktDataOptions
+        )
+
+    async def unsubscribe_index_market_data(self, instrument_id: InstrumentId) -> None:
+        """
+        Unsubscribes from index market data for a specified instrument.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The identifier of the instrument for which to unsubscribe.
+
+        """
+        name = (str(instrument_id), INDEX_MARKET_DATA)
+        await self._unsubscribe(name, self._eclient.cancelMktData)
+
+    async def subscribe_market_data(
+        self,
+        instrument_id: InstrumentId,
+        contract: IBContract,
+        generic_tick_list: str = "",
+    ) -> None:
+        """
+        Subscribe to market data for a specified instrument using reqMktData. This
+        method is used for BAG (spread) contracts that don't support reqTickByTickData.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The identifier of the instrument for which to subscribe.
+        contract : IBContract
+            The contract details for the instrument.
+        generic_tick_list : str
+            A comma-separated list of generic tick types to request.
+            Empty string for basic bid/ask data.
+
+        """
+        name = (str(instrument_id), "market_data")
+        await self._subscribe(
+            name,
+            self._eclient.reqMktData,
+            self._eclient.cancelMktData,
+            contract,
+            generic_tick_list,
+            False,  # snapshot
+            False,  # regulatory_snapshot
+            [],  # mktDataOptions
+        )
+
+    async def unsubscribe_market_data(self, instrument_id: InstrumentId) -> None:
+        """
+        Unsubscribes from market data for a specified instrument.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The identifier of the instrument for which to unsubscribe.
+
+        """
+        name = (str(instrument_id), "market_data")
+        await self._unsubscribe(name, self._eclient.cancelMktData)
 
     async def subscribe_order_book(
         self,
@@ -367,6 +474,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         contract: IBContract,
         use_rth: bool,
         handle_revised_bars: bool,
+        params: dict,
     ) -> None:
         """
         Subscribe to historical bar data for a specified bar type and contract. It
@@ -382,9 +490,41 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
             Whether to use regular trading hours (RTH) only.
         handle_revised_bars : bool
             Whether to handle revised bars or not.
+        params : dict
+            A dictionary of optional parameters.
 
         """
         name = str(bar_type)
+
+        # Remove stale subscription so _subscribe() allocates a fresh req_id.
+        # After an IB gateway restart the old req_id is dead server-side;
+        # reusing it leaves the stream silent.
+        existing = self._subscriptions.get(name=name)
+        if existing is not None:
+            self._subscriptions.remove(req_id=existing.req_id)
+            self._subscription_start_times.pop(existing.req_id, None)
+
+        now = self._clock.timestamp_ns()
+        start = params.pop("start_ns", None)
+
+        # A minimum number of bars needs to be requested so bars start to be received
+        # We then consider only bars which ts_init is after start
+        if start is not None:
+            duration_str = timedelta_to_duration_str(
+                max(
+                    pd.Timedelta(now - start, "ns"),
+                    pd.Timedelta(bar_type.spec.timedelta.total_seconds() * 300, "sec"),
+                ),  # Download at least approx 300 bars
+            )
+        else:
+            start = now
+            duration_str = timedelta_to_duration_str(
+                pd.Timedelta(bar_type.spec.timedelta.total_seconds() * 300, "sec"),
+            )  # Download approx 300 bars
+
+        if "first_start_ns" not in params:
+            params["first_start_ns"] = start
+
         subscription = await self._subscribe(
             name,
             self.subscribe_historical_bars,
@@ -393,22 +533,25 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
             contract=contract,
             use_rth=use_rth,
             handle_revised_bars=handle_revised_bars,
+            params=params,
         )
 
-        # Check and download the gaps or approx 300 bars whichever is less
-        last_bar: Bar = self._cache.bar(bar_type)
+        # In order to get missed bars after a disconnection
+        if (
+            self._last_disconnection_ns is not None
+            and self._last_disconnection_ns > params["first_start_ns"]
+        ):
+            start = self._last_disconnection_ns
 
-        if last_bar is None:
-            duration = pd.Timedelta(bar_type.spec.timedelta.total_seconds() * 300, "sec")
-        else:
-            duration = pd.Timedelta(self._clock.timestamp_ns() - last_bar.ts_event, "ns")
+        # Store start time separately for bar filtering (not part of resubscription handle)
+        self._subscription_start_times[subscription.req_id] = start
 
         bar_size_setting: str = bar_spec_to_bar_size(bar_type.spec)
         self._eclient.reqHistoricalData(
             reqId=subscription.req_id,
             contract=contract,
             endDateTime="",
-            durationStr=timedelta_to_duration_str(duration),
+            durationStr=duration_str,
             barSizeSetting=bar_size_setting,
             whatToShow=what_to_show(bar_type),
             useRTH=use_rth,
@@ -428,6 +571,12 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         """
         name = str(bar_type)
+
+        # Clean up stored start time before unsubscribing
+        subscription = self._subscriptions.get(name=name)
+        if subscription:
+            self._subscription_start_times.pop(subscription.req_id, None)
+
         await self._unsubscribe(name, self._eclient.cancelHistoricalData)
 
     async def get_historical_bars(
@@ -450,8 +599,8 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
             The Interactive Brokers contract details for the instrument.
         use_rth : bool
             Whether to use regular trading hours (RTH) only for the data.
-        end_date_time : str
-            The end time for the historical data request, formatted "%Y%m%d-%H:%M:%S".
+        end_date_time : pd.Timestamp
+            The end time for the historical data request as a pandas Timestamp.
         duration : str
             The duration for which historical data is requested, formatted as a string.
         timeout : int, optional
@@ -468,11 +617,10 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         else:
             end_date_time = end_date_time.astimezone(ZoneInfo("UTC"))
 
-        end_date_time = (
+        end_date_time_str = (
             end_date_time.strftime("%Y%m%d %H:%M:%S %Z") if contract.secType != "CONTFUT" else ""
         )
-
-        name = (bar_type, end_date_time)
+        name = (str(bar_type), end_date_time_str)
 
         if not (request := self._requests.get(name=name)):
             req_id = self._next_req_id()
@@ -484,7 +632,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
                     self._eclient.reqHistoricalData,
                     reqId=req_id,
                     contract=contract,
-                    endDateTime=end_date_time,
+                    endDateTime=end_date_time_str,
                     durationStr=duration,
                     barSizeSetting=bar_size_setting,
                     whatToShow=what_to_show(bar_type),
@@ -504,8 +652,8 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
             return await self._await_request(request, timeout, default_value=[])
         else:
-            self._log.info(f"Request already exist for {request}")
-
+            self._log.info(f"Request already exist for {request}, awaiting shared result")
+            await request.future
             return []
 
     async def get_historical_ticks(
@@ -681,6 +829,160 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         await self._handle_data(trade_tick)
 
+    async def process_tick_price(
+        self,
+        *,
+        req_id: int,
+        tick_type: int,
+        price: float,
+        attrib: Any,
+    ) -> None:
+        """
+        Process tick price data from reqMktData for spread instruments and indices.
+        """
+        if not (subscription := self._subscriptions.get(req_id=req_id)):
+            return
+
+        # Store the price data for this subscription
+        if req_id not in self._subscription_tick_data:
+            self._subscription_tick_data[req_id] = {}
+
+        # Skip invalid price in most cases (IB uses -1.0 to indicate unavailable/invalid prices)
+        # But option spreads can have negative prices, in this case the size of a quote will invalidate the quote
+        if price == -1.0 and self._subscription_tick_data[req_id].get(tick_type, 0.0) > 0.0:
+            self._log.warning(
+                f"Ignoring invalid tick price: {price} for req_id={req_id}, tick_type={tick_type}:{TickTypeEnum.toStr(tick_type)}",
+            )
+            return
+
+        # IB tick types: 0=BID_SIZE, 1=BID_PRICE, 2=ASK_PRICE, 3=ASK_SIZE, 4=LAST_PRICE
+        self._subscription_tick_data[req_id][tick_type] = price
+
+        if subscription.name[1] == INDEX_MARKET_DATA:
+            # Create an index price tick
+            await self._try_create_index_price_tick_from_market_data(subscription, req_id)
+        else:
+            # Check if we have both bid and ask prices to create a quote tick
+            await self._try_create_quote_tick_from_market_data(subscription, req_id)
+
+    async def process_tick_size(
+        self,
+        *,
+        req_id: int,
+        tick_type: int,
+        size: Decimal,
+    ) -> None:
+        """
+        Process tick size data from reqMktData for spread instruments.
+        """
+        if not (subscription := self._subscriptions.get(req_id=req_id)):
+            return
+
+        # Skip invalid sizes (negative or extremely large values)
+        # IB may send invalid sizes when prices are invalid
+        # For index subscriptions, this is expected (indices have no volume) so don't warn
+        if size < 0 or size > MAX_VALID_TICK_SIZE:
+            if subscription.name[1] != INDEX_MARKET_DATA:
+                self._log.warning(
+                    f"Ignoring invalid tick size: {size} for req_id={req_id}, tick_type={tick_type}:{TickTypeEnum.toStr(tick_type)}",
+                )
+            return
+
+        # Store the size data for this subscription
+        if req_id not in self._subscription_tick_data:
+            self._subscription_tick_data[req_id] = {}
+
+        # IB tick types: 0=BID_SIZE, 1=BID_PRICE, 2=ASK_PRICE, 3=ASK_SIZE
+        self._subscription_tick_data[req_id][tick_type] = int(size)
+
+        # Check if we have both bid and ask data to create a quote tick
+        await self._try_create_quote_tick_from_market_data(subscription, req_id)
+
+    async def _try_create_quote_tick_from_market_data(
+        self,
+        subscription: Subscription,
+        req_id: int,
+    ) -> None:
+        """
+        Try to create a QuoteTick from accumulated market data.
+        """
+        if req_id not in self._subscription_tick_data:
+            return
+
+        tick_data = self._subscription_tick_data[req_id]
+
+        bid_size = tick_data.get(TickTypeEnum.BID_SIZE)
+        bid_price = tick_data.get(TickTypeEnum.BID)
+        ask_price = tick_data.get(TickTypeEnum.ASK)
+        ask_size = tick_data.get(TickTypeEnum.ASK_SIZE)
+
+        # Validate that both prices are present and valid (positive)
+        if (
+            bid_price is not None
+            and ask_price is not None
+            and bid_size is not None
+            and ask_size is not None
+        ):
+            # Create quote tick
+            instrument_id = InstrumentId.from_str(subscription.name[0])
+            instrument = self._cache.instrument(instrument_id)
+            ts_event = self._clock.timestamp_ns()
+            price_magnifier = (
+                self._instrument_provider.get_price_magnifier(instrument_id)
+                if self._instrument_provider
+                else 1
+            )
+            converted_bid_price = ib_price_to_nautilus_price(bid_price, price_magnifier)
+            converted_ask_price = ib_price_to_nautilus_price(ask_price, price_magnifier)
+
+            quote_tick = QuoteTick(
+                instrument_id=instrument_id,
+                bid_price=instrument.make_price(converted_bid_price),
+                ask_price=instrument.make_price(converted_ask_price),
+                bid_size=instrument.make_qty(bid_size),
+                ask_size=instrument.make_qty(ask_size),
+                ts_event=ts_event,
+                ts_init=ts_event,
+            )
+
+            await self._handle_data(quote_tick)
+
+    async def _try_create_index_price_tick_from_market_data(
+        self,
+        subscription: Subscription,
+        req_id: int,
+    ) -> None:
+        if req_id not in self._subscription_tick_data:
+            return
+
+        tick_data = self._subscription_tick_data[req_id]
+
+        price = tick_data.get(TickTypeEnum.LAST)
+
+        if price is not None:
+            instrument_id = InstrumentId.from_str(subscription.name[0])
+            instrument = self._cache.instrument(instrument_id)
+            if instrument is None:
+                self._log.error(f"Cannot find instrument for {instrument_id}")
+                return
+
+            ts_event = self._clock.timestamp_ns()
+            price_magnifier = (
+                self._instrument_provider.get_price_magnifier(instrument_id)
+                if self._instrument_provider
+                else 1
+            )
+            converted_price = ib_price_to_nautilus_price(price, price_magnifier)
+
+            index_price_update = IndexPriceUpdate(
+                instrument_id=instrument_id,
+                value=instrument.make_price(converted_price),
+                ts_event=ts_event,
+                ts_init=ts_event,
+            )
+
+            await self._handle_data(index_price_update)
+
     async def process_realtime_bar(
         self,
         *,
@@ -699,6 +1001,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         """
         if not (subscription := self._subscriptions.get(req_id=req_id)):
             return
+
         bar_type = BarType.from_str(subscription.name)
         instrument = self._cache.instrument(bar_type.instrument_id)
 
@@ -711,6 +1014,18 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         converted_high = ib_price_to_nautilus_price(high, price_magnifier)
         converted_low = ib_price_to_nautilus_price(low, price_magnifier)
         converted_close = ib_price_to_nautilus_price(close, price_magnifier)
+
+        # Validate bar data integrity BEFORE creating Bar object
+        # IB sometimes sends corrupt data during extended hours
+        if not self._validate_bar_prices(
+            bar_type=bar_type,
+            open_price=converted_open,
+            high_price=converted_high,
+            low_price=converted_low,
+            close_price=converted_close,
+            bar_identifier=f"time={time}",
+        ):
+            return
 
         bar = Bar(
             bar_type=bar_type,
@@ -731,7 +1046,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         Return the requested historical data bars.
         """
         if request := self._requests.get(req_id=req_id):
-            bar_type = request.name[0]
+            bar_type = BarType.from_str(request.name[0])
             bar = await self._ib_bar_to_nautilus_bar(
                 bar_type=bar_type,
                 bar=bar,
@@ -741,11 +1056,15 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
             if bar:
                 request.result.append(bar)
         elif subscription := self._subscriptions.get(req_id=req_id):
+            # Get start time from stored subscription start times
+            start = self._subscription_start_times.get(req_id)
+
             bar = await self._process_bar_data(
                 bar_type_str=str(subscription.name),
                 bar=bar,
                 handle_revised_bars=False,
                 historical=True,
+                start=start,
             )
 
             if bar:
@@ -802,7 +1121,6 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         if request := self._requests.get(req_id=req_id):
             instrument_id = InstrumentId.from_str(request.name[0])
             instrument = self._cache.instrument(instrument_id)
-
             price_magnifier = (
                 self._instrument_provider.get_price_magnifier(instrument_id)
                 if self._instrument_provider
@@ -922,6 +1240,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
                 # Check if this bar is still the current bar (hasn't been superseded)
                 current_bar = self._bar_type_to_last_bar.get(bar_type_str)
+
                 if current_bar and int(current_bar.date) == int(bar.date):
                     self._log.debug(f"Publishing bar after period completion for {bar_type_str}")
                     ts_init = self._clock.timestamp_ns()
@@ -957,6 +1276,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         bar: BarData,
         handle_revised_bars: bool,
         historical: bool | None = False,
+        start: int | None = None,
     ) -> Bar | None:
         """
         Process received bar data and convert it into NautilusTrader's Bar format. This
@@ -973,6 +1293,8 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
             Indicates whether revised bars should be handled or not.
         historical : bool | None, optional
             Indicates whether the bar data is historical. Defaults to False.
+        start: int, optional
+            The start time of a subscription in ns.
 
         Returns
         -------
@@ -992,6 +1314,12 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         self._bar_type_to_last_bar[bar_type_str] = bar
         bar_type: BarType = BarType.from_str(bar_type_str)
+        bar_ts_init = await self._ib_bar_to_ts_init(bar, bar_type)
+
+        if start and bar_ts_init < start:
+            # Filtering bar out as it's historical data we don't want, see subscribe_historical_bars
+            return None
+
         ts_init = self._clock.timestamp_ns()
 
         if not handle_revised_bars:
@@ -1084,7 +1412,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         bar: BarData,
         ts_init: int,
         is_revision: bool = False,
-    ) -> Bar:
+    ) -> Bar | None:
         """
         Convert Interactive Brokers bar data to NautilusTrader's bar type.
 
@@ -1101,7 +1429,8 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         Returns
         -------
-        Bar
+        Bar | None
+            The converted bar, or None if the bar data is invalid (e.g., low > open during extended hours).
 
         """
         instrument = self._cache.instrument(bar_type.instrument_id)
@@ -1122,6 +1451,18 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         converted_high = ib_price_to_nautilus_price(bar.high, price_magnifier)
         converted_low = ib_price_to_nautilus_price(bar.low, price_magnifier)
         converted_close = ib_price_to_nautilus_price(bar.close, price_magnifier)
+
+        # Validate bar data integrity BEFORE creating Bar object
+        # IB sometimes sends corrupt data during extended hours
+        if not self._validate_bar_prices(
+            bar_type=bar_type,
+            open_price=converted_open,
+            high_price=converted_high,
+            low_price=converted_low,
+            close_price=converted_close,
+            bar_identifier=f"bar.date={bar.date}",
+        ):
+            return None
 
         return Bar(
             bar_type=bar_type,
@@ -1233,6 +1574,57 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         return ts.value
 
+    def _validate_bar_prices(
+        self,
+        bar_type: BarType,
+        open_price: float,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        bar_identifier: str,
+    ) -> bool:
+        if high_price < open_price:
+            self._log.warning(
+                f"Invalid bar from IB for {bar_type.instrument_id}: "
+                f"high ({high_price}) < open ({open_price}), "
+                f"{bar_identifier}, skipping bar",
+            )
+            return False
+
+        if high_price < low_price:
+            self._log.warning(
+                f"Invalid bar from IB for {bar_type.instrument_id}: "
+                f"high ({high_price}) < low ({low_price}), "
+                f"{bar_identifier}, skipping bar",
+            )
+            return False
+
+        if high_price < close_price:
+            self._log.warning(
+                f"Invalid bar from IB for {bar_type.instrument_id}: "
+                f"high ({high_price}) < close ({close_price}), "
+                f"{bar_identifier}, skipping bar",
+            )
+            return False
+
+        if low_price > close_price:
+            self._log.warning(
+                f"Invalid bar from IB for {bar_type.instrument_id}: "
+                f"low ({low_price}) > close ({close_price}), "
+                f"{bar_identifier}, skipping bar",
+            )
+            return False
+
+        if low_price > open_price:
+            self._log.warning(
+                f"Invalid bar from IB for {bar_type.instrument_id}: "
+                f"low ({low_price}) > open ({open_price}), "
+                f"{bar_identifier}, skipping bar",
+            )
+            return False
+
+        return True
+
     async def process_update_mkt_depth_l2(
         self,
         *,
@@ -1299,6 +1691,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         # Update order book based on operation type
         action = MKT_DEPTH_OPERATIONS[operation]
+
         if action in (BookAction.ADD, BookAction.UPDATE):
             levels[position] = IBKRBookLevel(
                 price=price,
@@ -1404,6 +1797,7 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
 
         for side, order_side in [("bids", OrderSide.BUY), ("asks", OrderSide.SELL)]:
             price_aggregates: dict[float, Decimal] = defaultdict(Decimal)
+
             for level in book[side].values():
                 price_aggregates[level.price] += level.size
 

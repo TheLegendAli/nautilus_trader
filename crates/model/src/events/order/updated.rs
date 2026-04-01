@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -35,12 +35,16 @@ use crate::{
 };
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Builder)]
-#[builder(default)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Builder)]
 #[serde(tag = "type")]
+#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OrderUpdated {
     /// The trader ID associated with the event.
@@ -61,6 +65,11 @@ pub struct OrderUpdated {
     pub price: Option<Price>,
     /// The order trigger price (STOP).
     pub trigger_price: Option<Price>,
+    /// The order calculated protection price.
+    pub protection_price: Option<Price>,
+    /// If the order quantity is denominated in the quote currency.
+    #[serde(default)]
+    pub is_quote_quantity: bool,
     /// The unique identifier for the event.
     pub event_id: UUID4,
     /// UNIX timestamp (nanoseconds) when the event occurred.
@@ -89,6 +98,8 @@ impl OrderUpdated {
         account_id: Option<AccountId>,
         price: Option<Price>,
         trigger_price: Option<Price>,
+        protection_price: Option<Price>,
+        is_quote_quantity: bool,
     ) -> Self {
         Self {
             trader_id,
@@ -104,6 +115,8 @@ impl OrderUpdated {
             account_id,
             price,
             trigger_price,
+            protection_price,
+            is_quote_quantity,
         }
     }
 }
@@ -113,7 +126,7 @@ impl Debug for OrderUpdated {
         write!(
             f,
             "{}(trader_id={}, strategy_id={}, instrument_id={}, client_order_id={}, \
-            venue_order_id={}, account_id={}, quantity={}, price={}, trigger_price={}, event_id={}, ts_event={}, ts_init={})",
+            venue_order_id={}, account_id={}, quantity={}, price={}, trigger_price={}, protection_price={}, event_id={}, ts_event={}, ts_init={})",
             stringify!(OrderUpdated),
             self.trader_id,
             self.strategy_id,
@@ -131,6 +144,9 @@ impl Debug for OrderUpdated {
             self.trigger_price
                 .map_or("None".to_string(), |trigger_price| trigger_price
                     .to_formatted_string()),
+            self.protection_price
+                .map_or("None".to_string(), |protection_price| protection_price
+                    .to_formatted_string()),
             self.event_id,
             self.ts_event,
             self.ts_init
@@ -142,7 +158,7 @@ impl Display for OrderUpdated {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}(instrument_id={}, client_order_id={}, venue_order_id={}, account_id={}, quantity={}, price={}, trigger_price={}, ts_event={})",
+            "{}(instrument_id={}, client_order_id={}, venue_order_id={}, account_id={}, quantity={}, price={}, trigger_price={}, protection_price={}, ts_event={})",
             stringify!(OrderUpdated),
             self.instrument_id,
             self.client_order_id,
@@ -158,6 +174,9 @@ impl Display for OrderUpdated {
             self.trigger_price
                 .map_or("None".to_string(), |trigger_price| trigger_price
                     .to_formatted_string()),
+            self.protection_price
+                .map_or("None".to_string(), |protection_price| protection_price
+                    .to_formatted_string()),
             self.ts_event
         )
     }
@@ -168,7 +187,7 @@ impl OrderEvent for OrderUpdated {
         self.event_id
     }
 
-    fn kind(&self) -> &str {
+    fn type_name(&self) -> &'static str {
         stringify!(OrderUpdated)
     }
 
@@ -229,11 +248,11 @@ impl OrderEvent for OrderUpdated {
     }
 
     fn quote_quantity(&self) -> Option<bool> {
-        None
+        Some(self.is_quote_quantity)
     }
 
     fn reconciliation(&self) -> bool {
-        false
+        self.reconciliation != 0
     }
 
     fn price(&self) -> Option<Price> {
@@ -333,9 +352,6 @@ impl OrderEvent for OrderUpdated {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -347,7 +363,15 @@ mod tests {
         let display = format!("{order_updated}");
         assert_eq!(
             display,
-            "OrderUpdated(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, venue_order_id=001, account_id=SIM-001, quantity=100, price=22_000, trigger_price=None, ts_event=0)"
+            "OrderUpdated(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, venue_order_id=001, account_id=SIM-001, quantity=100, price=22_000, trigger_price=None, protection_price=None, ts_event=0)"
         );
+    }
+
+    #[rstest]
+    fn test_order_updated_serialization() {
+        let original = OrderUpdated::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderUpdated = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
     }
 }

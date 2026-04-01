@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -40,6 +40,7 @@ from nautilus_trader.model.enums import CurrencyType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.identifiers import ExecAlgorithmId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import TradeId
@@ -79,6 +80,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.xdist_group(name="redis_integration")
 class TestCacheDatabaseAdapter:
     def setup(self) -> None:
         # Fixture Setup
@@ -470,6 +472,91 @@ class TestCacheDatabaseAdapter:
         assert True  # No exception raised
 
     @pytest.mark.asyncio
+    async def test_position_flip_cache_reload_netting_mode(self):
+        """
+        Test that position flip in NETTING mode can be reloaded from cache.
+
+        Reproduces issue #3081 where a position flip causes duplicate event IDs when
+        reloading from Redis cache.
+
+        """
+        # Arrange
+        self.database.add_instrument(_AUDUSD_SIM)
+
+        # Allow MPSC thread to insert
+        await eventually(lambda: self.database.load_instrument(_AUDUSD_SIM.id))
+
+        order1 = self.strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        position_id = PositionId("P-1")
+        self.database.add_order(order1)
+
+        await eventually(lambda: self.database.load_order(order1.client_order_id))
+
+        fill1 = TestEventStubs.order_filled(
+            order1,
+            instrument=_AUDUSD_SIM,
+            position_id=position_id,
+            last_px=Price.from_str("1.00000"),
+            trade_id=TradeId("1"),
+        )
+
+        position = Position(instrument=_AUDUSD_SIM, fill=fill1)
+        self.database.add_position(position)
+
+        await eventually(lambda: self.database.load_position(position.id))
+
+        order2 = self.strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(150_000),
+        )
+
+        self.database.add_order(order2)
+
+        await eventually(lambda: self.database.load_order(order2.client_order_id))
+
+        # Simulate position flip: close with partial fill, reopen with remainder
+        fill2_close = TestEventStubs.order_filled(
+            order2,
+            instrument=_AUDUSD_SIM,
+            position_id=position_id,
+            last_qty=Quantity.from_int(100_000),
+            last_px=Price.from_str("1.00010"),
+            trade_id=TradeId("2"),
+        )
+
+        position.apply(fill2_close)
+        self.database.update_position(position)
+
+        await eventually(lambda: (p := self.database.load_position(position_id)) and p.is_closed)
+
+        fill2_flip = TestEventStubs.order_filled(
+            order2,
+            instrument=_AUDUSD_SIM,
+            position_id=position_id,
+            last_qty=Quantity.from_int(50_000),
+            last_px=Price.from_str("1.00010"),
+            trade_id=TradeId("2"),
+        )
+
+        position_flipped = Position(instrument=_AUDUSD_SIM, fill=fill2_flip)
+        self.database.add_position(position_flipped)
+
+        await eventually(lambda: (p := self.database.load_position(position_id)) and p.is_open)
+
+        loaded_position = self.database.load_position(position_id)
+
+        assert loaded_position is not None
+        assert loaded_position.side == PositionSide.SHORT
+        assert loaded_position.quantity == Quantity.from_int(50_000)
+        assert len(loaded_position.events) == 1
+
+    @pytest.mark.asyncio
     async def test_update_actor(self):
         # Arrange
         actor = MockActor()
@@ -589,7 +676,7 @@ class TestCacheDatabaseAdapter:
         assert result == {_AUDUSD_SIM.id: _AUDUSD_SIM}
 
     @pytest.mark.asyncio
-    async def test_load_synthetic_when_no_synethic_instrument_in_database_returns_none(self):
+    async def test_load_synthetic_when_no_synthetic_instrument_in_database_returns_none(self):
         # Arrange
         synthetic = TestInstrumentProvider.synthetic_instrument()
 
@@ -1055,6 +1142,7 @@ class TestCacheDatabaseAdapter:
         assert result == {}
 
 
+@pytest.mark.xdist_group(name="redis_integration")
 class TestRedisCacheDatabaseIntegrity:
     def setup(self):
         # Fixture Setup
@@ -1129,3 +1217,56 @@ class TestRedisCacheDatabaseIntegrity:
 
         # Assert
         await eventually(lambda: self.engine.cache.check_integrity())
+
+
+@pytest.mark.xdist_group(name="redis_integration")
+class TestRedisCacheCustomData:
+    """
+    Tests Redis cache add_custom_data and load_custom_data roundtrip via PyO3.
+    """
+
+    def setup(self):
+        from nautilus_trader.common.config import msgspec_encoding_hook
+        from nautilus_trader.core import nautilus_pyo3
+
+        self.clock = TestClock()
+        self.trader_id = TestIdStubs.trader_id()
+        config = CacheConfig(database=DatabaseConfig())
+        config_json = msgspec.json.encode(config, enc_hook=msgspec_encoding_hook)
+        self.database = nautilus_pyo3.RedisCacheDatabase(
+            trader_id=nautilus_pyo3.TraderId(self.trader_id.value),
+            instance_id=nautilus_pyo3.UUID4.from_str(UUID4().value),
+            config_json=config_json,
+        )
+
+    def teardown(self):
+        time.sleep(0.2)
+        self.database.flushdb()
+        time.sleep(0.5)
+
+    @pytest.mark.asyncio
+    async def test_add_and_load_custom_data_roundtrip(self):
+        """
+        Add custom data to Redis cache and load it back by DataType.
+        """
+        from nautilus_trader.core.nautilus_pyo3 import InstrumentId
+        from nautilus_trader.core.nautilus_pyo3.model import CustomData
+        from nautilus_trader.core.nautilus_pyo3.model import DataType
+        from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+        from nautilus_trader.core.nautilus_pyo3.persistence import RustTestCustomData
+
+        register_custom_data_class(RustTestCustomData)
+        instrument_id_pyo3 = InstrumentId.from_str("REDIS.TEST")
+        metadata = {"venue": "TEST", "instrument_id": "REDIS.TEST"}
+        data_type_pyo3 = DataType("RustTestCustomData", metadata, "REDIS.TEST")
+        inner = RustTestCustomData(instrument_id_pyo3, 1.23, True, 1, 1000)
+        custom_data_pyo3 = CustomData(data_type_pyo3, inner)
+
+        self.database.add_custom_data(custom_data_pyo3)
+
+        await eventually(lambda: len(self.database.load_custom_data(data_type_pyo3)) > 0, timeout=5)
+
+        loaded = self.database.load_custom_data(data_type_pyo3)
+        assert len(loaded) == 1
+        assert loaded[0].data_type.type_name == "RustTestCustomData"
+        assert loaded[0].data.value == 1.23

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -87,7 +87,7 @@ pub fn check_nonempty_string<T: AsRef<str>>(s: T, param: &str) -> anyhow::Result
 /// - `s` consists solely of whitespace characters.
 /// - `s` contains one or more non-ASCII characters.
 #[inline(always)]
-pub fn check_valid_string<T: AsRef<str>>(s: T, param: &str) -> anyhow::Result<()> {
+pub fn check_valid_string_ascii<T: AsRef<str>>(s: T, param: &str) -> anyhow::Result<()> {
     let s = s.as_ref();
 
     if s.is_empty() {
@@ -100,10 +100,38 @@ pub fn check_valid_string<T: AsRef<str>>(s: T, param: &str) -> anyhow::Result<()
         if !c.is_whitespace() {
             has_non_whitespace = true;
         }
+
         if !c.is_ascii() {
             anyhow::bail!("invalid string for '{param}' contained a non-ASCII char, was '{s}'");
         }
     }
+
+    if !has_non_whitespace {
+        anyhow::bail!("invalid string for '{param}', was all whitespace");
+    }
+
+    Ok(())
+}
+
+/// Checks the string `s` has semantic meaning and allows UTF-8 characters.
+///
+/// This is a relaxed version of [`check_valid_string_ascii`] that permits non-ASCII UTF-8 characters.
+/// Use this for external identifiers (e.g., exchange symbols) that may contain Unicode characters.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `s` is an empty string.
+/// - `s` consists solely of whitespace characters.
+#[inline(always)]
+pub fn check_valid_string_utf8<T: AsRef<str>>(s: T, param: &str) -> anyhow::Result<()> {
+    let s = s.as_ref();
+
+    if s.is_empty() {
+        anyhow::bail!("invalid string for '{param}', was empty");
+    }
+
+    let has_non_whitespace = s.chars().any(|c| !c.is_whitespace());
 
     if !has_non_whitespace {
         anyhow::bail!("invalid string for '{param}', was all whitespace");
@@ -121,9 +149,12 @@ pub fn check_valid_string<T: AsRef<str>>(s: T, param: &str) -> anyhow::Result<()
 /// - `s` consists solely of whitespace characters.
 /// - `s` contains one or more non-ASCII characters.
 #[inline(always)]
-pub fn check_valid_string_optional<T: AsRef<str>>(s: Option<T>, param: &str) -> anyhow::Result<()> {
+pub fn check_valid_string_ascii_optional<T: AsRef<str>>(
+    s: Option<T>,
+    param: &str,
+) -> anyhow::Result<()> {
     if let Some(s) = s {
-        check_valid_string(s, param)?;
+        check_valid_string_ascii(s, param)?;
     }
     Ok(())
 }
@@ -253,6 +284,7 @@ pub fn check_non_negative_f64(value: f64, param: &str) -> anyhow::Result<()> {
     if value.is_nan() || value.is_infinite() {
         anyhow::bail!("invalid f64 for '{param}', was {value}")
     }
+
     if value < 0.0 {
         anyhow::bail!("invalid f64 for '{param}' negative, was {value}")
     }
@@ -305,7 +337,7 @@ pub fn check_in_range_inclusive_i64(value: i64, l: i64, r: i64, param: &str) -> 
 /// Returns an error if the validation check fails.
 #[inline(always)]
 pub fn check_in_range_inclusive_f64(value: f64, l: f64, r: f64, param: &str) -> anyhow::Result<()> {
-    // SAFETY: Hardcoded epsilon is intentional and appropriate here because:
+    // Hardcoded epsilon is intentional and appropriate here because:
     // - 1e-15 is conservative for IEEE 754 double precision (machine epsilon ~2.22e-16)
     // - This function is used for validation, not high-precision calculations
     // - The epsilon prevents spurious failures due to floating-point representation
@@ -315,6 +347,7 @@ pub fn check_in_range_inclusive_f64(value: f64, l: f64, r: f64, param: &str) -> 
     if value.is_nan() || value.is_infinite() {
         anyhow::bail!("invalid f64 for '{param}', was {value}")
     }
+
     if value < l - EPSILON || value > r + EPSILON {
         anyhow::bail!("invalid f64 for '{param}' not in range [{l}, {r}], was {value}")
     }
@@ -522,9 +555,6 @@ pub fn check_positive_decimal(value: Decimal, param: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use std::{
@@ -578,8 +608,8 @@ mod tests {
     #[case("a a")]
     #[case(" a ")]
     #[case("abc")]
-    fn test_check_valid_string_with_valid_value(#[case] s: &str) {
-        assert!(check_valid_string(s, "value").is_ok());
+    fn test_check_valid_string_ascii_with_valid_value(#[case] s: &str) {
+        assert!(check_valid_string_ascii(s, "value").is_ok());
     }
 
     #[rstest]
@@ -587,8 +617,25 @@ mod tests {
     #[case(" ")] // <-- whitespace-only
     #[case("  ")] // <-- whitespace-only string
     #[case("🦀")] // <-- contains non-ASCII char
-    fn test_check_valid_string_with_invalid_values(#[case] s: &str) {
-        assert!(check_valid_string(s, "value").is_err());
+    fn test_check_valid_string_ascii_with_invalid_values(#[case] s: &str) {
+        assert!(check_valid_string_ascii(s, "value").is_err());
+    }
+
+    #[rstest]
+    #[case(" a")]
+    #[case("a ")]
+    #[case("abc")]
+    #[case("ETHUSDT")]
+    fn test_check_valid_string_utf8_with_valid_values(#[case] s: &str) {
+        assert!(check_valid_string_utf8(s, "value").is_ok());
+    }
+
+    #[rstest]
+    #[case("")] // <-- empty string
+    #[case(" ")] // <-- whitespace-only
+    #[case("  ")] // <-- whitespace-only string
+    fn test_check_valid_string_utf8_with_invalid_values(#[case] s: &str) {
+        assert!(check_valid_string_utf8(s, "value").is_err());
     }
 
     #[rstest]
@@ -598,8 +645,8 @@ mod tests {
     #[case(Some("a a"))]
     #[case(Some(" a "))]
     #[case(Some("abc"))]
-    fn test_check_valid_string_optional_with_valid_value(#[case] s: Option<&str>) {
-        assert!(check_valid_string_optional(s, "value").is_ok());
+    fn test_check_valid_string_ascii_optional_with_valid_value(#[case] s: Option<&str>) {
+        assert!(check_valid_string_ascii_optional(s, "value").is_ok());
     }
 
     #[rstest]
@@ -935,5 +982,23 @@ mod tests {
         let value = Decimal::from_str(raw).expect("valid decimal literal");
         let result = super::check_positive_decimal(value, "param").is_ok();
         assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case(1, true)]
+    #[case(u128::MAX, true)]
+    #[case(0, false)]
+    fn test_check_positive_u128(#[case] value: u128, #[case] expected: bool) {
+        assert_eq!(check_positive_u128(value, "value").is_ok(), expected);
+    }
+
+    #[rstest]
+    #[case(1, true)]
+    #[case(i128::MAX, true)]
+    #[case(0, false)]
+    #[case(-1, false)]
+    #[case(i128::MIN, false)]
+    fn test_check_positive_i128(#[case] value: i128, #[case] expected: bool) {
+        assert_eq!(check_positive_i128(value, "value").is_ok(), expected);
     }
 }

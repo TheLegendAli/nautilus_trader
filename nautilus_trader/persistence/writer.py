@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,9 +14,11 @@
 # -------------------------------------------------------------------------------------------------
 
 import datetime as dt
+from collections import OrderedDict
 from enum import Enum
 from io import TextIOWrapper
-from typing import Any, BinaryIO
+from typing import Any
+from typing import BinaryIO
 
 import fsspec
 import pandas as pd
@@ -29,12 +31,16 @@ from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import Clock
 from nautilus_trader.common.component import Logger
 from nautilus_trader.core.correctness import PyCondition
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import CustomData
+from nautilus_trader.model.data import FundingRateUpdate
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
+from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.funcs import class_to_filename
 from nautilus_trader.persistence.funcs import urisafe_identifier
 from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
@@ -111,13 +117,15 @@ class StreamingFeatherWriter:
             self.fs.makedirs(self.path, exist_ok=True)  # Create directory if it doesn't exist
 
         self.include_types = include_types
+
         if self.fs.exists(self.path) and replace:
             for fn in self.fs.ls(self.path):
-                self.fs.rm(fn)
+                self.fs.rm(fn, recursive=True)
+
             self.fs.rmdir(self.path)
 
         self._schemas = list_schemas()
-        self.logger = Logger(type(self).__name__)
+        self.log = Logger(type(self).__name__)
         self._files: dict[
             str | tuple[str, str],
             TextIOWrapper | BinaryIO | AbstractBufferedFile,
@@ -125,9 +133,12 @@ class StreamingFeatherWriter:
         self._writers: dict[str | tuple[str, str], RecordBatchStreamWriter] = {}
         self._instrument_writers: dict[tuple[str, str], RecordBatchStreamWriter] = {}
         self._per_instrument_writers = {
-            "order_book_delta",
+            "bar",
+            "order_book_deltas",
+            "order_book_depths",
             "quote_tick",
             "trade_tick",
+            "funding_rate_update",
         }
         self.rotation_mode = rotation_mode
         self.max_file_size = max_file_size
@@ -143,32 +154,133 @@ class StreamingFeatherWriter:
         self.flush_interval_ms = flush_interval_ms or 1000
         self._last_flush = self.clock.utc_now()
         self.missing_writers: set[type] = set()
+        self._seen_event_ids: OrderedDict = OrderedDict()
+        self._seen_event_ids_maxlen = 10_000
 
-    def _update_next_rotation_time(self, table_name: str | tuple[str, str]) -> None:
+    def _create_writers(self) -> None:
+        for cls in self._schemas:
+            self._create_writer(cls=cls, skip_custom=True)
+
+    def write(self, obj: object) -> None:  # noqa: C901
         """
-        Update the next rotation time for a specific table based on the current rotation
-        mode and clock.
+        Write the object to the stream.
+
+        Parameters
+        ----------
+        obj : object
+            The object to write.
+
+        Raises
+        ------
+        ValueError
+            If `obj` is ``None``.
+
         """
-        now = self.clock.utc_now()
-        if self.rotation_mode == RotationMode.INTERVAL:
-            self._next_rotation_times[table_name] = now + self.rotation_interval
-        elif self.rotation_mode == RotationMode.SCHEDULED_DATES:
-            if (
-                table_name not in self._next_rotation_times
-                or self._next_rotation_times[table_name] is None
-            ):
-                user_rotation_time = pd.Timestamp.combine(now.date(), self.rotation_time)
-                next_rotation_time = pd.Timestamp(
-                    user_rotation_time,
-                    tz=self.rotation_timezone,
-                ).tz_convert("UTC")
-                while next_rotation_time <= now:
-                    next_rotation_time += self.rotation_interval
-                self._next_rotation_times[table_name] = next_rotation_time
+        PyCondition.not_none(obj, "obj")
+
+        cls = obj.__class__
+        is_custom_data = isinstance(obj, CustomData)
+        actual_data: Any = obj.data if is_custom_data else obj  # type: ignore[attr-defined]
+
+        if is_custom_data:
+            cls = obj.data_type.type  # type: ignore[attr-defined]
+
+        # Check if an include types filter has been specified
+        if self.include_types is not None and cls not in self.include_types:
+            return
+
+        # Deduplicate events published on multiple message bus topics
+        event_id = getattr(obj, "id", None)
+        if isinstance(event_id, UUID4) and event_id in self._seen_event_ids:
+            return
+        if isinstance(event_id, UUID4):
+            self._seen_event_ids[event_id] = None
+            if len(self._seen_event_ids) > self._seen_event_ids_maxlen:
+                self._seen_event_ids.popitem(last=False)
+
+        table = class_to_filename(cls)
+
+        # Check if data has instrument_id for per-instrument writing
+        # This applies to both CustomData wrappers and direct custom data objects
+        has_instrument_id = hasattr(actual_data, "instrument_id")
+        use_per_instrument_writer = table in self._per_instrument_writers or (
+            table.startswith("custom_") and has_instrument_id
+        )
+
+        if isinstance(obj, Bar):
+            bar: Bar = obj
+            bar_type_str = str(bar.bar_type)
+            key = (table, bar_type_str)
+            instrument = self.cache.instrument(bar.bar_type.instrument_id)
+
+            if key not in self._instrument_writers and instrument is not None:
+                self._create_identifier_writer(cls=cls, obj=bar)
+
+            if key in self._instrument_writers:
+                writer = self._instrument_writers[key]
             else:
-                self._next_rotation_times[table_name] = now + self.rotation_interval
-        elif self.rotation_mode in (RotationMode.SIZE, RotationMode.NO_ROTATION):
-            self._next_rotation_times[table_name] = None
+                return
+        elif use_per_instrument_writer:
+            # Handle per-instrument writers for custom data with instrument_id
+            key = (table, actual_data.instrument_id.value)
+            instrument = self.cache.instrument(actual_data.instrument_id)
+
+            if key not in self._instrument_writers and instrument is not None:
+                self._create_identifier_writer(cls=cls, obj=actual_data)
+
+            if key in self._instrument_writers:
+                writer = self._instrument_writers[key]
+            else:
+                return
+        elif table not in self._writers:
+            self.log.debug(f"Writer not setup for table '{table}'")
+
+            # Create regular writer for custom data without instrument_id or custom_signal
+            if table.startswith("custom_"):
+                self._create_writer(cls=cls)
+                if table in self._writers:
+                    writer = self._writers[table]
+                else:
+                    return
+            elif cls not in self.missing_writers:
+                self.log.warning(f"Can't find writer for cls: {cls}")
+                self.missing_writers.add(cls)
+                return
+            else:
+                return
+        else:
+            writer = self._writers[table]
+
+        serialized = ArrowSerializer.serialize_batch([obj], data_cls=cls)
+
+        if not serialized:
+            return
+
+        try:
+            writer.write_table(serialized)
+
+            # Use the appropriate key for file size tracking
+            if isinstance(obj, Bar):
+                size_key = (table, str(obj.bar_type))
+            elif isinstance(obj, Instrument):
+                size_key = (table, obj.id.value)
+            elif use_per_instrument_writer:
+                size_key = (table, actual_data.instrument_id.value)
+            else:
+                size_key = table  # type: ignore
+
+            self._file_sizes[size_key] = self._file_sizes.get(size_key, 0) + serialized.nbytes
+            self.check_flush()
+
+            if self._check_file_rotation(size_key):
+                if isinstance(obj, Bar) or use_per_instrument_writer:
+                    self._rotate_identifier_file(cls=cls, obj=actual_data)
+                else:
+                    self._rotate_regular_file(table, cls)
+        except Exception as e:
+            self.log.error(f"Failed to serialize {cls=}")
+            self.log.error(f"ERROR = `{e}`")
+            self.log.debug(f"data = {obj}")
 
     def _check_file_rotation(self, table_name: str | tuple[str, str]) -> bool:
         """
@@ -192,13 +304,78 @@ class StreamingFeatherWriter:
         elif self.rotation_mode in (RotationMode.INTERVAL, RotationMode.SCHEDULED_DATES):
             now = self.clock.utc_now()
             next_rotation_time = self._next_rotation_times.get(table_name)
+
             if next_rotation_time is None:
                 self._update_next_rotation_time(table_name)
                 return False
             elif now >= next_rotation_time:
                 self._update_next_rotation_time(table_name)
                 return True
+
         return False
+
+    def _update_next_rotation_time(self, table_name: str | tuple[str, str]) -> None:
+        """
+        Update the next rotation time for a specific table based on the current rotation
+        mode and clock.
+        """
+        now = self.clock.utc_now()
+
+        if self.rotation_mode == RotationMode.INTERVAL:
+            self._next_rotation_times[table_name] = now + self.rotation_interval
+        elif self.rotation_mode == RotationMode.SCHEDULED_DATES:
+            if (
+                table_name not in self._next_rotation_times
+                or self._next_rotation_times[table_name] is None
+            ):
+                user_rotation_time = pd.Timestamp.combine(now.date(), self.rotation_time)
+                next_rotation_time = pd.Timestamp(
+                    user_rotation_time,
+                    tz=self.rotation_timezone,
+                ).tz_convert("UTC")
+
+                while next_rotation_time <= now:
+                    next_rotation_time += self.rotation_interval
+
+                self._next_rotation_times[table_name] = next_rotation_time
+            else:
+                self._next_rotation_times[table_name] = now + self.rotation_interval
+        elif self.rotation_mode in (RotationMode.SIZE, RotationMode.NO_ROTATION):
+            self._next_rotation_times[table_name] = None
+
+    def _rotate_identifier_file(self, cls: type, obj: Any) -> None:
+        """
+        Rotate the file for an identifier-based table (per-instrument or per-bar_type).
+
+        Parameters
+        ----------
+        cls : type
+            The class type of the object.
+        obj : Any
+            The object containing identifier data (instrument_id or bar_type).
+
+        """
+        table_name = class_to_filename(cls)
+
+        # Extract identifier: bar_type for bars, instrument_id for other data
+        identifier_str = str(obj.bar_type) if isinstance(obj, Bar) else obj.instrument_id.value
+
+        key = (table_name, identifier_str)
+
+        if key in self._instrument_writers:
+            self._files[key].flush()
+            self._instrument_writers[key].close()
+            self._files[key].close()
+            del self._instrument_writers[key]
+            del self._files[key]
+
+        self._create_identifier_writer(cls=cls, obj=obj)
+
+        self._file_sizes[key] = 0
+        self._file_creation_times[key] = self.clock.utc_now()
+        self.log.info(
+            f"Rotated {table_name} file for '{identifier_str}'",
+        )
 
     def _rotate_regular_file(self, table_name: str, cls: type) -> None:
         """
@@ -222,53 +399,66 @@ class StreamingFeatherWriter:
         self._create_writer(cls=cls, table_name=table_name)
         self._file_sizes[table_name] = 0
         self._file_creation_times[table_name] = self.clock.utc_now()
-        self.logger.info(f"Rotated regular file for table '{table_name}'")
+        self.log.info(f"Rotated regular file for table '{table_name}'")
 
-    def _rotate_per_instrument_file(self, cls: type, obj: Any) -> None:
-        """
-        Rotate the file for a per-instrument table.
-
-        Parameters
-        ----------
-        cls : type
-            The class type of the object.
-        obj : Any
-            The object containing instrument data.
-
-        """
-        table_name = class_to_filename(cls)
-        key = (table_name, obj.instrument_id.value)
-        if key in self._instrument_writers:
-            self._files[key].flush()
-            self._instrument_writers[key].close()
-            self._files[key].close()
-            del self._instrument_writers[key]
-            del self._files[key]
-
-        self._create_instrument_writer(cls=cls, obj=obj)
-
-        self._file_sizes[key] = 0
-        self._file_creation_times[key] = self.clock.utc_now()
-        self.logger.info(
-            f"Rotated instrument file for table '{table_name}' with instrument ID '{obj.instrument_id.value}'",
-        )
-
-    def _create_writer(self, cls: type, table_name: str | None = None) -> None:
+    def _create_identifier_writer(self, cls: type, obj: Any) -> None:
         # Check if an include types filter has been specified
         if self.include_types is not None and cls not in self.include_types:
             return
 
-        table_name = class_to_filename(cls) if not table_name else table_name
+        # Create an arrow writer with identifier specific metadata in the schema
+        metadata: dict[bytes, bytes] = self._extract_obj_metadata(obj)
+        mapped_cls = {OrderBookDeltas: OrderBookDelta}.get(cls, cls)
+        schema = self._schemas[mapped_cls].with_metadata(metadata)
+        table_name = class_to_filename(cls)
+
+        identifier_str = str(obj.bar_type) if isinstance(obj, Bar) else obj.instrument_id.value
+
+        folder = f"{self.path}/{table_name}/{urisafe_identifier(identifier_str)}"
+        key = (table_name, identifier_str)
+        self.fs.makedirs(folder, exist_ok=True)
+
+        timestamp = self.clock.timestamp_ns()
+        full_path = f"{folder}/{urisafe_identifier(identifier_str)}_{timestamp}.feather"
+
+        f = self.fs.open(full_path, "wb")
+        self._files[key] = f
+        self._instrument_writers[key] = pa.ipc.new_stream(f, schema)
+        self._file_sizes[key] = 0
+        self._file_creation_times[key] = self.clock.utc_now()
+        self.log.info(f"Created {table_name} writer for '{identifier_str}'")
+
+    def _create_writer(
+        self,
+        cls: type,
+        table_name: str | None = None,
+        skip_custom: bool = False,
+    ) -> None:
+        # Check if an include types filter has been specified
+        if self.include_types is not None and cls not in self.include_types:
+            return
+
+        table_name = table_name or class_to_filename(cls)
 
         if table_name in self._writers:
             return
+
         if table_name in self._per_instrument_writers:
             return
 
+        # Skip creating regular writers for custom data types during initialization
+        # They will be created on-demand as per-instrument writers if they have instrument_id
+        # or as regular writers if they don't
+        if skip_custom and table_name.startswith("custom_") and table_name != "custom_signal":
+            return
+
         schema = self._schemas[cls]
+
+        # Add metadata for Instrument subclasses so it's preserved in feather files
+        schema = schema.with_metadata({"class": cls.__name__})
+
         timestamp = self.clock.timestamp_ns()
         full_path = f"{self.path}/{table_name}_{timestamp}.feather"
-        print(full_path)
 
         self.fs.makedirs(self.fs._parent(full_path), exist_ok=True)
         f = self.fs.open(full_path, "wb")
@@ -277,148 +467,107 @@ class StreamingFeatherWriter:
         self._file_sizes[table_name] = 0
         self._file_creation_times[table_name] = self.clock.utc_now()
 
-        self.logger.info(f"Created writer for table '{table_name}'")
+        self.log.info(f"Created writer for table '{table_name}'")
 
-    def _create_writers(self) -> None:
-        for cls in self._schemas:
-            self._create_writer(cls=cls)
-
-    def _create_instrument_writer(self, cls: type, obj: Any) -> None:
-        # Check if an include types filter has been specified
-        if self.include_types is not None and cls not in self.include_types:
-            return
-
-        # Create an arrow writer with instrument specific metadata in the schema
-        metadata: dict[bytes, bytes] = self._extract_obj_metadata(obj)
-        mapped_cls = {OrderBookDeltas: OrderBookDelta}.get(cls, cls)
-        schema = self._schemas[mapped_cls].with_metadata(metadata)
-        table_name = class_to_filename(cls)
-        folder = f"{self.path}/{table_name}"
-        key = (table_name, obj.instrument_id.value)
-        self.fs.makedirs(folder, exist_ok=True)
-
-        timestamp = self.clock.timestamp_ns()
-        full_path = f"{folder}/{urisafe_identifier(obj.instrument_id.value)}_{timestamp}.feather"
-
-        f = self.fs.open(full_path, "wb")
-        self._files[key] = f
-        self._instrument_writers[key] = pa.ipc.new_stream(f, schema)
-        self._file_sizes[key] = 0
-        self._file_creation_times[key] = self.clock.utc_now()
-        self.logger.info(f"Created writer for table '{table_name}'")
-
-    def _extract_obj_metadata(
+    def _extract_obj_metadata(  # noqa: C901
         self,
-        obj: TradeTick | QuoteTick | Bar | OrderBookDelta,
+        obj: TradeTick
+        | QuoteTick
+        | Bar
+        | OrderBookDelta
+        | OrderBookDepth10
+        | FundingRateUpdate
+        | object,
     ) -> dict[bytes, bytes]:
-        instrument = self.cache.instrument(obj.instrument_id)
-        metadata = {b"instrument_id": obj.instrument_id.value.encode()}
-        if (
-            isinstance(obj, OrderBookDelta)
-            or isinstance(obj, OrderBookDeltas)
-            or isinstance(obj, QuoteTick | TradeTick)
-        ):
-            metadata.update(
-                {
-                    b"price_precision": str(instrument.price_precision).encode(),
-                    b"size_precision": str(instrument.size_precision).encode(),
-                },
+        # Derive instrument_id and (when possible) precision from the object to match catalog/Rust metadata.
+        if isinstance(obj, Bar):
+            instrument_id = obj.bar_type.instrument_id
+        elif hasattr(obj, "instrument_id"):
+            instrument_id = obj.instrument_id
+        else:
+            raise ValueError(
+                f"Object of type '{type(obj).__name__}' does not have an instrument_id attribute",
             )
-        elif isinstance(obj, Bar):
+
+        metadata = {b"instrument_id": instrument_id.value.encode()}
+
+        if isinstance(obj, Bar):
             metadata.update(
                 {
                     b"bar_type": str(obj.bar_type).encode(),
+                    b"price_precision": str(obj.open.precision).encode(),
+                    b"size_precision": str(obj.volume.precision).encode(),
+                },
+            )
+        elif isinstance(obj, QuoteTick):
+            metadata.update(
+                {
+                    b"price_precision": str(obj.bid_price.precision).encode(),
+                    b"size_precision": str(obj.bid_size.precision).encode(),
+                },
+            )
+        elif isinstance(obj, TradeTick):
+            metadata.update(
+                {
+                    b"price_precision": str(obj.price.precision).encode(),
+                    b"size_precision": str(obj.size.precision).encode(),
+                },
+            )
+        elif isinstance(obj, OrderBookDelta):
+            metadata.update(
+                {
+                    b"price_precision": str(obj.order.price.precision).encode(),
+                    b"size_precision": str(obj.order.size.precision).encode(),
+                },
+            )
+        elif isinstance(obj, OrderBookDepth10):
+            if obj.bids:
+                first_bid = obj.bids[0]
+                metadata.update(
+                    {
+                        b"price_precision": str(first_bid.price.precision).encode(),
+                        b"size_precision": str(first_bid.size.precision).encode(),
+                    },
+                )
+            else:
+                instrument = self.cache.instrument(instrument_id)
+                if instrument is None:
+                    raise ValueError(
+                        f"Cannot determine precision for OrderBookDepth10 with empty bids: "
+                        f"instrument '{instrument_id}' not found in cache",
+                    )
+                metadata.update(
+                    {
+                        b"price_precision": str(instrument.price_precision).encode(),
+                        b"size_precision": str(instrument.size_precision).encode(),
+                    },
+                )
+        elif isinstance(obj, FundingRateUpdate):
+            # FundingRateUpdate only has instrument_id in Rust metadata; no precision.
+            pass
+        else:
+            # Fallback for custom or legacy types: use cache
+            instrument = self.cache.instrument(instrument_id)
+            if instrument is None:
+                raise ValueError(
+                    f"Cannot determine precision for type '{type(obj).__name__}': "
+                    f"instrument '{instrument_id}' not found in cache",
+                )
+            metadata.update(
+                {
                     b"price_precision": str(instrument.price_precision).encode(),
                     b"size_precision": str(instrument.size_precision).encode(),
                 },
             )
-        else:
-            raise NotImplementedError(
-                f"type '{(type(obj)).__name__}' not currently supported for writing feather files.",
-            )
 
         return metadata
-
-    def write(self, obj: object) -> None:  # noqa: C901
-        """
-        Write the object to the stream.
-
-        Parameters
-        ----------
-        obj : object
-            The object to write.
-
-        Raises
-        ------
-        ValueError
-            If `obj` is ``None``.
-
-        """
-        PyCondition.not_none(obj, "obj")
-
-        cls = obj.__class__
-
-        # Check if an include types filter has been specified
-        if self.include_types is not None and cls not in self.include_types:
-            return
-
-        if isinstance(obj, CustomData):
-            cls = obj.data_type.type
-
-        table = class_to_filename(cls)
-        if isinstance(obj, Bar):
-            bar: Bar = obj
-            table += f"_{str(bar.bar_type).lower()}"
-
-        if table not in self._writers:
-            self.logger.debug(f"Writer not setup for table '{table}'")
-            if table.startswith("custom_signal"):
-                self._create_writer(cls=cls)
-            elif table.startswith(("bar", "binance_bar")):
-                self._create_writer(cls=cls, table_name=table)
-            elif table in self._per_instrument_writers:
-                key = (table, obj.instrument_id.value)  # type: ignore
-                instrument = self.cache.instrument(obj.instrument_id)  # type: ignore
-                if key not in self._instrument_writers and instrument is not None:
-                    self._create_instrument_writer(cls=cls, obj=obj)
-            elif cls not in self.missing_writers:
-                self.logger.warning(f"Can't find writer for cls: {cls}")
-                self.missing_writers.add(cls)
-                return
-            else:
-                return
-
-        if table in self._per_instrument_writers:
-            key = (table, obj.instrument_id.value)  # type: ignore
-            if key in self._instrument_writers:
-                writer: RecordBatchStreamWriter = self._instrument_writers[key]
-            else:
-                return
-        else:
-            writer: RecordBatchStreamWriter = self._writers[table]  # type: ignore
-
-        serialized = ArrowSerializer.serialize_batch([obj], data_cls=cls)
-        if not serialized:
-            return
-        try:
-            writer.write_table(serialized)
-            self._file_sizes[table] = self._file_sizes.get(table, 0) + serialized.nbytes
-            self.check_flush()
-            if self._check_file_rotation(table):
-                if table in self._per_instrument_writers:
-                    self._rotate_per_instrument_file(cls=cls, obj=obj)
-                else:
-                    self._rotate_regular_file(table, cls)
-        except Exception as e:
-            self.logger.error(f"Failed to serialize {cls=}")
-            self.logger.error(f"ERROR = `{e}`")
-            self.logger.debug(f"data = {obj}")
 
     def check_flush(self) -> None:
         """
         Flush all stream writers if current time greater than the next flush interval.
         """
         now = self.clock.utc_now()
+
         if (now - self._last_flush).total_seconds() * 1000 > self.flush_interval_ms:
             self.flush()
             self._last_flush = now
@@ -436,9 +585,15 @@ class StreamingFeatherWriter:
         Flush and close all stream writers.
         """
         self.flush()
+
         for wcls in tuple(self._writers):
             self._writers[wcls].close()
             del self._writers[wcls]
+
+        for wcls in tuple(self._instrument_writers):
+            self._instrument_writers[wcls].close()
+            del self._instrument_writers[wcls]
+
         for fcls in self._files:
             self._files[fcls].close()
 
@@ -452,13 +607,21 @@ class StreamingFeatherWriter:
             A dictionary containing file information for each table.
 
         """
-        return {
+        info = {
             table_name: {
                 "size": self._file_sizes.get(table_name, 0),
                 "creation_time": self._file_creation_times.get(table_name),
             }
             for table_name in self._writers
         }
+
+        # Add instrument writers (including bar types)
+        for key in self._instrument_writers:
+            info[key] = {
+                "size": self._file_sizes.get(key, 0),
+                "creation_time": self._file_creation_times.get(key),
+            }
+        return info
 
     def get_next_rotation_time(
         self,

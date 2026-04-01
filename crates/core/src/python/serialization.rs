@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -33,7 +33,6 @@ where
     T: DeserializeOwned,
 {
     // Extract to JSON bytes
-    use crate::python::to_pyvalue_err;
     let json_str: String = PyModule::import(py, "json")?
         .call_method("dumps", (values,), None)?
         .extract()?;

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,13 +15,58 @@
 
 from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 from nautilus_trader.adapters.binance.common.enums import BinanceKeyType
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesMarginType
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 from nautilus_trader.config import PositiveInt
 from nautilus_trader.model.identifiers import Venue
+
+
+class BinanceInstrumentProviderConfig(InstrumentProviderConfig, frozen=True):
+    """
+    Configuration for ``BinanceInstrumentProvider`` instances.
+
+    Parameters
+    ----------
+    load_all : bool, default False
+        If all venue instruments should be loaded on start.
+    load_ids : frozenset[InstrumentId], optional
+        The list of instrument IDs to be loaded on start (if `load_all` is False).
+    filters : frozendict or dict[str, Any], optional
+        The venue specific instrument loading filters to apply.
+    filter_callable: str, optional
+        A fully qualified path to a callable that takes a single argument, `instrument` and returns a bool, indicating
+        whether the instrument should be loaded
+    log_warnings : bool, default True
+        If parser warnings should be logged.
+    query_commission_rates : bool, default False
+        If commission rates should be queried per symbol from the exchange.
+        When False, uses venue fee tier tables as fallback.
+        Recommended for market maker accounts with negative maker fees.
+
+    """
+
+    def __eq__(self, other: object) -> bool:
+        if other is None:
+            return False
+        if not isinstance(other, BinanceInstrumentProviderConfig):
+            return False
+        return (
+            self.load_all == other.load_all
+            and self.load_ids == other.load_ids
+            and self.filters == other.filters
+            and self.query_commission_rates == other.query_commission_rates
+        )
+
+    def __hash__(self) -> int:
+        filters = frozenset(self.filters.items()) if self.filters else None
+        return hash((self.load_all, self.load_ids, filters, self.query_commission_rates))
+
+    query_commission_rates: bool = False
 
 
 class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
@@ -34,24 +79,28 @@ class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
         The venue for the client.
     api_key : str, optional
         The Binance API public key.
-        If ``None`` then will source the `BINANCE_API_KEY` or
-        `BINANCE_TESTNET_API_KEY` environment variables.
+        If ``None``, the client will work for public market data only.
+        Providing an API key may improve rate limits.
     api_secret : str, optional
         The Binance API secret key.
-        If ``None`` then will source the `BINANCE_API_SECRET` or
-        `BINANCE_TESTNET_API_SECRET` environment variables.
+        If ``None``, the client will work for public market data only.
     key_type : BinanceKeyType, default 'HMAC'
-        The private key cryptographic algorithm type.
+        Deprecated: key type is now auto-detected from the api_secret format.
+        Only needed for RSA keys (set explicitly to ``BinanceKeyType.RSA``).
     account_type : BinanceAccountType, default BinanceAccountType.SPOT
         The account type for the client.
     base_url_http : str, optional
         The HTTP client custom endpoint override.
     base_url_ws : str, optional
         The WebSocket client custom endpoint override.
+    proxy_url : str, optional
+        The proxy URL for HTTP requests.
+    environment : BinanceEnvironment, optional
+        The Binance environment (LIVE, TESTNET, or DEMO). Defaults to LIVE.
     us : bool, default False
         If client is connecting to Binance US.
     testnet : bool, default False
-        If the client is connecting to a Binance testnet.
+        Deprecated: use ``environment`` instead.
     update_instruments_interval_mins: PositiveInt or None, default 60
         The interval (minutes) between reloading instruments from the venue.
     use_agg_trade_ticks : bool, default False
@@ -67,6 +116,8 @@ class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
     account_type: BinanceAccountType = BinanceAccountType.SPOT
     base_url_http: str | None = None
     base_url_ws: str | None = None
+    proxy_url: str | None = None
+    environment: BinanceEnvironment | None = None
     us: bool = False
     testnet: bool = False
     update_instruments_interval_mins: PositiveInt | None = 60
@@ -83,24 +134,30 @@ class BinanceExecClientConfig(LiveExecClientConfig, frozen=True):
         The venue for the client.
     api_key : str, optional
         The Binance API public key.
-        If ``None`` then will source the `BINANCE_API_KEY` or
-        `BINANCE_TESTNET_API_KEY` environment variables.
+        If ``None`` then will source from `BINANCE_API_KEY` (or testnet equivalent).
     api_secret : str, optional
         The Binance API secret key.
-        If ``None`` then will source the `BINANCE_API_SECRET` or
-        `BINANCE_TESTNET_API_SECRET` environment variables.
+        If ``None`` then will source from `BINANCE_API_SECRET` (or testnet equivalent).
     key_type : BinanceKeyType, default 'HMAC'
-        The private key cryptographic algorithm type.
+        Deprecated: key type is now auto-detected from the api_secret format.
+        Only needed for RSA keys (set explicitly to ``BinanceKeyType.RSA``).
     account_type : BinanceAccountType, default BinanceAccountType.SPOT
         The account type for the client.
     base_url_http : str, optional
         The HTTP client custom endpoint override.
     base_url_ws : str, optional
-        The WebSocket client custom endpoint override.
+        The WebSocket API client custom endpoint override.
+    base_url_ws_stream : str, optional
+        The WebSocket stream custom endpoint override for futures user data event delivery.
+        Only applicable to futures account types. When ``None``, derived from the environment.
+    proxy_url : str, optional
+        The proxy URL for HTTP requests.
+    environment : BinanceEnvironment, optional
+        The Binance environment (LIVE, TESTNET, or DEMO). Defaults to LIVE.
     us : bool, default False
         If client is connecting to Binance US.
     testnet : bool, default False
-        If the client is connecting to a Binance testnet.
+        Deprecated: use ``environment`` instead.
     use_gtd : bool, default True
         If GTD orders will use the Binance GTD TIF option.
         If False, then GTD time in force will be remapped to GTC (this is useful if managing GTD orders locally).
@@ -130,8 +187,8 @@ class BinanceExecClientConfig(LiveExecClientConfig, frozen=True):
         The initial leverage to be used for each symbol. It's applicable to futures only.
     futures_margin_types : dict[BinanceSymbol, BinanceFuturesMarginType], optional
         Margin type (isolated or cross) to be used for each symbol. It's applicable to futures only.
-    listen_key_ping_max_failures : PositiveInt, default 3
-        The maximum number of consecutive listen key ping failures before triggering recovery.
+    log_rejected_due_post_only_as_warning : bool, default True
+        If order rejected events where `due_post_only` is True should be logged as warnings.
 
     Warnings
     --------
@@ -146,6 +203,9 @@ class BinanceExecClientConfig(LiveExecClientConfig, frozen=True):
     account_type: BinanceAccountType = BinanceAccountType.SPOT
     base_url_http: str | None = None
     base_url_ws: str | None = None
+    base_url_ws_stream: str | None = None
+    proxy_url: str | None = None
+    environment: BinanceEnvironment | None = None
     us: bool = False
     testnet: bool = False
     use_gtd: bool = True
@@ -159,4 +219,4 @@ class BinanceExecClientConfig(LiveExecClientConfig, frozen=True):
     retry_delay_max_ms: PositiveInt | None = None
     futures_leverages: dict[BinanceSymbol, PositiveInt] | None = None
     futures_margin_types: dict[BinanceSymbol, BinanceFuturesMarginType] | None = None
-    listen_key_ping_max_failures: PositiveInt = 3
+    log_rejected_due_post_only_as_warning: bool = True

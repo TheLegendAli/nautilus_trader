@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -20,6 +20,10 @@
 // memory leak), so the compiler raises an error about an unknown cfg feature.
 // This attribute prevents those errors without actually enabling `gil-refs`.
 #![allow(unexpected_cfgs)]
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "errors documented on underlying Rust methods"
+)]
 
 pub mod http;
 pub mod socket;
@@ -27,17 +31,19 @@ pub mod websocket;
 
 use std::num::NonZeroU32;
 
-use pyo3::{PyTypeCheck, exceptions::PyException, prelude::*};
+use nautilus_core::python::to_pyexception;
+use pyo3::prelude::*;
 
 use crate::{
     python::{
-        http::{HttpError, HttpTimeoutError},
+        http::{HttpClientBuildError, HttpError, HttpInvalidProxyError, HttpTimeoutError},
         websocket::WebSocketClientError,
     },
     ratelimiter::quota::Quota,
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Quota {
     /// Construct a quota for a number of requests per second.
     ///
@@ -46,12 +52,13 @@ impl Quota {
     /// Returns a `PyErr` if the max burst capacity is 0
     #[staticmethod]
     pub fn rate_per_second(max_burst: u32) -> PyResult<Self> {
-        match NonZeroU32::new(max_burst) {
-            Some(max_burst) => Ok(Self::per_second(max_burst)),
-            None => Err(PyErr::new::<PyException, _>(
-                "Max burst capacity should be a non-zero integer",
-            )),
-        }
+        let max_burst = NonZeroU32::new(max_burst)
+            .ok_or_else(|| to_pyexception("Max burst capacity should be a non-zero integer"))?;
+        Self::per_second(max_burst).ok_or_else(|| {
+            to_pyexception(
+                "Max burst too large: replenish interval rounds to zero (max 1_000_000_000)",
+            )
+        })
     }
 
     /// Construct a quota for a number of requests per minute.
@@ -63,7 +70,7 @@ impl Quota {
     pub fn rate_per_minute(max_burst: u32) -> PyResult<Self> {
         match NonZeroU32::new(max_burst) {
             Some(max_burst) => Ok(Self::per_minute(max_burst)),
-            None => Err(PyErr::new::<PyException, _>(
+            None => Err(to_pyexception(
                 "Max burst capacity should be a non-zero integer",
             )),
         }
@@ -78,7 +85,7 @@ impl Quota {
     pub fn rate_per_hour(max_burst: u32) -> PyResult<Self> {
         match NonZeroU32::new(max_burst) {
             Some(max_burst) => Ok(Self::per_hour(max_burst)),
-            None => Err(PyErr::new::<PyException, _>(
+            None => Err(to_pyexception(
                 "Max burst capacity should be a non-zero integer",
             )),
         }
@@ -91,7 +98,7 @@ impl Quota {
 ///
 /// Returns a `PyErr` if registering any module components fails.
 #[pymodule]
-pub fn network(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn network(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::http::HttpClient>()?;
     m.add_class::<crate::http::HttpMethod>()?;
     m.add_class::<crate::http::HttpResponse>()?;
@@ -101,19 +108,26 @@ pub fn network(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::socket::SocketClient>()?;
     m.add_class::<crate::socket::SocketConfig>()?;
 
-    // Add error classes
     m.add(
-        <WebSocketClientError as PyTypeCheck>::NAME,
+        "WebSocketClientError",
         m.py().get_type::<WebSocketClientError>(),
     )?;
+    m.add("HttpError", m.py().get_type::<HttpError>())?;
+    m.add("HttpTimeoutError", m.py().get_type::<HttpTimeoutError>())?;
     m.add(
-        <HttpError as PyTypeCheck>::NAME,
-        m.py().get_type::<HttpError>(),
+        "HttpInvalidProxyError",
+        m.py().get_type::<HttpInvalidProxyError>(),
     )?;
     m.add(
-        <HttpTimeoutError as PyTypeCheck>::NAME,
-        m.py().get_type::<HttpTimeoutError>(),
+        "HttpClientBuildError",
+        m.py().get_type::<HttpClientBuildError>(),
     )?;
+
+    m.add_function(wrap_pyfunction!(http::http_get, m)?)?;
+    m.add_function(wrap_pyfunction!(http::http_post, m)?)?;
+    m.add_function(wrap_pyfunction!(http::http_patch, m)?)?;
+    m.add_function(wrap_pyfunction!(http::http_delete, m)?)?;
+    m.add_function(wrap_pyfunction!(http::http_download, m)?)?;
 
     Ok(())
 }

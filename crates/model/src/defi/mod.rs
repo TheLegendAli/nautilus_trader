@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -30,9 +30,18 @@ pub mod chain;
 pub mod data;
 pub mod dex;
 pub mod hex;
+pub mod pool_analysis;
+pub mod pool_identifier;
+pub mod reporting;
 pub mod rpc;
+pub mod tick_map;
 pub mod token;
 pub mod types;
+pub mod validation;
+pub mod wallet;
+
+#[cfg(test)]
+pub mod stubs;
 
 // Re-exports
 pub use amm::{Pool, SharedPool};
@@ -40,11 +49,15 @@ pub use chain::{Blockchain, Chain, SharedChain};
 pub use data::{
     DefiData,
     block::Block,
+    collect::PoolFeeCollect,
+    flash::PoolFlash,
     liquidity::{PoolLiquidityUpdate, PoolLiquidityUpdateType},
     swap::PoolSwap,
     transaction::Transaction,
 };
-pub use dex::{AmmType, Dex, SharedDex};
+pub use dex::{AmmType, Dex, DexType, SharedDex};
+pub use pool_analysis::PoolProfiler;
+pub use pool_identifier::PoolIdentifier;
 pub use token::{SharedToken, Token};
 
 /// Number of decimal places used by the native Ether denomination.

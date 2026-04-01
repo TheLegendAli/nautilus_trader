@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -28,12 +28,41 @@ use crate::defi::{
     },
 };
 
+/// Represents the precise position of an event within a blockchain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BlockPosition {
+    /// The block number (height) in the blockchain where the event occurred.
+    pub number: u64,
+    /// The unique hash identifier of the transaction containing the event.
+    pub transaction_hash: String,
+    /// The index position of the transaction within the block (0-based).
+    pub transaction_index: u32,
+    /// The index position of the log/event within the transaction (0-based).
+    pub log_index: u32,
+}
+
+impl BlockPosition {
+    /// Creates a new [`BlockPosition`] with the specified positioning data.
+    pub fn new(number: u64, transaction_hash: String, index: u32, log_index: u32) -> Self {
+        Self {
+            number,
+            transaction_hash,
+            transaction_index: index,
+            log_index,
+        }
+    }
+}
+
 /// Represents an Ethereum-compatible blockchain block with essential metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct Block {
     /// The blockchain network this block is part of.
@@ -122,7 +151,7 @@ impl Block {
     }
 
     pub fn set_chain(&mut self, chain: Blockchain) {
-        self.chain = Some(chain)
+        self.chain = Some(chain);
     }
 
     /// Sets the EIP-1559 base fee and returns `self` for chaining.

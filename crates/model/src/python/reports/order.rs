@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,7 +17,12 @@ use nautilus_core::{
     UUID4,
     python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3},
 };
-use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+use pyo3::{
+    Py,
+    basic::CompareOp,
+    prelude::*,
+    types::{PyDict, PyList},
+};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -31,7 +36,9 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderStatusReport {
+    /// Represents an order status at a point in time.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -51,6 +58,8 @@ impl OrderStatusReport {
         report_id=None,
         order_list_id=None,
         venue_position_id=None,
+        linked_order_ids=None,
+        parent_order_id=None,
         contingency_type=None,
         expire_time=None,
         price=None,
@@ -83,6 +92,8 @@ impl OrderStatusReport {
         report_id: Option<UUID4>,
         order_list_id: Option<OrderListId>,
         venue_position_id: Option<PositionId>,
+        linked_order_ids: Option<Vec<ClientOrderId>>,
+        parent_order_id: Option<ClientOrderId>,
         contingency_type: Option<ContingencyType>,
         expire_time: Option<u64>,
         price: Option<Price>,
@@ -91,13 +102,13 @@ impl OrderStatusReport {
         limit_offset: Option<Decimal>,
         trailing_offset: Option<Decimal>,
         trailing_offset_type: Option<TrailingOffsetType>,
-        avg_px: Option<f64>,
+        avg_px: Option<Decimal>,
         display_qty: Option<Quantity>,
         post_only: bool,
         reduce_only: bool,
         cancel_reason: Option<String>,
         ts_triggered: Option<u64>,
-    ) -> PyResult<Self> {
+    ) -> Self {
         let mut report = Self::new(
             account_id,
             instrument_id,
@@ -118,53 +129,76 @@ impl OrderStatusReport {
         if let Some(order_list_id) = order_list_id {
             report = report.with_order_list_id(order_list_id);
         }
+
         if let Some(venue_position_id) = venue_position_id {
             report = report.with_venue_position_id(venue_position_id);
         }
+
+        if let Some(linked_order_ids) = linked_order_ids {
+            report = report.with_linked_order_ids(linked_order_ids);
+        }
+
+        if let Some(parent_order_id) = parent_order_id {
+            report = report.with_parent_order_id(parent_order_id);
+        }
+
         if let Some(contingency_type) = contingency_type {
             report = report.with_contingency_type(contingency_type);
         }
+
         if let Some(expire_time) = expire_time {
             report = report.with_expire_time(expire_time.into());
         }
+
         if let Some(price) = price {
             report = report.with_price(price);
         }
+
         if let Some(trigger_price) = trigger_price {
             report = report.with_trigger_price(trigger_price);
         }
+
         if let Some(trigger_type) = trigger_type {
             report = report.with_trigger_type(trigger_type);
         }
+
         if let Some(limit_offset) = limit_offset {
             report = report.with_limit_offset(limit_offset);
         }
+
         if let Some(trailing_offset) = trailing_offset {
             report = report.with_trailing_offset(trailing_offset);
         }
+
         if let Some(trailing_offset_type) = trailing_offset_type {
             report = report.with_trailing_offset_type(trailing_offset_type);
         }
+
         if let Some(avg_px) = avg_px {
-            report = report.with_avg_px(avg_px);
+            report.avg_px = Some(avg_px);
         }
+
         if let Some(display_qty) = display_qty {
             report = report.with_display_qty(display_qty);
         }
+
         if post_only {
             report = report.with_post_only(post_only);
         }
+
         if reduce_only {
             report = report.with_reduce_only(reduce_only);
         }
+
         if let Some(cancel_reason) = cancel_reason {
             report = report.with_cancel_reason(cancel_reason);
         }
+
         if let Some(ts_triggered) = ts_triggered {
             report = report.with_ts_triggered(ts_triggered.into());
         }
 
-        Ok(report)
+        report
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -280,6 +314,18 @@ impl OrderStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "linked_order_ids")]
+    fn py_linked_order_ids(&self) -> Option<Vec<ClientOrderId>> {
+        self.linked_order_ids.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "parent_order_id")]
+    fn py_parent_order_id(&self) -> Option<ClientOrderId> {
+        self.parent_order_id
+    }
+
+    #[getter]
     #[pyo3(name = "contingency_type")]
     const fn py_contingency_type(&self) -> ContingencyType {
         self.contingency_type
@@ -329,7 +375,7 @@ impl OrderStatusReport {
 
     #[getter]
     #[pyo3(name = "avg_px")]
-    const fn py_avg_px(&self) -> Option<f64> {
+    fn py_avg_px(&self) -> Option<Decimal> {
         self.avg_px
     }
 
@@ -363,6 +409,19 @@ impl OrderStatusReport {
         self.ts_triggered.map(|t| t.as_u64())
     }
 
+    #[getter]
+    #[pyo3(name = "is_open")]
+    fn py_is_open(&self) -> bool {
+        matches!(
+            self.order_status,
+            OrderStatus::Accepted
+                | OrderStatus::Triggered
+                | OrderStatus::PendingCancel
+                | OrderStatus::PendingUpdate
+                | OrderStatus::PartiallyFilled
+        )
+    }
+
     /// Creates an `OrderStatusReport` from a Python dictionary.
     ///
     /// # Errors
@@ -380,7 +439,7 @@ impl OrderStatusReport {
     ///
     /// Returns a Python exception if conversion to dict fails.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("type", stringify!(OrderStatusReport))?;
         dict.set_item("account_id", self.account_id.to_string())?;
@@ -411,6 +470,21 @@ impl OrderStatusReport {
         match &self.order_list_id {
             Some(id) => dict.set_item("order_list_id", id.to_string())?,
             None => dict.set_item("order_list_id", py.None())?,
+        }
+        match &self.venue_position_id {
+            Some(id) => dict.set_item("venue_position_id", id.to_string())?,
+            None => dict.set_item("venue_position_id", py.None())?,
+        }
+        match &self.linked_order_ids {
+            Some(ids) => {
+                let py_list = PyList::new(py, ids.iter().map(|id| id.to_string()))?;
+                dict.set_item("linked_order_ids", py_list)?;
+            }
+            None => dict.set_item("linked_order_ids", py.None())?,
+        }
+        match &self.parent_order_id {
+            Some(id) => dict.set_item("parent_order_id", id.to_string())?,
+            None => dict.set_item("parent_order_id", py.None())?,
         }
         match &self.expire_time {
             Some(t) => dict.set_item("expire_time", t.as_u64())?,

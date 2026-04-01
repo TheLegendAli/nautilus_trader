@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -42,7 +42,11 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct QuoteTick {
     /// The quotes instrument ID.
@@ -170,10 +174,16 @@ impl QuoteTick {
         match price_type {
             PriceType::Bid => self.bid_price,
             PriceType::Ask => self.ask_price,
-            PriceType::Mid => Price::from_raw(
-                (self.bid_price.raw + self.ask_price.raw) / 2,
-                cmp::min(self.bid_price.precision + 1, FIXED_PRECISION),
-            ),
+            PriceType::Mid => {
+                // Calculate mid avoiding overflow
+                let a = self.bid_price.raw;
+                let b = self.ask_price.raw;
+                let mid_raw = (a / 2) + (b / 2) + ((a % 2 + b % 2) / 2);
+                Price::from_raw(
+                    mid_raw,
+                    cmp::min(self.bid_price.precision + 1, FIXED_PRECISION),
+                )
+            }
             _ => panic!("Cannot extract with price type {price_type}"),
         }
     }
@@ -188,10 +198,16 @@ impl QuoteTick {
         match price_type {
             PriceType::Bid => self.bid_size,
             PriceType::Ask => self.ask_size,
-            PriceType::Mid => Quantity::from_raw(
-                (self.bid_size.raw + self.ask_size.raw) / 2,
-                cmp::min(self.bid_size.precision + 1, FIXED_PRECISION),
-            ),
+            PriceType::Mid => {
+                // Calculate mid avoiding overflow
+                let a = self.bid_size.raw;
+                let b = self.ask_size.raw;
+                let mid_raw = (a / 2) + (b / 2) + ((a % 2 + b % 2) / 2);
+                Quantity::from_raw(
+                    mid_raw,
+                    cmp::min(self.bid_size.precision + 1, FIXED_PRECISION),
+                )
+            }
             _ => panic!("Cannot extract with price type {price_type}"),
         }
     }
@@ -220,9 +236,6 @@ impl HasTsInit for QuoteTick {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
 

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -18,6 +18,7 @@ use nautilus_core::{
     python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3},
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
+use rust_decimal::Decimal;
 
 use crate::{
     enums::PositionSide,
@@ -27,9 +28,11 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PositionStatusReport {
+    /// Represents a position status at a point in time.
     #[new]
-    #[pyo3(signature = (account_id, instrument_id, position_side, quantity, ts_last, ts_init, venue_position_id=None, report_id=None))]
+    #[pyo3(signature = (account_id, instrument_id, position_side, quantity, ts_last, ts_init, report_id=None, venue_position_id=None, avg_px_open=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         account_id: AccountId,
@@ -38,19 +41,21 @@ impl PositionStatusReport {
         quantity: Quantity,
         ts_last: u64,
         ts_init: u64,
-        venue_position_id: Option<PositionId>,
         report_id: Option<UUID4>,
-    ) -> PyResult<Self> {
-        Ok(Self::new(
+        venue_position_id: Option<PositionId>,
+        avg_px_open: Option<Decimal>,
+    ) -> Self {
+        Self::new(
             account_id,
             instrument_id,
-            position_side,
+            position_side.as_specified(),
             quantity,
-            venue_position_id,
             ts_last.into(),
             ts_init.into(),
             report_id,
-        ))
+            venue_position_id,
+            avg_px_open,
+        )
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -95,14 +100,20 @@ impl PositionStatusReport {
 
     #[getter]
     #[pyo3(name = "position_side")]
-    const fn py_position_side(&self) -> PositionSide {
-        self.position_side
+    fn py_position_side(&self) -> PositionSide {
+        self.position_side.as_position_side()
     }
 
     #[getter]
     #[pyo3(name = "quantity")]
     const fn py_quantity(&self) -> Quantity {
         self.quantity
+    }
+
+    #[getter]
+    #[pyo3(name = "avg_px_open")]
+    const fn py_avg_px_open(&self) -> Option<Decimal> {
+        self.avg_px_open
     }
 
     #[getter]
@@ -123,18 +134,21 @@ impl PositionStatusReport {
         self.ts_init.as_u64()
     }
 
+    /// Checks if this is a flat position (quantity is zero).
     #[getter]
     #[pyo3(name = "is_flat")]
-    const fn py_is_flat(&self) -> bool {
+    fn py_is_flat(&self) -> bool {
         self.is_flat()
     }
 
+    /// Checks if this is a long position.
     #[getter]
     #[pyo3(name = "is_long")]
     fn py_is_long(&self) -> bool {
         self.is_long()
     }
 
+    /// Checks if this is a short position.
     #[getter]
     #[pyo3(name = "is_short")]
     fn py_is_short(&self) -> bool {
@@ -158,7 +172,7 @@ impl PositionStatusReport {
     ///
     /// Returns a Python exception if conversion to dict fails.
     #[pyo3(name = "to_dict")]
-    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("type", stringify!(PositionStatusReport))?;
         dict.set_item("account_id", self.account_id.to_string())?;

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -21,7 +21,7 @@ from decimal import Decimal
 import msgspec
 import pandas as pd
 import pytz
-from ibapi.commission_report import CommissionReport
+from ibapi.commission_and_fees_report import CommissionAndFeesReport
 from ibapi.common import UNSET_DECIMAL
 from ibapi.common import BarData
 from ibapi.contract import Contract  # We use this for the expected response from IB
@@ -37,6 +37,7 @@ from nautilus_trader.adapters.interactive_brokers.common import IBContractDetail
 from nautilus_trader.adapters.interactive_brokers.parsing.instruments import parse_instrument
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.instruments import Equity
+from nautilus_trader.model.instruments import IndexInstrument
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.model.instruments import OptionContract
 from tests import TESTS_PACKAGE_ROOT
@@ -180,8 +181,8 @@ class IBTestContractStubs:
             "contract": IBTestContractStubs.aapl_equity_contract(),
             "marketName": "NMS",
             "minTick": 0.01,
-            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,BENCHPX,CASHQTY,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,PEGBENCH,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",  # noqa: E501
-            "validExchanges": "SMART,AMEX,NYSE,CBOE,PHLX,ISE,CHX,ARCA,ISLAND,DRCTEDGE,BEX,BATS,EDGEA,CSFBALGO,JEFFALGO,BYX,IEX,EDGX,FOXRIVER,PEARL,NYSENAT,LTSE,MEMX,TPLUS1,PSX",  # noqa: E501
+            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,BENCHPX,CASHQTY,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,PEGBENCH,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",
+            "validExchanges": "SMART,AMEX,NYSE,CBOE,PHLX,ISE,CHX,ARCA,ISLAND,DRCTEDGE,BEX,BATS,EDGEA,CSFBALGO,JEFFALGO,BYX,IEX,EDGX,FOXRIVER,PEARL,NYSENAT,LTSE,MEMX,TPLUS1,PSX",
             "priceMagnifier": 1,
             "underConId": 0,
             "longName": "APPLE INC",
@@ -190,8 +191,8 @@ class IBTestContractStubs:
             "category": "Computers",
             "subcategory": "Computers",
             "timeZoneId": "US/Eastern",
-            "tradingHours": "20221207:0700-20221207:2000;20221208:0700-20221208:2000;20221209:0700-20221209:2000;20221210:CLOSED;20221211:CLOSED;20221212:0700-20221212:2000",  # noqa: E501
-            "liquidHours": "20221207:0700-20221207:2000;20221208:0700-20221208:2000;20221209:0700-20221209:2000;20221210:CLOSED;20221211:CLOSED;20221212:0700-20221212:2000",  # noqa: E501
+            "tradingHours": "20221207:0700-20221207:2000;20221208:0700-20221208:2000;20221209:0700-20221209:2000;20221210:CLOSED;20221211:CLOSED;20221212:0700-20221212:2000",
+            "liquidHours": "20221207:0700-20221207:2000;20221208:0700-20221208:2000;20221209:0700-20221209:2000;20221210:CLOSED;20221211:CLOSED;20221212:0700-20221212:2000",
             "evRule": "",
             "evMultiplier": 0,
             "mdSizeMultiplier": 1,
@@ -250,7 +251,7 @@ class IBTestContractStubs:
             "contract": IBTestContractStubs.cl_future_contract(),
             "marketName": "CL",
             "minTick": 0.01,
-            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALGO,ALLOC,AVGCOST,BASKET,BENCHPX,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,ICE,IOC,LIT,LMT,LTH,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,PEGBENCH,SCALE,SCALERST,SIZECHK,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",  # noqa
+            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALGO,ALLOC,AVGCOST,BASKET,BENCHPX,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,ICE,IOC,LIT,LMT,LTH,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,PEGBENCH,SCALE,SCALERST,SIZECHK,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",
             "validExchanges": "NYMEX,QBALGO",
             "priceMagnifier": 1,
             "underConId": 17340715,
@@ -260,8 +261,8 @@ class IBTestContractStubs:
             "category": "",
             "subcategory": "",
             "timeZoneId": "US/Eastern",
-            "tradingHours": "20221206:1800-20221207:1700;20221207:1800-20221208:1700;20221208:1800-20221209:1700;20221210:CLOSED;20221211:1800-20221212:1700;20221212:1800-20221213:1700",  # noqa
-            "liquidHours": "20221207:0930-20221207:1700;20221208:0930-20221208:1700;20221209:0930-20221209:1700;20221210:CLOSED;20221211:CLOSED;20221212:0930-20221212:1700;20221212:1800-20221213:1700",  # noqa
+            "tradingHours": "20221206:1800-20221207:1700;20221207:1800-20221208:1700;20221208:1800-20221209:1700;20221210:CLOSED;20221211:1800-20221212:1700;20221212:1800-20221213:1700",
+            "liquidHours": "20221207:0930-20221207:1700;20221208:0930-20221208:1700;20221209:0930-20221209:1700;20221210:CLOSED;20221211:CLOSED;20221212:0930-20221212:1700;20221212:1800-20221213:1700",
             "evRule": "",
             "evMultiplier": 0,
             "mdSizeMultiplier": 1,
@@ -326,7 +327,7 @@ class IBTestContractStubs:
             "contract": cls.es_future_option_contract(),
             "marketName": "E4A",
             "minTick": 0.05,
-            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,LTH,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,VOLAT,WHATIF",  # noqa: E501
+            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,LTH,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,VOLAT,WHATIF",
             "validExchanges": "CME",
             "priceMagnifier": 1,
             "underConId": 568550526,
@@ -389,7 +390,7 @@ class IBTestContractStubs:
             "contract": IBTestContractStubs.eurusd_forex_contract(),
             "marketName": "EUR.USD",
             "minTick": 5e-05,
-            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALGO,ALLOC,AVGCOST,BASKET,CASHQTY,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,NONALGO,OCA,REL,RELPCTOFS,SCALE,SCALERST,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",  # noqa
+            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALGO,ALLOC,AVGCOST,BASKET,CASHQTY,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,NONALGO,OCA,REL,RELPCTOFS,SCALE,SCALERST,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",
             "validExchanges": "IDEALPRO",
             "priceMagnifier": 1,
             "underConId": 0,
@@ -399,8 +400,8 @@ class IBTestContractStubs:
             "category": "",
             "subcategory": "",
             "timeZoneId": "US/Eastern",
-            "tradingHours": "20221205:1715-20221206:1700;20221206:1715-20221207:1700;20221207:1715-20221208:1700;20221208:1715-20221209:1700;20221210:CLOSED;20221211:1715-20221212:1700",  # noqa
-            "liquidHours": "20221205:1715-20221206:1700;20221206:1715-20221207:1700;20221207:1715-20221208:1700;20221208:1715-20221209:1700;20221210:CLOSED;20221211:1715-20221212:1700",  # noqa
+            "tradingHours": "20221205:1715-20221206:1700;20221206:1715-20221207:1700;20221207:1715-20221208:1700;20221208:1715-20221209:1700;20221210:CLOSED;20221211:1715-20221212:1700",
+            "liquidHours": "20221205:1715-20221206:1700;20221206:1715-20221207:1700;20221207:1715-20221208:1700;20221208:1715-20221209:1700;20221210:CLOSED;20221211:1715-20221212:1700",
             "evRule": "",
             "evMultiplier": 0,
             "mdSizeMultiplier": 1,
@@ -456,7 +457,7 @@ class IBTestContractStubs:
             "contract": IBTestContractStubs.tsla_option_contract(),
             "marketName": "TSLA",
             "minTick": 0.01,
-            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,OPENCLOSE,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",  # noqa
+            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,AVGCOST,BASKET,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,IOC,LIT,LMT,MIT,MKT,MTL,NGCOMB,NONALGO,OCA,OPENCLOSE,SCALE,SCALERST,SNAPMID,SNAPMKT,SNAPREL,STP,STPLMT,TRAIL,TRAILLIT,TRAILLMT,TRAILMIT,WHATIF",
             "validExchanges": "SMART,AMEX,CBOE,PHLX,PSE,ISE,BOX,BATS,NASDAQOM,CBOE2,NASDAQBX,MIAX,GEMINI,EDGX,MERCURY,PEARL,EMERALD",
             "priceMagnifier": 1,
             "underConId": 76792991,
@@ -466,8 +467,8 @@ class IBTestContractStubs:
             "category": "",
             "subcategory": "",
             "timeZoneId": "US/Eastern",
-            "tradingHours": "20221207:0930-20221207:1600;20221208:0930-20221208:1600;20221209:0930-20221209:1600;20221210:CLOSED;20221211:CLOSED;20221212:0930-20221212:1600",  # noqa: E501
-            "liquidHours": "20221207:0930-20221207:1600;20221208:0930-20221208:1600;20221209:0930-20221209:1600;20221210:CLOSED;20221211:CLOSED;20221212:0930-20221212:1600",  # noqa: E501
+            "tradingHours": "20221207:0930-20221207:1600;20221208:0930-20221208:1600;20221209:0930-20221209:1600;20221210:CLOSED;20221211:CLOSED;20221212:0930-20221212:1600",
+            "liquidHours": "20221207:0930-20221207:1600;20221208:0930-20221208:1600;20221209:0930-20221209:1600;20221210:CLOSED;20221211:CLOSED;20221212:0930-20221212:1600",
             "evRule": "",
             "evMultiplier": 0,
             "mdSizeMultiplier": 1,
@@ -499,6 +500,81 @@ class IBTestContractStubs:
             "notes": "",
         }
         return IBTestContractStubs.create_contract_details(**params)
+
+    @staticmethod
+    def spx_index_contract() -> Contract:
+        params = {
+            "secType": "IND",
+            "conId": 416904,
+            "symbol": "SPX",
+            "exchange": "CBOE",
+            "primaryExchange": "CBOE",
+            "currency": "USD",
+            "localSymbol": "SPX",
+            "tradingClass": "",
+        }
+        return IBTestContractStubs.create_contract(**params)
+
+    @staticmethod
+    def spx_index_ib_contract() -> IBContract:
+        contract = IBTestContractStubs.spx_index_contract()
+        return IBTestContractStubs.convert_contract_to_ib_contract(contract)
+
+    @staticmethod
+    def spx_index_contract_details() -> ContractDetails:
+        params = {
+            "contract": IBTestContractStubs.spx_index_contract(),
+            "marketName": "",
+            "minTick": 0.01,
+            "orderTypes": "ACTIVETIM,AD,ADJUST,ALERT,ALLOC,BASKET,BENCHPX,COND,CONDORDER,DAY,DEACT,DEACTDIS,DEACTEOD,GAT,GTC,GTD,GTT,HID,LMT,NONALGO,OCA,SCALE,SCALERST,WHATIF",
+            "validExchanges": "CBOE",
+            "priceMagnifier": 1,
+            "underConId": 0,
+            "longName": "S&P 500 Stock Index",
+            "contractMonth": "",
+            "industry": "Indices",
+            "category": "Broad Range Equity Index",
+            "subcategory": "*",
+            "timeZoneId": "US/Central",
+            "tradingHours": "20260131:CLOSED;20260201:CLOSED;20260202:0830-20260202:1500;20260203:0830-20260203:1500;20260204:0830-20260204:1500;20260205:0830-20260205:1500",
+            "liquidHours": "20260131:CLOSED;20260201:CLOSED;20260202:0830-20260202:1500;20260203:0830-20260203:1500;20260204:0830-20260204:1500;20260205:0830-20260205:1500",
+            "evRule": "",
+            "evMultiplier": 0,
+            "mdSizeMultiplier": None,
+            "aggGroup": 2147483647,
+            "underSymbol": "",
+            "underSecType": "",
+            "marketRuleIds": "25",
+            "secIdList": None,
+            "realExpirationDate": "",
+            "lastTradeTime": "",
+            "stockType": "",
+            "minSize": 1.0,
+            "sizeIncrement": 1.0,
+            "suggestedSizeIncrement": 1.0,
+            "cusip": "",
+            "ratings": "",
+            "descAppend": "",
+            "bondType": "",
+            "couponType": "",
+            "callable": False,
+            "putable": False,
+            "coupon": 0,
+            "convertible": False,
+            "maturity": "",
+            "issueDate": "",
+            "nextOptionDate": "",
+            "nextOptionType": "",
+            "nextOptionPartial": False,
+            "notes": "",
+        }
+        return IBTestContractStubs.create_contract_details(**params)
+
+    @staticmethod
+    def spx_instrument() -> IndexInstrument:
+        contract_details = IBTestContractStubs.spx_index_contract_details()
+        instrument = IBTestContractStubs.create_instrument(contract_details)
+        return instrument
 
     @staticmethod
     def aapl_instrument() -> Equity:
@@ -712,7 +788,7 @@ class IBTestExecStubs:
             "isOmsContainer": False,
             "discretionaryUpToLimitPrice": False,
             "autoCancelDate": "",
-            "filledQuantity": Decimal("170141183460469231731687303715884105727"),
+            "filledQuantity": Decimal(170141183460469231731687303715884105727),
             "refFuturesConId": 0,
             "autoCancelParent": False,
             "shareholder": "",
@@ -774,16 +850,16 @@ class IBTestExecStubs:
         return set_attributes(Execution(), params)
 
     @staticmethod
-    def commission() -> CommissionReport:
+    def commission() -> CommissionAndFeesReport:
         params = {
             "execId": "0000e0d5.6596b0d2.01.01",
-            "commission": 1.0,
+            "commissionAndFees": 1.0,
             "currency": "USD",
             "realizedPNL": 0.0,
             "yield_": 0.0,
             "yieldRedemptionDate": 0,
         }
-        return set_attributes(CommissionReport(), params)
+        return set_attributes(CommissionAndFeesReport(), params)
 
 
 def filter_out_options(instrument) -> bool:

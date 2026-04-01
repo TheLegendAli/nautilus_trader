@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -125,6 +125,7 @@ class DatabentoDataLoader:
         include_trades: bool = False,
         use_exchange_as_venue: bool = False,
         bars_timestamp_on_close: bool = True,
+        skip_on_error: bool = False,
     ) -> list[Data]:
         """
         Return a list of data objects decoded from the DBN file at the given `path`.
@@ -155,6 +156,9 @@ class DatabentoDataLoader:
             Whether to use actual exchanges for instrument ids or GLBX.
         bars_timestamp_on_close : bool, default True
             If bar timestamps should be set to close time (True) or open time (False).
+        skip_on_error : bool, default False
+            If True, instruments that fail to decode are skipped with a warning log.
+            If False (default), any decode error is raised as an exception.
 
         Returns
         -------
@@ -185,7 +189,11 @@ class DatabentoDataLoader:
 
         match schema:
             case DatabentoSchema.DEFINITION.value:
-                data = self._pyo3_loader.load_instruments(str(path), use_exchange_as_venue)
+                data = self._pyo3_loader.load_instruments(
+                    str(path),
+                    use_exchange_as_venue,
+                    skip_on_error,
+                )
 
                 if as_legacy_cython:
                     data = instruments_from_pyo3(data)
@@ -241,6 +249,31 @@ class DatabentoDataLoader:
                         instrument_id=pyo3_instrument_id,
                         price_precision=price_precision,
                     )
+            case DatabentoSchema.CMBP_1.value:
+                if as_legacy_cython:
+                    capsule = self._pyo3_loader.load_cmbp_quotes_as_pycapsule(
+                        filepath=str(path),
+                        instrument_id=pyo3_instrument_id,
+                        price_precision=price_precision,
+                        include_trades=include_trades,
+                    )
+                    data = capsule_to_list(capsule)
+                    # Drop encapsulated `CVec` as data is now transferred
+                    drop_cvec_pycapsule(capsule)
+
+                    return data
+                else:
+                    if include_trades:
+                        raise RuntimeError(
+                            "Cannot load `QuoteTick` and `TradeTick` objects together, "
+                            "set `include_trades` to False",
+                        )
+
+                    return self._pyo3_loader.load_cmbp_quotes(
+                        filepath=str(path),
+                        instrument_id=pyo3_instrument_id,
+                        price_precision=price_precision,
+                    )
             case DatabentoSchema.BBO_1S.value | DatabentoSchema.BBO_1M.value:
                 if as_legacy_cython:
                     capsule = self._pyo3_loader.load_bbo_quotes_as_pycapsule(
@@ -259,6 +292,63 @@ class DatabentoDataLoader:
                         instrument_id=pyo3_instrument_id,
                         price_precision=price_precision,
                     )
+            case DatabentoSchema.CBBO_1S.value | DatabentoSchema.CBBO_1M.value:
+                if as_legacy_cython:
+                    capsule = self._pyo3_loader.load_cbbo_quotes_as_pycapsule(
+                        filepath=str(path),
+                        instrument_id=pyo3_instrument_id,
+                        price_precision=price_precision,
+                    )
+                    data = capsule_to_list(capsule)
+                    # Drop encapsulated `CVec` as data is now transferred
+                    drop_cvec_pycapsule(capsule)
+
+                    return data
+                else:
+                    return self._pyo3_loader.load_cbbo_quotes(
+                        filepath=str(path),
+                        instrument_id=pyo3_instrument_id,
+                        price_precision=price_precision,
+                    )
+            case DatabentoSchema.TCBBO.value:
+                # TCBBO provides both quotes and trades
+                if as_legacy_cython:
+                    if include_trades:
+                        # Load both quotes and trades
+                        capsule = self._pyo3_loader.load_cbbo_quotes_as_pycapsule(
+                            filepath=str(path),
+                            instrument_id=pyo3_instrument_id,
+                            price_precision=price_precision,
+                        )
+                        data = capsule_to_list(capsule)
+                        # Drop encapsulated `CVec` as data is now transferred
+                        drop_cvec_pycapsule(capsule)
+                        return data
+                    else:
+                        # Load only trades (the primary data for TCBBO)
+                        capsule = self._pyo3_loader.load_tcbbo_trades_as_pycapsule(
+                            filepath=str(path),
+                            instrument_id=pyo3_instrument_id,
+                            price_precision=price_precision,
+                        )
+                        data = capsule_to_list(capsule)
+                        # Drop encapsulated `CVec` as data is now transferred
+                        drop_cvec_pycapsule(capsule)
+                        return data
+                else:
+                    if include_trades:
+                        # Both quotes and trades
+                        return self._pyo3_loader.load_cbbo_quotes(
+                            filepath=str(path),
+                            instrument_id=pyo3_instrument_id,
+                            price_precision=price_precision,
+                        )
+                    else:
+                        return self._pyo3_loader.load_tcbbo_trades(
+                            filepath=str(path),
+                            instrument_id=pyo3_instrument_id,
+                            price_precision=price_precision,
+                        )
             case DatabentoSchema.MBP_10.value:
                 if as_legacy_cython:
                     capsule = self._pyo3_loader.load_order_book_depth10_as_pycapsule(
@@ -292,7 +382,7 @@ class DatabentoDataLoader:
                 | DatabentoSchema.OHLCV_1M.value
                 | DatabentoSchema.OHLCV_1H.value
                 | DatabentoSchema.OHLCV_1D.value
-                | DatabentoSchema.OHLCV_EOD
+                | DatabentoSchema.OHLCV_EOD.value
             ):
                 if as_legacy_cython:
                     capsule = self._pyo3_loader.load_bars_as_pycapsule(
@@ -318,6 +408,7 @@ class DatabentoDataLoader:
                     filepath=str(path),
                     instrument_id=pyo3_instrument_id,
                 )
+
                 if as_legacy_cython:
                     return InstrumentStatus.from_pyo3_list(data)
 

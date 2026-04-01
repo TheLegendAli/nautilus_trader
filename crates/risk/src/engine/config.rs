@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,32 +15,29 @@
 
 //! Provides a configuration for `RiskEngine` instances.
 
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use nautilus_common::throttler::RateLimit;
 use nautilus_core::datetime::NANOSECONDS_IN_SECOND;
 use nautilus_model::identifiers::InstrumentId;
 use rust_decimal::Decimal;
 
-#[derive(Debug, Clone)]
 /// Configuration for `RiskEngineConfig` instances.
+#[derive(Debug, Clone, bon::Builder)]
 pub struct RiskEngineConfig {
+    #[builder(default)]
     pub bypass: bool,
+    #[builder(default = RateLimit::new(100, NANOSECONDS_IN_SECOND))]
     pub max_order_submit: RateLimit,
+    #[builder(default = RateLimit::new(100, NANOSECONDS_IN_SECOND))]
     pub max_order_modify: RateLimit,
-    pub max_notional_per_order: HashMap<InstrumentId, Decimal>,
+    #[builder(default)]
+    pub max_notional_per_order: AHashMap<InstrumentId, Decimal>,
+    #[builder(default)]
     pub debug: bool,
 }
 
 impl Default for RiskEngineConfig {
-    /// Creates a new [`RiskEngineConfig`] instance.
     fn default() -> Self {
-        Self {
-            bypass: false,
-            max_order_submit: RateLimit::new(100, NANOSECONDS_IN_SECOND),
-            max_order_modify: RateLimit::new(100, NANOSECONDS_IN_SECOND),
-            max_notional_per_order: HashMap::new(),
-            debug: false,
-        }
+        Self::builder().build()
     }
 }

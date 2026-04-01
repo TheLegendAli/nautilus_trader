@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -28,8 +28,14 @@
 #[cfg(feature = "ffi")]
 use std::env;
 
-#[allow(clippy::expect_used)]
-#[allow(unused_assignments)]
+#[allow(
+    clippy::expect_used,
+    reason = "Build script may panic on misconfiguration"
+)]
+#[allow(
+    unused_assignments,
+    reason = "Conditional compilation creates unused assignments"
+)]
 #[allow(unused_mut)]
 fn main() {
     // Skip file generation if we're in the docs.rs environment
@@ -62,9 +68,8 @@ fn main() {
             .expect("unable to find cbindgen.toml configuration file");
 
         // Check HIGH_PRECISION environment variable for C header too
-        let high_precision_c = env::var("HIGH_PRECISION")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or_else(|_| {
+        let high_precision_c = env::var("HIGH_PRECISION").map_or_else(
+            |_| {
                 #[cfg(feature = "high-precision")]
                 {
                     true
@@ -73,7 +78,9 @@ fn main() {
                 {
                     false
                 }
-            });
+            },
+            |v| v.to_lowercase() == "true" || v == "1",
+        );
 
         if high_precision_c && let Some(mut includes) = config_c.after_includes {
             includes.insert_str(0, "\n#define HIGH_PRECISION\n");
@@ -90,9 +97,8 @@ fn main() {
             .expect("unable to find cbindgen_cython.toml configuration file");
 
         // Check HIGH_PRECISION environment variable first, then fall back to feature flag
-        let high_precision = env::var("HIGH_PRECISION")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or_else(|_| {
+        let high_precision = env::var("HIGH_PRECISION").map_or_else(
+            |_| {
                 #[cfg(feature = "high-precision")]
                 {
                     true
@@ -101,7 +107,9 @@ fn main() {
                 {
                     false
                 }
-            });
+            },
+            |v| v.to_lowercase() == "true" || v == "1",
+        );
 
         let flag = if high_precision {
             Some("\nDEF HIGH_PRECISION = True  # or False".to_string())

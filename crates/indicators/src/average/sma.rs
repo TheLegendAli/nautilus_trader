@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -30,6 +30,10 @@ const MAX_PERIOD: usize = 1_024;
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.indicators")
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.indicators")
 )]
 pub struct SimpleMovingAverage {
     pub period: usize,
@@ -137,9 +141,6 @@ impl SimpleMovingAverage {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use arraydeque::{ArrayDeque, Wrapping};
@@ -240,7 +241,7 @@ mod tests {
             assert_eq!(
                 sma.count(),
                 expected,
-                "period={period}, step={i}, expected={expected}, got={}",
+                "period={period}, step={i}, expected={expected}, was={}",
                 sma.count()
             );
         }
@@ -288,7 +289,7 @@ mod tests {
             sma.update_raw(p);
             assert!(
                 (sma.value() - expect_avg[i]).abs() < 1e-9,
-                "step {i}: expected {}, got {}",
+                "step {i}: expected {}, was {}",
                 expect_avg[i],
                 sma.value()
             );
@@ -330,7 +331,7 @@ mod tests {
             sma.update_raw(price);
             assert!(
                 (sma.value() - exp_mean).abs() < 1e-12,
-                "input={price}, expected={exp_mean}, got={}",
+                "input={price}, expected={exp_mean}, was={}",
                 sma.value()
             );
         }
@@ -354,7 +355,7 @@ mod tests {
             let ref_mean: f64 = window.iter().sum::<f64>() / window.len() as f64;
             assert!(
                 (sma.value() - ref_mean).abs() < 1e-12,
-                "step={step}, expected={ref_mean}, got={}",
+                "step={step}, expected={ref_mean}, was={}",
                 sma.value()
             );
         }

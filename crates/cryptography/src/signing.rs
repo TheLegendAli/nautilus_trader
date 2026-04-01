@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -87,12 +87,9 @@ pub fn ed25519_signature(private_key: &[u8], data: &str) -> anyhow::Result<Strin
             .map_err(|_| anyhow::anyhow!("Invalid Ed25519 private key length"))?,
     );
     let signature: Ed25519Signature = signing_key.sign(data.as_bytes());
-    Ok(hex::encode(signature.to_bytes()))
+    Ok(BASE64_STANDARD.encode(signature.to_bytes()))
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -139,7 +136,7 @@ mod tests {
 
     #[rstest]
     #[case(
-        r"-----BEGIN TEST KEY-----
+        "-----BEGIN TEST KEY-----
 MIIBVwIBADANBgkqhkiG9w0BAQEFAASCATswggE3AgEAAkEAu/...
 -----END PRIVATE KEY-----",
         ""
@@ -154,7 +151,7 @@ MIIBVwIBADANBgkqhkiG9w0BAQEFAASCATswggE3AgEAAkEAu/...
 
     #[rstest]
     #[case(
-        r"-----BEGIN INVALID KEY-----
+        "-----BEGIN INVALID KEY-----
 INVALID_KEY_DATA
 -----END INVALID KEY-----",
         "This is a test query"

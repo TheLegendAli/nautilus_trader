@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -18,10 +18,11 @@ use std::{collections::HashMap, str::FromStr};
 use ahash::AHashMap;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, future::join_all};
+use futures::future::join_all;
 use nautilus_common::{cache::database::CacheMap, enums::SerializationEncoding};
 use nautilus_model::{
     accounts::AccountAny,
+    data::{CustomData, DataType, HasTsInit},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
     instruments::{InstrumentAny, SyntheticInstrument},
     orders::OrderAny,
@@ -31,8 +32,9 @@ use nautilus_model::{
 use redis::{AsyncCommands, aio::ConnectionManager};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::try_join;
 use ustr::Ustr;
+
+use super::get_index_key;
 
 // Collection keys
 const INDEX: &str = "index";
@@ -45,6 +47,7 @@ const ORDERS: &str = "orders";
 const POSITIONS: &str = "positions";
 const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
+const CUSTOM: &str = "custom";
 const REDIS_DELIMITER: char = ':';
 
 // Index keys
@@ -114,11 +117,94 @@ impl DatabaseQueries {
         con: &mut ConnectionManager,
         pattern: String,
     ) -> anyhow::Result<Vec<String>> {
-        Ok(con
-            .scan_match::<String, String>(pattern)
-            .await?
-            .collect()
-            .await)
+        let mut result = Vec::new();
+        let mut cursor = 0u64;
+
+        loop {
+            let scan_result: (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(5000)
+                .query_async(con)
+                .await?;
+
+            let (new_cursor, keys) = scan_result;
+            result.extend(keys);
+
+            // If cursor is 0, we've completed the full scan
+            if new_cursor == 0 {
+                break;
+            }
+
+            cursor = new_cursor;
+        }
+
+        Ok(result)
+    }
+
+    /// Bulk reads multiple keys from Redis using MGET for efficiency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis MGET operation fails.
+    pub async fn read_bulk(
+        con: &ConnectionManager,
+        keys: &[String],
+    ) -> anyhow::Result<Vec<Option<Bytes>>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut con = con.clone();
+
+        // Use MGET to fetch all keys in a single network operation
+        let results: Vec<Option<Vec<u8>>> =
+            redis::cmd("MGET").arg(keys).query_async(&mut con).await?;
+
+        // Convert Vec<u8> to Bytes
+        let bytes_results: Vec<Option<Bytes>> = results
+            .into_iter()
+            .map(|opt| opt.map(Bytes::from))
+            .collect();
+
+        Ok(bytes_results)
+    }
+
+    /// Bulk reads multiple keys from Redis using MGET, batched into chunks.
+    ///
+    /// Keys are batched into chunks of `batch_size` to avoid exceeding Redis
+    /// request size limits on some providers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `batch_size` is zero or if the underlying Redis MGET operation fails.
+    pub async fn read_bulk_batched(
+        con: &ConnectionManager,
+        keys: &[String],
+        batch_size: usize,
+    ) -> anyhow::Result<Vec<Option<Bytes>>> {
+        if batch_size == 0 {
+            anyhow::bail!("`batch_size` must be greater than zero");
+        }
+
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut all_results: Vec<Option<Bytes>> = Vec::with_capacity(keys.len());
+
+        for chunk in keys.chunks(batch_size) {
+            let mut con = con.clone();
+
+            let results: Vec<Option<Vec<u8>>> =
+                redis::cmd("MGET").arg(chunk).query_async(&mut con).await?;
+
+            all_results.extend(results.into_iter().map(|opt| opt.map(Bytes::from)));
+        }
+
+        Ok(all_results)
     }
 
     /// Reads raw byte payloads for `key` under `trader_key` from Redis.
@@ -132,20 +218,21 @@ impl DatabaseQueries {
         key: &str,
     ) -> anyhow::Result<Vec<Bytes>> {
         let collection = Self::get_collection_key(key)?;
-        let key = format!("{trader_key}{REDIS_DELIMITER}{key}");
+        let full_key = format!("{trader_key}{REDIS_DELIMITER}{key}");
+
         let mut con = con.clone();
 
         match collection {
-            INDEX => Self::read_index(&mut con, &key).await,
-            GENERAL => Self::read_string(&mut con, &key).await,
-            CURRENCIES => Self::read_string(&mut con, &key).await,
-            INSTRUMENTS => Self::read_string(&mut con, &key).await,
-            SYNTHETICS => Self::read_string(&mut con, &key).await,
-            ACCOUNTS => Self::read_list(&mut con, &key).await,
-            ORDERS => Self::read_list(&mut con, &key).await,
-            POSITIONS => Self::read_list(&mut con, &key).await,
-            ACTORS => Self::read_string(&mut con, &key).await,
-            STRATEGIES => Self::read_string(&mut con, &key).await,
+            INDEX => Self::read_index(&mut con, &full_key).await,
+            GENERAL => Self::read_string(&mut con, &full_key).await,
+            CURRENCIES => Self::read_string(&mut con, &full_key).await,
+            INSTRUMENTS => Self::read_string(&mut con, &full_key).await,
+            SYNTHETICS => Self::read_string(&mut con, &full_key).await,
+            ACCOUNTS => Self::read_list(&mut con, &full_key).await,
+            ORDERS => Self::read_list(&mut con, &full_key).await,
+            POSITIONS => Self::read_list(&mut con, &full_key).await,
+            ACTORS => Self::read_string(&mut con, &full_key).await,
+            STRATEGIES => Self::read_string(&mut con, &full_key).await,
             _ => anyhow::bail!("Unsupported operation: `read` for collection '{collection}'"),
         }
     }
@@ -160,7 +247,7 @@ impl DatabaseQueries {
         encoding: SerializationEncoding,
         trader_key: &str,
     ) -> anyhow::Result<CacheMap> {
-        let (currencies, instruments, synthetics, accounts, orders, positions) = try_join!(
+        let (currencies, instruments, synthetics, accounts, orders, positions) = tokio::try_join!(
             Self::load_currencies(con, trader_key, encoding),
             Self::load_instruments(con, trader_key, encoding),
             Self::load_synthetics(con, trader_key, encoding),
@@ -199,41 +286,42 @@ impl DatabaseQueries {
     ) -> anyhow::Result<AHashMap<Ustr, Currency>> {
         let mut currencies = AHashMap::new();
         let pattern = format!("{trader_key}{REDIS_DELIMITER}{CURRENCIES}*");
-        tracing::debug!("Loading {pattern}");
+        log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
 
-        let futures: Vec<_> = keys
-            .iter()
-            .map(|key| {
-                let con = con.clone();
-                async move {
-                    let currency_code = if let Some(code) = key.as_str().rsplit(':').next() {
-                        Ustr::from(code)
-                    } else {
-                        log::error!("Invalid key format: {key}");
-                        return None;
-                    };
+        if keys.is_empty() {
+            return Ok(currencies);
+        }
 
-                    match Self::load_currency(&con, trader_key, &currency_code, encoding).await {
-                        Ok(Some(currency)) => Some((currency_code, currency)),
-                        Ok(None) => {
-                            log::error!("Currency not found: {currency_code}");
-                            None
-                        }
-                        Err(e) => {
-                            log::error!("Failed to load currency {currency_code}: {e}");
-                            None
-                        }
+        // Use bulk loading with MGET for efficiency
+        let bulk_values = Self::read_bulk(&con, &keys).await?;
+
+        // Process the bulk results
+        for (key, value_opt) in keys.iter().zip(bulk_values.iter()) {
+            let currency_code = if let Some(code) = key.as_str().rsplit(':').next() {
+                Ustr::from(code)
+            } else {
+                log::error!("Invalid key format: {key}");
+                continue;
+            };
+
+            if let Some(value_bytes) = value_opt {
+                match Self::deserialize_payload(encoding, value_bytes) {
+                    Ok(currency) => {
+                        currencies.insert(currency_code, currency);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to deserialize currency {currency_code}: {e}");
                     }
                 }
-            })
-            .collect();
+            } else {
+                log::error!("Currency not found in Redis: {currency_code}");
+            }
+        }
 
-        // Insert all Currency_code (key) and Currency (value) into the HashMap, filtering out None values.
-        currencies.extend(join_all(futures).await.into_iter().flatten());
-        tracing::debug!("Loaded {} currencies(s)", currencies.len());
+        log::debug!("Loaded {} currencies(s)", currencies.len());
 
         Ok(currencies)
     }
@@ -255,7 +343,7 @@ impl DatabaseQueries {
     ) -> anyhow::Result<AHashMap<InstrumentId, InstrumentAny>> {
         let mut instruments = AHashMap::new();
         let pattern = format!("{trader_key}{REDIS_DELIMITER}{INSTRUMENTS}*");
-        tracing::debug!("Loading {pattern}");
+        log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
@@ -302,7 +390,7 @@ impl DatabaseQueries {
 
         // Insert all Instrument_id (key) and Instrument (value) into the HashMap, filtering out None values.
         instruments.extend(join_all(futures).await.into_iter().flatten());
-        tracing::debug!("Loaded {} instruments(s)", instruments.len());
+        log::debug!("Loaded {} instruments(s)", instruments.len());
 
         Ok(instruments)
     }
@@ -324,7 +412,7 @@ impl DatabaseQueries {
     ) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
         let mut synthetics = AHashMap::new();
         let pattern = format!("{trader_key}{REDIS_DELIMITER}{SYNTHETICS}*");
-        tracing::debug!("Loading {pattern}");
+        log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
@@ -371,7 +459,7 @@ impl DatabaseQueries {
 
         // Insert all Instrument_id (key) and Synthetic (value) into the HashMap, filtering out None values.
         synthetics.extend(join_all(futures).await.into_iter().flatten());
-        tracing::debug!("Loaded {} synthetics(s)", synthetics.len());
+        log::debug!("Loaded {} synthetics(s)", synthetics.len());
 
         Ok(synthetics)
     }
@@ -393,7 +481,7 @@ impl DatabaseQueries {
     ) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
         let mut accounts = AHashMap::new();
         let pattern = format!("{trader_key}{REDIS_DELIMITER}{ACCOUNTS}*");
-        tracing::debug!("Loading {pattern}");
+        log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
@@ -427,7 +515,7 @@ impl DatabaseQueries {
 
         // Insert all Account_id (key) and Account (value) into the HashMap, filtering out None values.
         accounts.extend(join_all(futures).await.into_iter().flatten());
-        tracing::debug!("Loaded {} accounts(s)", accounts.len());
+        log::debug!("Loaded {} accounts(s)", accounts.len());
 
         Ok(accounts)
     }
@@ -449,7 +537,7 @@ impl DatabaseQueries {
     ) -> anyhow::Result<AHashMap<ClientOrderId, OrderAny>> {
         let mut orders = AHashMap::new();
         let pattern = format!("{trader_key}{REDIS_DELIMITER}{ORDERS}*");
-        tracing::debug!("Loading {pattern}");
+        log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
@@ -483,7 +571,7 @@ impl DatabaseQueries {
 
         // Insert all Client-Order-Id (key) and Order (value) into the HashMap, filtering out None values.
         orders.extend(join_all(futures).await.into_iter().flatten());
-        tracing::debug!("Loaded {} order(s)", orders.len());
+        log::debug!("Loaded {} order(s)", orders.len());
 
         Ok(orders)
     }
@@ -505,7 +593,7 @@ impl DatabaseQueries {
     ) -> anyhow::Result<AHashMap<PositionId, Position>> {
         let mut positions = AHashMap::new();
         let pattern = format!("{trader_key}{REDIS_DELIMITER}{POSITIONS}*");
-        tracing::debug!("Loading {pattern}");
+        log::debug!("Loading {pattern}");
 
         let mut con = con.clone();
         let keys = Self::scan_keys(&mut con, pattern).await?;
@@ -539,9 +627,74 @@ impl DatabaseQueries {
 
         // Insert all Position_id (key) and Position (value) into the HashMap, filtering out None values.
         positions.extend(join_all(futures).await.into_iter().flatten());
-        tracing::debug!("Loaded {} position(s)", positions.len());
+        log::debug!("Loaded {} position(s)", positions.len());
 
         Ok(positions)
+    }
+
+    /// Loads all custom data for `trader_key` matching the given `data_type`.
+    ///
+    /// Keys are stored as `custom:<ts_init_020>:<uuid>`; value is full CustomData JSON.
+    /// Scans all custom keys, deserializes, filters by type_name (full or short), metadata,
+    /// and identifier to match SQL semantics, then sorts by ts_init ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if scanning, bulk read, or deserialization fails.
+    pub async fn load_custom_data(
+        con: &ConnectionManager,
+        trader_key: &str,
+        data_type: &DataType,
+    ) -> anyhow::Result<Vec<CustomData>> {
+        let pattern = format!("{trader_key}{REDIS_DELIMITER}{CUSTOM}*");
+        log::debug!("Loading custom data {pattern}");
+
+        let mut con = con.clone();
+        let keys = Self::scan_keys(&mut con, pattern).await?;
+
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let values = Self::read_bulk(&con, &keys).await?;
+        let request_type_name = data_type.type_name();
+        let request_short = request_type_name
+            .rsplit([':', '.'])
+            .next()
+            .unwrap_or(request_type_name);
+        let request_identifier = data_type.identifier().unwrap_or("");
+
+        let mut results = Vec::new();
+        for value_opt in values {
+            let Some(value_bytes) = value_opt else {
+                continue;
+            };
+            let custom = match CustomData::from_json_bytes(value_bytes.as_ref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Failed to deserialize custom data from Redis: {e}");
+                    continue;
+                }
+            };
+            let stored_type_name = custom.data_type.type_name();
+            let type_match =
+                stored_type_name == request_type_name || stored_type_name == request_short;
+            let identifier_match =
+                custom.data_type.identifier().unwrap_or("") == request_identifier;
+            let metadata_match = match (data_type.metadata(), custom.data_type.metadata()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
+                _ => false,
+            };
+
+            if type_match && identifier_match && metadata_match {
+                results.push(custom);
+            }
+        }
+
+        results.sort_by_key(|c| c.ts_init());
+        log::debug!("Loaded {} custom data item(s)", results.len());
+        Ok(results)
     }
 
     /// Loads a single currency for `trader_key` and `code` using the specified `encoding`.
@@ -680,7 +833,7 @@ impl DatabaseQueries {
     }
 
     async fn read_index(conn: &mut ConnectionManager, key: &str) -> anyhow::Result<Vec<Bytes>> {
-        let index_key = Self::get_index_key(key)?;
+        let index_key = get_index_key(key)?;
         match index_key {
             INDEX_ORDER_IDS => Self::read_set(conn, key).await,
             INDEX_ORDER_POSITION => Self::read_hset(conn, key).await,
@@ -721,14 +874,6 @@ impl DatabaseQueries {
     async fn read_list(conn: &mut ConnectionManager, key: &str) -> anyhow::Result<Vec<Bytes>> {
         let result: Vec<Bytes> = conn.lrange(key, 0, -1).await?;
         Ok(result)
-    }
-
-    fn get_index_key(key: &str) -> anyhow::Result<&str> {
-        key.split_once(REDIS_DELIMITER)
-            .map(|(_, index_key)| index_key)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Invalid `key`, missing a '{REDIS_DELIMITER}' delimiter, was {key}")
-            })
     }
 }
 

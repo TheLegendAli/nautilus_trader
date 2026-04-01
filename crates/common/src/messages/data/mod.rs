@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -30,28 +30,29 @@ pub mod unsubscribe;
 
 // Re-exports
 pub use request::{
-    RequestBars, RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
-    RequestQuotes, RequestTrades,
+    RequestBars, RequestBookDepth, RequestBookSnapshot, RequestCustomData, RequestForwardPrices,
+    RequestFundingRates, RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades,
 };
 pub use response::{
-    BarsResponse, BookResponse, CustomDataResponse, InstrumentResponse, InstrumentsResponse,
-    QuotesResponse, TradesResponse,
+    BarsResponse, BookResponse, CustomDataResponse, ForwardPricesResponse, FundingRatesResponse,
+    InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
 };
 pub use subscribe::{
     SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
-    SubscribeCustomData, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
-    SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes,
-    SubscribeTrades,
+    SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+    SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
+    SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
 };
 pub use unsubscribe::{
     UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeBookSnapshots,
-    UnsubscribeCustomData, UnsubscribeIndexPrices, UnsubscribeInstrument,
+    UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
     UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
-    UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
+    UnsubscribeMarkPrices, UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes,
+    UnsubscribeTrades,
 };
 
 #[cfg(feature = "defi")]
-use crate::messages::defi::{DefiSubscribeCommand, DefiUnsubscribeCommand};
+use crate::messages::defi::{DefiRequestCommand, DefiSubscribeCommand, DefiUnsubscribeCommand};
 
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +60,8 @@ pub enum DataCommand {
     Request(RequestCommand),
     Subscribe(SubscribeCommand),
     Unsubscribe(UnsubscribeCommand),
+    #[cfg(feature = "defi")]
+    DefiRequest(DefiRequestCommand),
     #[cfg(feature = "defi")]
     DefiSubscribe(DefiSubscribeCommand),
     #[cfg(feature = "defi")]
@@ -85,8 +88,11 @@ pub enum SubscribeCommand {
     Bars(SubscribeBars),
     MarkPrices(SubscribeMarkPrices),
     IndexPrices(SubscribeIndexPrices),
+    FundingRates(SubscribeFundingRates),
     InstrumentStatus(SubscribeInstrumentStatus),
     InstrumentClose(SubscribeInstrumentClose),
+    OptionGreeks(SubscribeOptionGreeks),
+    OptionChain(SubscribeOptionChain),
 }
 
 impl PartialEq for SubscribeCommand {
@@ -114,8 +120,11 @@ impl SubscribeCommand {
             Self::Bars(cmd) => cmd.command_id,
             Self::MarkPrices(cmd) => cmd.command_id,
             Self::IndexPrices(cmd) => cmd.command_id,
+            Self::FundingRates(cmd) => cmd.command_id,
             Self::InstrumentStatus(cmd) => cmd.command_id,
             Self::InstrumentClose(cmd) => cmd.command_id,
+            Self::OptionGreeks(cmd) => cmd.command_id,
+            Self::OptionChain(cmd) => cmd.command_id,
         }
     }
 
@@ -131,9 +140,12 @@ impl SubscribeCommand {
             Self::Trades(cmd) => cmd.client_id.as_ref(),
             Self::MarkPrices(cmd) => cmd.client_id.as_ref(),
             Self::IndexPrices(cmd) => cmd.client_id.as_ref(),
+            Self::FundingRates(cmd) => cmd.client_id.as_ref(),
             Self::Bars(cmd) => cmd.client_id.as_ref(),
             Self::InstrumentStatus(cmd) => cmd.client_id.as_ref(),
             Self::InstrumentClose(cmd) => cmd.client_id.as_ref(),
+            Self::OptionGreeks(cmd) => cmd.client_id.as_ref(),
+            Self::OptionChain(cmd) => cmd.client_id.as_ref(),
         }
     }
 
@@ -149,9 +161,12 @@ impl SubscribeCommand {
             Self::Trades(cmd) => cmd.venue.as_ref(),
             Self::MarkPrices(cmd) => cmd.venue.as_ref(),
             Self::IndexPrices(cmd) => cmd.venue.as_ref(),
+            Self::FundingRates(cmd) => cmd.venue.as_ref(),
             Self::Bars(cmd) => cmd.venue.as_ref(),
             Self::InstrumentStatus(cmd) => cmd.venue.as_ref(),
             Self::InstrumentClose(cmd) => cmd.venue.as_ref(),
+            Self::OptionGreeks(cmd) => cmd.venue.as_ref(),
+            Self::OptionChain(cmd) => cmd.venue.as_ref(),
         }
     }
 
@@ -167,9 +182,33 @@ impl SubscribeCommand {
             Self::Trades(cmd) => cmd.ts_init,
             Self::MarkPrices(cmd) => cmd.ts_init,
             Self::IndexPrices(cmd) => cmd.ts_init,
+            Self::FundingRates(cmd) => cmd.ts_init,
             Self::Bars(cmd) => cmd.ts_init,
             Self::InstrumentStatus(cmd) => cmd.ts_init,
             Self::InstrumentClose(cmd) => cmd.ts_init,
+            Self::OptionGreeks(cmd) => cmd.ts_init,
+            Self::OptionChain(cmd) => cmd.ts_init,
+        }
+    }
+
+    pub fn correlation_id(&self) -> Option<UUID4> {
+        match self {
+            Self::Data(cmd) => cmd.correlation_id,
+            Self::Instrument(cmd) => cmd.correlation_id,
+            Self::Instruments(cmd) => cmd.correlation_id,
+            Self::BookDeltas(cmd) => cmd.correlation_id,
+            Self::BookDepth10(cmd) => cmd.correlation_id,
+            Self::BookSnapshots(cmd) => cmd.correlation_id,
+            Self::Quotes(cmd) => cmd.correlation_id,
+            Self::Trades(cmd) => cmd.correlation_id,
+            Self::MarkPrices(cmd) => cmd.correlation_id,
+            Self::IndexPrices(cmd) => cmd.correlation_id,
+            Self::FundingRates(cmd) => cmd.correlation_id,
+            Self::Bars(cmd) => cmd.correlation_id,
+            Self::InstrumentStatus(cmd) => cmd.correlation_id,
+            Self::InstrumentClose(cmd) => cmd.correlation_id,
+            Self::OptionGreeks(cmd) => cmd.correlation_id,
+            Self::OptionChain(_) => None,
         }
     }
 }
@@ -187,8 +226,11 @@ pub enum UnsubscribeCommand {
     Bars(UnsubscribeBars),
     MarkPrices(UnsubscribeMarkPrices),
     IndexPrices(UnsubscribeIndexPrices),
+    FundingRates(UnsubscribeFundingRates),
     InstrumentStatus(UnsubscribeInstrumentStatus),
     InstrumentClose(UnsubscribeInstrumentClose),
+    OptionGreeks(UnsubscribeOptionGreeks),
+    OptionChain(UnsubscribeOptionChain),
 }
 
 impl PartialEq for UnsubscribeCommand {
@@ -216,8 +258,11 @@ impl UnsubscribeCommand {
             Self::Bars(cmd) => cmd.command_id,
             Self::MarkPrices(cmd) => cmd.command_id,
             Self::IndexPrices(cmd) => cmd.command_id,
+            Self::FundingRates(cmd) => cmd.command_id,
             Self::InstrumentStatus(cmd) => cmd.command_id,
             Self::InstrumentClose(cmd) => cmd.command_id,
+            Self::OptionGreeks(cmd) => cmd.command_id,
+            Self::OptionChain(cmd) => cmd.command_id,
         }
     }
 
@@ -234,8 +279,11 @@ impl UnsubscribeCommand {
             Self::Bars(cmd) => cmd.client_id.as_ref(),
             Self::MarkPrices(cmd) => cmd.client_id.as_ref(),
             Self::IndexPrices(cmd) => cmd.client_id.as_ref(),
+            Self::FundingRates(cmd) => cmd.client_id.as_ref(),
             Self::InstrumentStatus(cmd) => cmd.client_id.as_ref(),
             Self::InstrumentClose(cmd) => cmd.client_id.as_ref(),
+            Self::OptionGreeks(cmd) => cmd.client_id.as_ref(),
+            Self::OptionChain(cmd) => cmd.client_id.as_ref(),
         }
     }
 
@@ -252,8 +300,11 @@ impl UnsubscribeCommand {
             Self::Bars(cmd) => cmd.venue.as_ref(),
             Self::MarkPrices(cmd) => cmd.venue.as_ref(),
             Self::IndexPrices(cmd) => cmd.venue.as_ref(),
+            Self::FundingRates(cmd) => cmd.venue.as_ref(),
             Self::InstrumentStatus(cmd) => cmd.venue.as_ref(),
             Self::InstrumentClose(cmd) => cmd.venue.as_ref(),
+            Self::OptionGreeks(cmd) => cmd.venue.as_ref(),
+            Self::OptionChain(cmd) => cmd.venue.as_ref(),
         }
     }
 
@@ -269,9 +320,33 @@ impl UnsubscribeCommand {
             Self::Trades(cmd) => cmd.ts_init,
             Self::MarkPrices(cmd) => cmd.ts_init,
             Self::IndexPrices(cmd) => cmd.ts_init,
+            Self::FundingRates(cmd) => cmd.ts_init,
             Self::Bars(cmd) => cmd.ts_init,
             Self::InstrumentStatus(cmd) => cmd.ts_init,
             Self::InstrumentClose(cmd) => cmd.ts_init,
+            Self::OptionGreeks(cmd) => cmd.ts_init,
+            Self::OptionChain(cmd) => cmd.ts_init,
+        }
+    }
+
+    pub fn correlation_id(&self) -> Option<UUID4> {
+        match self {
+            Self::Data(cmd) => cmd.correlation_id,
+            Self::Instrument(cmd) => cmd.correlation_id,
+            Self::Instruments(cmd) => cmd.correlation_id,
+            Self::BookDeltas(cmd) => cmd.correlation_id,
+            Self::BookDepth10(cmd) => cmd.correlation_id,
+            Self::BookSnapshots(cmd) => cmd.correlation_id,
+            Self::Quotes(cmd) => cmd.correlation_id,
+            Self::Trades(cmd) => cmd.correlation_id,
+            Self::MarkPrices(cmd) => cmd.correlation_id,
+            Self::IndexPrices(cmd) => cmd.correlation_id,
+            Self::FundingRates(cmd) => cmd.correlation_id,
+            Self::Bars(cmd) => cmd.correlation_id,
+            Self::InstrumentStatus(cmd) => cmd.correlation_id,
+            Self::InstrumentClose(cmd) => cmd.correlation_id,
+            Self::OptionGreeks(cmd) => cmd.correlation_id,
+            Self::OptionChain(_) => None,
         }
     }
 }
@@ -289,8 +364,11 @@ pub enum RequestCommand {
     Instrument(RequestInstrument),
     Instruments(RequestInstruments),
     BookSnapshot(RequestBookSnapshot),
+    BookDepth(RequestBookDepth),
     Quotes(RequestQuotes),
     Trades(RequestTrades),
+    FundingRates(RequestFundingRates),
+    ForwardPrices(RequestForwardPrices),
     Bars(RequestBars),
 }
 
@@ -312,8 +390,11 @@ impl RequestCommand {
             Self::Instrument(cmd) => &cmd.request_id,
             Self::Instruments(cmd) => &cmd.request_id,
             Self::BookSnapshot(cmd) => &cmd.request_id,
+            Self::BookDepth(cmd) => &cmd.request_id,
             Self::Quotes(cmd) => &cmd.request_id,
             Self::Trades(cmd) => &cmd.request_id,
+            Self::FundingRates(cmd) => &cmd.request_id,
+            Self::ForwardPrices(cmd) => &cmd.request_id,
             Self::Bars(cmd) => &cmd.request_id,
         }
     }
@@ -324,8 +405,11 @@ impl RequestCommand {
             Self::Instrument(cmd) => cmd.client_id.as_ref(),
             Self::Instruments(cmd) => cmd.client_id.as_ref(),
             Self::BookSnapshot(cmd) => cmd.client_id.as_ref(),
+            Self::BookDepth(cmd) => cmd.client_id.as_ref(),
             Self::Quotes(cmd) => cmd.client_id.as_ref(),
             Self::Trades(cmd) => cmd.client_id.as_ref(),
+            Self::FundingRates(cmd) => cmd.client_id.as_ref(),
+            Self::ForwardPrices(cmd) => cmd.client_id.as_ref(),
             Self::Bars(cmd) => cmd.client_id.as_ref(),
         }
     }
@@ -336,8 +420,11 @@ impl RequestCommand {
             Self::Instrument(cmd) => Some(&cmd.instrument_id.venue),
             Self::Instruments(cmd) => cmd.venue.as_ref(),
             Self::BookSnapshot(cmd) => Some(&cmd.instrument_id.venue),
+            Self::BookDepth(cmd) => Some(&cmd.instrument_id.venue),
             Self::Quotes(cmd) => Some(&cmd.instrument_id.venue),
             Self::Trades(cmd) => Some(&cmd.instrument_id.venue),
+            Self::FundingRates(cmd) => Some(&cmd.instrument_id.venue),
+            Self::ForwardPrices(cmd) => Some(&cmd.venue),
             // TODO: Extract the below somewhere
             Self::Bars(cmd) => match &cmd.bar_type {
                 BarType::Standard { instrument_id, .. } => Some(&instrument_id.venue),
@@ -352,8 +439,11 @@ impl RequestCommand {
             Self::Instrument(cmd) => cmd.ts_init,
             Self::Instruments(cmd) => cmd.ts_init,
             Self::BookSnapshot(cmd) => cmd.ts_init,
+            Self::BookDepth(cmd) => cmd.ts_init,
             Self::Quotes(cmd) => cmd.ts_init,
             Self::Trades(cmd) => cmd.ts_init,
+            Self::FundingRates(cmd) => cmd.ts_init,
+            Self::ForwardPrices(cmd) => cmd.ts_init,
             Self::Bars(cmd) => cmd.ts_init,
         }
     }
@@ -367,6 +457,8 @@ pub enum DataResponse {
     Book(BookResponse),
     Quotes(QuotesResponse),
     Trades(TradesResponse),
+    FundingRates(FundingRatesResponse),
+    ForwardPrices(ForwardPricesResponse),
     Bars(BarsResponse),
 }
 
@@ -384,6 +476,8 @@ impl DataResponse {
             Self::Book(resp) => &resp.correlation_id,
             Self::Quotes(resp) => &resp.correlation_id,
             Self::Trades(resp) => &resp.correlation_id,
+            Self::FundingRates(resp) => &resp.correlation_id,
+            Self::ForwardPrices(resp) => &resp.correlation_id,
             Self::Bars(resp) => &resp.correlation_id,
         }
     }

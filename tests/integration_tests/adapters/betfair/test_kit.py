@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -86,7 +86,7 @@ def mock_betfair_request(obj, response):
         mock_resp.body = encode(response)
         return mock_resp
 
-    setattr(obj, "_request", MagicMock(side_effect=mock_request))
+    obj._request = MagicMock(side_effect=mock_request)
 
 
 class BetfairTestStubs:
@@ -128,6 +128,7 @@ class BetfairTestStubs:
                 "SportsAPING/v1.0/listClearedOrders": BetfairResponses.list_cleared_orders,
             }
             kw = {}
+
             if rpc_method == "SportsAPING/v1.0/listMarketCatalogue":
                 kw = {"filter_": request.params.filter}
             if rpc_method in responses:
@@ -366,6 +367,22 @@ class BetfairResponses:
         return BetfairResponses.load("betting_place_order_success.json")
 
     @staticmethod
+    def betting_place_order_batch_success():
+        return BetfairResponses.load("betting_place_order_batch_success.json")
+
+    @staticmethod
+    def betting_place_order_batch_partial_failure():
+        return BetfairResponses.load("betting_place_order_batch_partial_failure.json")
+
+    @staticmethod
+    def betting_cancel_orders_batch_success():
+        return BetfairResponses.load("betting_cancel_orders_batch_success.json")
+
+    @staticmethod
+    def betting_cancel_orders_batch_partial_failure():
+        return BetfairResponses.load("betting_cancel_orders_batch_partial_failure.json")
+
+    @staticmethod
     def betting_place_orders_old():
         return BetfairResponses.load("betting_place_orders_old.json")
 
@@ -434,6 +451,7 @@ class BetfairResponses:
     @staticmethod
     def betting_list_market_catalogue(filter_: MarketFilter | None = None) -> dict:
         result = BetfairResponses.load("betting_list_market_catalogue.json")
+
         if filter_:
             result = [r for r in result if r["marketId"] in filter_.market_ids]  # type: ignore
         return {"jsonrpc": "2.0", "result": result, "id": 1}
@@ -600,11 +618,15 @@ class BetfairStreaming:
         sm=0,
         sr=0,
         sc=0,
+        sl=0,
+        sv=0,
         avp=0,
         order_id: int = 248485109136,
         client_order_id: str = "",
         mb: list[MatchedOrder] | None = None,
         ml: list[MatchedOrder] | None = None,
+        market_id: str = "1",
+        selection_id: int = 1,
     ) -> OCM:
         assert side in ("B", "L"), "`side` should be 'B' or 'L'"
         assert isinstance(order_id, int)
@@ -614,10 +636,10 @@ class BetfairStreaming:
             pt=0,
             oc=[
                 OrderMarketChange(
-                    id="1",
+                    id=market_id,
                     orc=[
                         OrderRunnerChange(
-                            id=1,
+                            id=selection_id,
                             uo=[
                                 Order(
                                     id=order_id,
@@ -631,9 +653,9 @@ class BetfairStreaming:
                                     md=int(pd.Timestamp.utcnow().timestamp()),
                                     sm=sm,
                                     sr=sr,
-                                    sl=0,
+                                    sl=sl,
                                     sc=sc,
-                                    sv=0,
+                                    sv=sv,
                                     rac="",
                                     rc="REG_LGA",
                                     rfo=client_order_id,
@@ -773,11 +795,13 @@ class BetfairDataProvider:
         assert market_id.startswith("1-")
 
         def _fix_ids(r):
-            return (
-                r.replace(market_id.encode(), b"1-180737206")
-                .replace(runner1.encode(), b"19248890")
-                .replace(runner2.encode(), b"38848248")
-            )
+            # Replace market ID (appears as string in JSON: "id":"1-xxx")
+            result = r.replace(market_id.encode(), b"1-180737206")
+            # Replace runner IDs only when they appear as JSON field values
+            # (after "id": context) to avoid corrupting timestamps
+            result = result.replace(b'"id":' + runner1.encode(), b'"id":19248890')
+            result = result.replace(b'"id":' + runner2.encode(), b'"id":38848248')
+            return result
 
         return [
             stream_decode(_fix_ids(line.strip()))

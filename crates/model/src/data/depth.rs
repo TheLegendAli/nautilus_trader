@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -26,7 +26,7 @@ use crate::{identifiers::InstrumentId, types::fixed::FIXED_SIZE_BINARY};
 
 pub const DEPTH10_LEN: usize = 10;
 
-/// Represents a aggregated order book update with a fixed depth of 10 levels per side.
+/// Represents an aggregated order book update with a fixed depth of 10 levels per side.
 ///
 /// This structure is specifically designed for scenarios where a snapshot of the top 10 bid and
 /// ask levels in an order book is needed. It differs from `OrderBookDelta` or `OrderBookDeltas`
@@ -39,7 +39,11 @@ pub const DEPTH10_LEN: usize = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OrderBookDepth10 {
     /// The instrument ID for the book.
@@ -195,9 +199,6 @@ impl HasTsInit for OrderBookDepth10 {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use std::{
@@ -520,10 +521,11 @@ mod tests {
 
     #[rstest]
     fn test_order_book_depth10_serializable_trait() {
+        fn assert_serializable<T: Serializable>(_: &T) {}
+
         let depth = create_test_depth10();
 
         // Verify Serializable trait is implemented (compile-time check)
-        fn assert_serializable<T: Serializable>(_: &T) {}
         assert_serializable(&depth);
     }
 

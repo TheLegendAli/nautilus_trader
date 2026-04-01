@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -18,8 +18,9 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use nautilus_core::python::{
-    IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyvalue_err,
+use nautilus_core::{
+    from_pydict,
+    python::{IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyvalue_err},
 };
 use pyo3::{basic::CompareOp, prelude::*, types::PyDict};
 use rust_decimal::Decimal;
@@ -31,10 +32,12 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl CryptoFuture {
+    /// Represents a deliverable futures contract instrument, with crypto assets as underlying and for settlement.
     #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (instrument_id, raw_symbol, underlying, quote_currency, settlement_currency, is_inverse, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment,ts_event, ts_init, multiplier=None, lot_size=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None))]
+    #[pyo3(signature = (instrument_id, raw_symbol, underlying, quote_currency, settlement_currency, is_inverse, activation_ns, expiration_ns, price_precision, size_precision, price_increment, size_increment,ts_event, ts_init, multiplier=None, lot_size=None, max_quantity=None, min_quantity=None, max_notional=None, min_notional=None, max_price=None, min_price=None, margin_init=None, margin_maint=None, maker_fee=None, taker_fee=None, info=None))]
     fn py_new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -62,7 +65,15 @@ impl CryptoFuture {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        info: Option<Py<PyDict>>,
     ) -> PyResult<Self> {
+        // Convert Python dict to Params
+        let info_map = if let Some(info_dict) = info {
+            Python::attach(|py| from_pydict(py, info_dict))?
+        } else {
+            None
+        };
+
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -88,6 +99,7 @@ impl CryptoFuture {
             margin_maint,
             maker_fee,
             taker_fee,
+            info_map,
             ts_event.into(),
             ts_init.into(),
         )
@@ -109,7 +121,7 @@ impl CryptoFuture {
     }
 
     #[getter]
-    fn type_str(&self) -> &str {
+    fn type_name(&self) -> &'static str {
         stringify!(CryptoFuture)
     }
 
@@ -193,8 +205,8 @@ impl CryptoFuture {
 
     #[getter]
     #[pyo3(name = "lot_size")]
-    fn py_lot_size(&self) -> Option<Quantity> {
-        Some(self.lot_size)
+    fn py_lot_size(&self) -> Quantity {
+        self.lot_size
     }
 
     #[getter]
@@ -259,8 +271,21 @@ impl CryptoFuture {
 
     #[getter]
     #[pyo3(name = "info")]
-    fn py_info(&self, py: Python<'_>) -> PyResult<PyObject> {
-        Ok(PyDict::new(py).into())
+    fn py_info(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        // Convert HashMap<String, serde_json::Value> back to Python dict
+        if let Some(ref info_map) = self.info {
+            let py_dict = PyDict::new(py);
+            for (key, value) in info_map {
+                // Convert serde_json::Value back to Python object via JSON
+                let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
+                let py_value =
+                    PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+                py_dict.set_item(key, py_value)?;
+            }
+            Ok(py_dict.unbind())
+        } else {
+            Ok(PyDict::new(py).unbind())
+        }
     }
 
     #[getter]
@@ -282,7 +307,7 @@ impl CryptoFuture {
     }
 
     #[pyo3(name = "to_dict")]
-    fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("type", stringify!(CryptoFuture))?;
         dict.set_item("id", self.id.to_string())?;
@@ -304,7 +329,19 @@ impl CryptoFuture {
         dict.set_item("margin_maint", self.margin_maint.to_string())?;
         dict.set_item("multiplier", self.multiplier.to_string())?;
         dict.set_item("lot_size", self.lot_size.to_string())?;
-        dict.set_item("info", PyDict::new(py))?;
+        // Serialize info dict
+        if let Some(ref info_map) = self.info {
+            let info_dict = PyDict::new(py);
+            for (key, value) in info_map {
+                let json_str = serde_json::to_string(value).map_err(to_pyvalue_err)?;
+                let py_value =
+                    PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+                info_dict.set_item(key, py_value)?;
+            }
+            dict.set_item("info", info_dict)?;
+        } else {
+            dict.set_item("info", PyDict::new(py))?;
+        }
         dict.set_item("maker_fee", self.maker_fee.to_string())?;
         dict.set_item("taker_fee", self.taker_fee.to_string())?;
         dict.set_item("ts_event", self.ts_event.as_u64())?;
@@ -337,25 +374,22 @@ impl CryptoFuture {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
-    use pyo3::{prelude::*, prepare_freethreaded_python, types::PyDict};
+    use pyo3::{prelude::*, types::PyDict};
     use rstest::rstest;
 
     use crate::instruments::{CryptoFuture, stubs::*};
 
     #[rstest]
     fn test_dict_round_trip(crypto_future_btcusdt: CryptoFuture) {
-        prepare_freethreaded_python();
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let crypto_future = crypto_future_btcusdt;
             let values = crypto_future.py_to_dict(py).unwrap();
             let values: Py<PyDict> = values.extract(py).unwrap();
             let new_crypto_future = CryptoFuture::py_from_dict(py, values).unwrap();
             assert_eq!(crypto_future, new_crypto_future);
-        })
+        });
     }
 }

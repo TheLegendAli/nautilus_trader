@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -24,9 +24,12 @@ use nautilus_core::{
         serialization::{from_dict_pyo3, to_dict_pyo3},
         to_pyvalue_err,
     },
-    serialization::Serializable,
+    serialization::{
+        Serializable,
+        msgpack::{FromMsgPack, ToMsgPack},
+    },
 };
-use pyo3::{prelude::*, pyclass::CompareOp, types::PyDict};
+use pyo3::{IntoPyObjectExt, prelude::*, pyclass::CompareOp, types::PyDict};
 
 use crate::{
     data::order::{BookOrder, OrderId},
@@ -36,7 +39,9 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BookOrder {
+    /// Represents an order in a book.
     #[new]
     fn py_new(side: OrderSide, price: Price, size: Quantity, order_id: OrderId) -> Self {
         Self::new(side, price, size, order_id)
@@ -94,11 +99,13 @@ impl BookOrder {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(BookOrder))
     }
 
+    /// Returns the order exposure as an `f64`.
     #[pyo3(name = "exposure")]
     fn py_exposure(&self) -> f64 {
         self.exposure()
     }
 
+    /// Returns the signed order size as `f64`, positive for buys, negative for sells.
     #[pyo3(name = "signed_size")]
     fn py_signed_size(&self) -> f64 {
         self.signed_size()
@@ -115,18 +122,6 @@ impl BookOrder {
         from_dict_pyo3(py, values)
     }
 
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_json_bytes(&data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: Vec<u8>) -> PyResult<Self> {
-        Self::from_msgpack_bytes(&data).map_err(to_pyvalue_err)
-    }
-
     /// Converts the `BookOrder` into a Python dict representation.
     ///
     /// # Errors
@@ -140,21 +135,37 @@ impl BookOrder {
     /// Return JSON encoded bytes representation of the object.
     #[pyo3(name = "to_json_bytes")]
     fn py_to_json_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_json_bytes().unwrap().into_py_any_unwrap(py)
     }
 
     /// Return MsgPack encoded bytes representation of the object.
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
-        // SAFETY: Unwrap safe when serializing a valid object
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    }
+
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let from_dict = py.get_type::<Self>().getattr("from_dict")?;
+        let dict = self.py_to_dict(py)?;
+        (from_dict, (dict,)).into_py_any(py)
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
+#[pymethods]
+impl BookOrder {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -164,23 +175,23 @@ mod tests {
 
     #[rstest]
     fn test_to_dict(stub_book_order: BookOrder) {
-        pyo3::prepare_freethreaded_python();
         let book_order = stub_book_order;
 
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict_string = book_order.py_to_dict(py).unwrap().to_string();
             let expected_string =
-                r"{'side': 'BUY', 'price': '100.00', 'size': '10', 'order_id': 123456}";
+                "{'side': 'BUY', 'price': '100.00', 'size': '10', 'order_id': 123456}";
             assert_eq!(dict_string, expected_string);
         });
     }
 
     #[rstest]
     fn test_from_dict(stub_book_order: BookOrder) {
-        pyo3::prepare_freethreaded_python();
         let book_order = stub_book_order;
 
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let dict = book_order.py_to_dict(py).unwrap();
             let parsed = BookOrder::py_from_dict(py, dict).unwrap();
             assert_eq!(parsed, book_order);

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -16,7 +16,7 @@
 use std::io::Cursor;
 
 use arrow::{ipc::writer::StreamWriter, record_batch::RecordBatch};
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err};
 use nautilus_model::{
     data::{
         Bar, IndexPriceUpdate, MarkPriceUpdate, OrderBookDelta, OrderBookDepth10, QuoteTick,
@@ -24,12 +24,12 @@ use nautilus_model::{
     },
     python::data::{
         pyobjects_to_bars, pyobjects_to_book_deltas, pyobjects_to_index_prices,
-        pyobjects_to_mark_prices, pyobjects_to_quotes, pyobjects_to_trades,
+        pyobjects_to_instrument_closes, pyobjects_to_mark_prices, pyobjects_to_quotes,
+        pyobjects_to_trades,
     },
 };
 use pyo3::{
     conversion::IntoPyObjectExt,
-    exceptions::{PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyBytes, PyType},
 };
@@ -41,21 +41,21 @@ use crate::arrow::{
     quotes_to_arrow_record_batch_bytes, trades_to_arrow_record_batch_bytes,
 };
 
-/// Transforms the given record `batches` into Python `bytes`.
-fn arrow_record_batch_to_pybytes(py: Python, batch: RecordBatch) -> PyResult<Py<PyBytes>> {
+/// Transforms the given record `batch` into Python `bytes`.
+///
+/// # Errors
+///
+/// Returns a `PyErr` if writing the Arrow IPC stream fails.
+pub fn arrow_record_batch_to_pybytes(py: Python, batch: &RecordBatch) -> PyResult<Py<PyBytes>> {
     // Create a cursor to write to a byte array in memory
     let mut cursor = Cursor::new(Vec::new());
     {
-        let mut writer = StreamWriter::try_new(&mut cursor, &batch.schema())
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        let mut writer =
+            StreamWriter::try_new(&mut cursor, &batch.schema()).map_err(to_pyruntime_err)?;
 
-        writer
-            .write(&batch)
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        writer.write(batch).map_err(to_pyruntime_err)?;
 
-        writer
-            .finish()
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        writer.finish().map_err(to_pyruntime_err)?;
     }
 
     let buffer = cursor.into_inner();
@@ -70,6 +70,7 @@ fn arrow_record_batch_to_pybytes(py: Python, batch: RecordBatch) -> PyResult<Py<
 ///
 /// Returns a `PyErr` if the class name is not recognized or schema extraction fails.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
 pub fn get_arrow_schema_map(py: Python<'_>, cls: &Bound<'_, PyType>) -> PyResult<Py<PyAny>> {
     let cls_str: String = cls.getattr("__name__")?.extract()?;
     let result_map = match cls_str.as_str() {
@@ -80,8 +81,9 @@ pub fn get_arrow_schema_map(py: Python<'_>, cls: &Bound<'_, PyType>) -> PyResult
         stringify!(Bar) => Bar::get_schema_map(),
         stringify!(MarkPriceUpdate) => MarkPriceUpdate::get_schema_map(),
         stringify!(IndexPriceUpdate) => IndexPriceUpdate::get_schema_map(),
+        stringify!(InstrumentClose) => InstrumentClose::get_schema_map(),
         _ => {
-            return Err(PyTypeError::new_err(format!(
+            return Err(to_pytype_err(format!(
                 "Arrow schema for `{cls_str}` is not currently implemented in Rust."
             )));
         }
@@ -90,19 +92,10 @@ pub fn get_arrow_schema_map(py: Python<'_>, cls: &Bound<'_, PyType>) -> PyResult
     result_map.into_py_any(py)
 }
 
-/// Returns Python `bytes` from the given list of legacy data objects, which can be passed
-/// to `pa.ipc.open_stream` to create a `RecordBatchReader`.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The input list is empty: `PyErr`.
-/// - An unsupported data type is encountered or conversion fails: `PyErr`.
-///
-/// # Panics
-///
-/// Panics if `data.first()` returns `None` (should not occur due to emptiness check).
+/// Converts a vector of `OrderBookDelta` into an Arrow `RecordBatch`.
 #[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::missing_panics_doc)] // Guarded by empty check
 pub fn pyobjects_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<Bound<'_, PyAny>>,
@@ -122,6 +115,13 @@ pub fn pyobjects_to_arrow_record_batch_bytes(
         stringify!(OrderBookDelta) => {
             let deltas = pyobjects_to_book_deltas(data)?;
             py_book_deltas_to_arrow_record_batch_bytes(py, deltas)
+        }
+        stringify!(OrderBookDepth10) => {
+            let depth_snapshots: Vec<OrderBookDepth10> = data
+                .into_iter()
+                .map(|obj| obj.extract::<OrderBookDepth10>().map_err(Into::into))
+                .collect::<PyResult<Vec<OrderBookDepth10>>>()?;
+            py_book_depth10_to_arrow_record_batch_bytes(py, depth_snapshots)
         }
         stringify!(QuoteTick) => {
             let quotes = pyobjects_to_quotes(data)?;
@@ -144,10 +144,10 @@ pub fn pyobjects_to_arrow_record_batch_bytes(
             py_index_prices_to_arrow_record_batch_bytes(py, index_prices)
         }
         stringify!(InstrumentClose) => {
-            let closes = pyobjects_to_index_prices(data)?;
-            py_index_prices_to_arrow_record_batch_bytes(py, closes)
+            let closes = pyobjects_to_instrument_closes(data)?;
+            py_instrument_closes_to_arrow_record_batch_bytes(py, closes)
         }
-        _ => Err(PyValueError::new_err(format!(
+        _ => Err(to_pyvalue_err(format!(
             "unsupported data type: {data_type}"
         ))),
     }
@@ -159,12 +159,14 @@ pub fn pyobjects_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "book_deltas_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_book_deltas_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<OrderBookDelta>,
 ) -> PyResult<Py<PyBytes>> {
-    match book_deltas_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match book_deltas_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -175,12 +177,14 @@ pub fn py_book_deltas_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "book_depth10_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_book_depth10_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<OrderBookDepth10>,
 ) -> PyResult<Py<PyBytes>> {
-    match book_depth10_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match book_depth10_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -191,12 +195,14 @@ pub fn py_book_depth10_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "quotes_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_quotes_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<QuoteTick>,
 ) -> PyResult<Py<PyBytes>> {
-    match quotes_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match quotes_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -207,12 +213,14 @@ pub fn py_quotes_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "trades_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_trades_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<TradeTick>,
 ) -> PyResult<Py<PyBytes>> {
-    match trades_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match trades_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -223,9 +231,11 @@ pub fn py_trades_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "bars_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_bars_to_arrow_record_batch_bytes(py: Python, data: Vec<Bar>) -> PyResult<Py<PyBytes>> {
-    match bars_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match bars_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -236,12 +246,14 @@ pub fn py_bars_to_arrow_record_batch_bytes(py: Python, data: Vec<Bar>) -> PyResu
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "mark_prices_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_mark_prices_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<MarkPriceUpdate>,
 ) -> PyResult<Py<PyBytes>> {
-    match mark_prices_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match mark_prices_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -252,12 +264,14 @@ pub fn py_mark_prices_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "index_prices_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_index_prices_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<IndexPriceUpdate>,
 ) -> PyResult<Py<PyBytes>> {
-    match index_prices_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match index_prices_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }
@@ -268,12 +282,14 @@ pub fn py_index_prices_to_arrow_record_batch_bytes(
 ///
 /// Returns a `PyErr` if encoding fails.
 #[pyfunction(name = "instrument_closes_to_arrow_record_batch_bytes")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[allow(clippy::needless_pass_by_value)]
 pub fn py_instrument_closes_to_arrow_record_batch_bytes(
     py: Python,
     data: Vec<InstrumentClose>,
 ) -> PyResult<Py<PyBytes>> {
-    match instrument_closes_to_arrow_record_batch_bytes(data) {
-        Ok(batch) => arrow_record_batch_to_pybytes(py, batch),
+    match instrument_closes_to_arrow_record_batch_bytes(&data) {
+        Ok(batch) => arrow_record_batch_to_pybytes(py, &batch),
         Err(e) => Err(to_pyvalue_err(e)),
     }
 }

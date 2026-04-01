@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,11 +17,27 @@
 
 use std::{any::Any, cell::RefCell, rc::Rc};
 
-use nautilus_common::{cache::Cache, clock::Clock};
-use nautilus_data::client::DataClient;
-use nautilus_system::factories::{ClientConfig, DataClientFactory};
+use nautilus_common::{
+    cache::Cache,
+    clients::{DataClient, ExecutionClient},
+    clock::Clock,
+};
+use nautilus_live::ExecutionClientCore;
+use nautilus_model::{
+    enums::{AccountType, OmsType},
+    identifiers::ClientId,
+};
+use nautilus_system::{
+    ExecutionClientFactory,
+    factories::{ClientConfig, DataClientFactory},
+};
 
-use crate::{config::BlockchainDataClientConfig, data::BlockchainDataClient};
+use crate::{
+    config::{BlockchainDataClientConfig, BlockchainExecutionClientConfig},
+    constants::BLOCKCHAIN_VENUE,
+    data::client::BlockchainDataClient,
+    execution::client::BlockchainExecutionClient,
+};
 
 impl ClientConfig for BlockchainDataClientConfig {
     fn as_any(&self) -> &dyn Any {
@@ -33,10 +49,17 @@ impl ClientConfig for BlockchainDataClientConfig {
 ///
 /// This factory creates `BlockchainDataClient` instances configured for different blockchain networks
 /// (Ethereum, Arbitrum, Base, Polygon) with appropriate RPC and HyperSync configurations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.blockchain")
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.blockchain",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.blockchain")
 )]
 pub struct BlockchainDataClientFactory;
 
@@ -85,6 +108,79 @@ impl DataClientFactory for BlockchainDataClientFactory {
     }
 }
 
+/// Factory for creating blockchain execution clients.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.blockchain",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.blockchain")
+)]
+pub struct BlockchainExecutionClientFactory;
+
+impl BlockchainExecutionClientFactory {
+    /// Creates a new [`BlockchainExecutionClientFactory`] instance.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for BlockchainExecutionClientFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecutionClientFactory for BlockchainExecutionClientFactory {
+    fn create(
+        &self,
+        name: &str,
+        config: &dyn ClientConfig,
+        cache: Rc<RefCell<Cache>>,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        let blockchain_execution_config = config
+            .as_any()
+            .downcast_ref::<BlockchainExecutionClientConfig>()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid config type for BlockchainDataClientFactory. Expected `BlockchainDataClientConfig`, was {config:?}"
+                )
+            })?;
+
+        let core_execution_client = ExecutionClientCore::new(
+            blockchain_execution_config.trader_id,
+            ClientId::from(name),
+            *BLOCKCHAIN_VENUE,
+            OmsType::Netting,
+            blockchain_execution_config.client_id,
+            AccountType::Wallet,
+            None,
+            cache,
+        );
+
+        let client = BlockchainExecutionClient::new(
+            core_execution_client,
+            blockchain_execution_config.clone(),
+        )?;
+
+        Ok(Box::new(client))
+    }
+
+    fn name(&self) -> &'static str {
+        "BLOCKCHAIN"
+    }
+
+    fn config_type(&self) -> &'static str {
+        "BlockchainExecutionClientConfig"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -100,10 +196,14 @@ mod tests {
         let chain = Arc::new(chains::ETHEREUM.clone());
         let config = BlockchainDataClientConfig::new(
             chain,
+            vec![],
             "https://eth-mainnet.example.com".to_string(),
             None,
             None,
+            None,
             false,
+            None,
+            None,
             None,
         );
 

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -12,6 +12,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+
+from contextlib import suppress
 
 import pyarrow as pa
 
@@ -125,26 +127,20 @@ def generate_signal_class(name: str, value_type: type) -> type:
         },
     )
     # Register for arrow serialization (only if not already registered)
-    try:
+    with suppress(KeyError, ValueError):
         register_arrow(
             data_cls=SignalData,
             encoder=serialize_signal,
             decoder=deserialize_signal,
             schema=schema,
         )
-    except (KeyError, ValueError):
-        # Already registered, skip
-        pass
 
     # Register for message bus serialization (only if not already registered)
-    try:
+    with suppress(KeyError):
         register_serializable_type(
             cls=SignalData,
             to_dict=SignalData.to_dict_c,
             from_dict=SignalData.from_dict_c,
         )
-    except KeyError:
-        # Already registered, skip
-        pass
 
     return SignalData

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,10 +13,33 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Redis-backed cache database for the system.
+//!
+//! # Architecture
+//!
+//! Uses two Redis connections with distinct roles:
+//! - **READ** (`self.con`): synchronous queries (`keys`, `read`, `load_all`),
+//!   owned by the main struct.
+//! - **WRITE**: owned by a background task on `get_runtime()`, receives
+//!   commands via an unbounded `tokio::sync::mpsc` channel.
+//!
+//! All write operations (`insert`, `update`, `delete`, `flush`) are routed
+//! through the command channel so they execute on the WRITE connection. This
+//! avoids cross-runtime I/O issues since the WRITE connection is always
+//! created on the Nautilus runtime.
+//!
+//! Synchronous callers (`close`, `flushdb_sync`) use `std::sync::mpsc` reply
+//! channels to block until the background task confirms completion. When
+//! called from the Nautilus runtime itself, `block_in_place` is used
+//! automatically to avoid stalling the worker thread.
+
 use std::{
     collections::VecDeque,
     fmt::Debug,
-    time::{Duration, Instant},
+    ops::ControlFlow,
+    pin::Pin,
+    sync::mpsc::{self, SyncSender},
+    time::Duration,
 };
 
 use ahash::AHashMap;
@@ -26,17 +49,16 @@ use nautilus_common::{
         CacheConfig,
         database::{CacheDatabaseAdapter, CacheMap},
     },
-    custom::CustomData,
     enums::SerializationEncoding,
+    live::get_runtime,
     logging::{log_task_awaiting, log_task_started, log_task_stopped},
-    runtime::get_runtime,
     signal::Signal,
 };
 use nautilus_core::{UUID4, UnixNanos, correctness::check_slice_not_empty};
 use nautilus_cryptography::providers::install_cryptographic_provider;
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, DataType, QuoteTick, TradeTick},
+    data::{Bar, CustomData, DataType, FundingRateUpdate, HasTsInit, QuoteTick, TradeTick},
     events::{OrderEventAny, OrderSnapshot, position::snapshot::PositionSnapshot},
     identifiers::{
         AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
@@ -49,10 +71,9 @@ use nautilus_model::{
     types::Currency,
 };
 use redis::{Pipeline, aio::ConnectionManager};
-use tokio::try_join;
 use ustr::Ustr;
 
-use super::{REDIS_DELIMITER, REDIS_FLUSHDB};
+use super::{REDIS_DELIMITER, REDIS_FLUSHDB, get_index_key};
 use crate::redis::{create_redis_connection, queries::DatabaseQueries};
 
 // Task and connection names
@@ -76,6 +97,7 @@ const ACTORS: &str = "actors";
 const STRATEGIES: &str = "strategies";
 const SNAPSHOTS: &str = "snapshots";
 const HEALTH: &str = "health";
+const CUSTOM: &str = "custom";
 
 // Index keys
 const INDEX_ORDER_IDS: &str = "index:order_ids";
@@ -96,7 +118,7 @@ pub enum DatabaseOperation {
     Insert,
     Update,
     Delete,
-    DeleteFromList,
+    Flush(SyncSender<()>),
     Close,
 }
 
@@ -142,8 +164,9 @@ pub struct RedisCacheDatabase {
     pub trader_id: TraderId,
     pub trader_key: String,
     pub encoding: SerializationEncoding,
+    pub bulk_read_batch_size: Option<usize>,
     tx: tokio::sync::mpsc::UnboundedSender<DatabaseCommand>,
-    handle: tokio::task::JoinHandle<()>,
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Debug for RedisCacheDatabase {
@@ -181,6 +204,8 @@ impl RedisCacheDatabase {
         let trader_key = get_trader_key(trader_id, instance_id, &config);
         let trader_key_clone = trader_key.clone();
         let encoding = config.encoding;
+        let bulk_read_batch_size = config.bulk_read_batch_size;
+
         let handle = get_runtime().spawn(async move {
             if let Err(e) = process_commands(rx, trader_key_clone, config.clone()).await {
                 log::error!("Error in task '{CACHE_PROCESS}': {e}");
@@ -192,8 +217,9 @@ impl RedisCacheDatabase {
             trader_id,
             trader_key,
             encoding,
+            bulk_read_batch_size,
             tx,
-            handle,
+            handle: Some(handle),
         })
     }
 
@@ -210,17 +236,26 @@ impl RedisCacheDatabase {
     pub fn close(&mut self) {
         log::debug!("Closing");
 
+        let Some(handle) = self.handle.take() else {
+            log::debug!("Already closed");
+            return;
+        };
+
         if let Err(e) = self.tx.send(DatabaseCommand::close()) {
             log::debug!("Error sending close command: {e:?}");
         }
 
         log_task_awaiting(CACHE_PROCESS);
 
-        tokio::task::block_in_place(|| {
-            if let Err(e) = get_runtime().block_on(&mut self.handle) {
+        let (tx, rx) = mpsc::sync_channel(1);
+
+        get_runtime().spawn(async move {
+            if let Err(e) = handle.await {
                 log::error!("Error awaiting task '{CACHE_PROCESS}': {e:?}");
             }
+            let _ = tx.send(());
         });
+        let _ = blocking_recv(&rx);
 
         log::debug!("Closed");
     }
@@ -234,6 +269,26 @@ impl RedisCacheDatabase {
         }
     }
 
+    /// Sends a flush command through the background task channel and blocks
+    /// until it completes. Safe to call from any runtime context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command channel is closed or the reply is lost.
+    pub fn flushdb_sync(&self) -> anyhow::Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let cmd = DatabaseCommand {
+            op_type: DatabaseOperation::Flush(reply_tx),
+            key: None,
+            payload: None,
+        };
+        self.tx
+            .send(cmd)
+            .map_err(|e| anyhow::anyhow!("{FAILED_TX_CHANNEL}: {e}"))?;
+        blocking_recv(&reply_rx).map_err(|e| anyhow::anyhow!("Failed to flush database: {e}"))?;
+        Ok(())
+    }
+
     /// Retrieves all keys matching the given `pattern` from Redis for this trader.
     ///
     /// # Errors
@@ -241,7 +296,6 @@ impl RedisCacheDatabase {
     /// Returns an error if the underlying Redis scan operation fails.
     pub async fn keys(&mut self, pattern: &str) -> anyhow::Result<Vec<String>> {
         let pattern = format!("{}{REDIS_DELIMITER}{pattern}", self.trader_key);
-        log::debug!("Querying keys: {pattern}");
         DatabaseQueries::scan_keys(&mut self.con, pattern).await
     }
 
@@ -254,17 +308,73 @@ impl RedisCacheDatabase {
         DatabaseQueries::read(&self.con, &self.trader_key, key).await
     }
 
+    /// Reads multiple values using bulk operations for efficiency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying Redis read operation fails.
+    pub async fn read_bulk(&mut self, keys: &[String]) -> anyhow::Result<Vec<Option<Bytes>>> {
+        match self.bulk_read_batch_size {
+            Some(batch_size) => {
+                DatabaseQueries::read_bulk_batched(&self.con, keys, batch_size).await
+            }
+            None => DatabaseQueries::read_bulk(&self.con, keys).await,
+        }
+    }
+
+    /// Loads custom data from Redis matching the given `data_type` (blocking).
+    ///
+    /// Spawns the async query on the global Nautilus runtime and blocks until
+    /// the result arrives via a channel. Safe from any thread context (Python,
+    /// test runtimes, plain threads).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the reply channel is closed.
+    pub fn load_custom_data(&self, data_type: &DataType) -> anyhow::Result<Vec<CustomData>> {
+        let con = self.con.clone();
+        let trader_key = self.trader_key.clone();
+        let data_type = data_type.clone();
+        let (tx, rx) = mpsc::channel();
+
+        get_runtime().spawn(async move {
+            let result = DatabaseQueries::load_custom_data(&con, &trader_key, &data_type).await;
+            if let Err(e) = tx.send(result) {
+                log::error!("Failed to send custom data result for '{data_type}': {e:?}");
+            }
+        });
+
+        blocking_recv(&rx).map_err(|e| anyhow::anyhow!("load_custom_data channel closed: {e}"))?
+    }
+
     /// Sends an insert command for `key` with optional `payload` to Redis via the background task.
     ///
     /// # Errors
     ///
     /// Returns an error if the command cannot be sent to the background task channel.
-    pub fn insert(&mut self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
+    pub fn insert(&self, key: String, payload: Option<Vec<Bytes>>) -> anyhow::Result<()> {
         let op = DatabaseCommand::new(DatabaseOperation::Insert, key, payload);
         match self.tx.send(op) {
             Ok(()) => Ok(()),
             Err(e) => anyhow::bail!("{FAILED_TX_CHANNEL}: {e}"),
         }
+    }
+
+    /// Stores custom data in Redis (key format: `custom:<ts_init_020>:<uuid>`, value: full JSON).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the insert command cannot be sent.
+    pub fn add_custom_data(&self, data: &CustomData) -> anyhow::Result<()> {
+        let json_bytes = serde_json::to_vec(data)
+            .map_err(|e| anyhow::anyhow!("CustomData serialization failed: {e}"))?;
+        let ts_init = data.ts_init().as_u64();
+        let key = format!(
+            "{CUSTOM}{REDIS_DELIMITER}{:020}{REDIS_DELIMITER}{}",
+            ts_init,
+            UUID4::new()
+        );
+        self.insert(key, Some(vec![Bytes::from(json_bytes)]))
     }
 
     /// Sends an update command for `key` with optional `payload` to Redis via the background task.
@@ -293,7 +403,7 @@ impl RedisCacheDatabase {
         }
     }
 
-    /// Delete the given order from the database with comprehensive index cleanup.
+    /// Delete the given order from the database with full index cleanup.
     ///
     /// # Errors
     ///
@@ -301,12 +411,8 @@ impl RedisCacheDatabase {
     pub fn delete_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
         let order_id_bytes = Bytes::from(client_order_id.to_string());
 
-        log::debug!("Deleting order: {client_order_id} from Redis");
-        log::debug!("Trader key: {}", self.trader_key);
-
         // Delete the order itself
         let key = format!("{ORDERS}{REDIS_DELIMITER}{client_order_id}");
-        log::debug!("Deleting order key: {key}");
         let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
         self.tx
             .send(op)
@@ -324,7 +430,6 @@ impl RedisCacheDatabase {
 
         for index_key in &index_keys {
             let key = (*index_key).to_string();
-            log::debug!("Deleting from index: {key} (order_id: {client_order_id})");
             let payload = vec![order_id_bytes.clone()];
             let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
             self.tx
@@ -336,7 +441,6 @@ impl RedisCacheDatabase {
         let hash_indexes = [INDEX_ORDER_POSITION, INDEX_ORDER_CLIENT];
         for index_key in &hash_indexes {
             let key = (*index_key).to_string();
-            log::debug!("Deleting from hash index: {key} (order_id: {client_order_id})");
             let payload = vec![order_id_bytes.clone()];
             let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
             self.tx.send(op).map_err(|e| {
@@ -344,11 +448,10 @@ impl RedisCacheDatabase {
             })?;
         }
 
-        log::debug!("Sent all delete commands for order: {client_order_id}");
         Ok(())
     }
 
-    /// Delete the given position from the database with comprehensive index cleanup.
+    /// Delete the given position from the database with full index cleanup.
     ///
     /// # Errors
     ///
@@ -356,12 +459,8 @@ impl RedisCacheDatabase {
     pub fn delete_position(&self, position_id: &PositionId) -> anyhow::Result<()> {
         let position_id_bytes = Bytes::from(position_id.to_string());
 
-        log::debug!("Deleting position: {position_id} from Redis");
-        log::debug!("Trader key: {}", self.trader_key);
-
         // Delete the position itself
         let key = format!("{POSITIONS}{REDIS_DELIMITER}{position_id}");
-        log::debug!("Deleting position key: {key}");
         let op = DatabaseCommand::new(DatabaseOperation::Delete, key, None);
         self.tx
             .send(op)
@@ -376,7 +475,6 @@ impl RedisCacheDatabase {
 
         for index_key in &index_keys {
             let key = (*index_key).to_string();
-            log::debug!("Deleting from index: {key} (position_id: {position_id})");
             let payload = vec![position_id_bytes.clone()];
             let op = DatabaseCommand::new(DatabaseOperation::Delete, key, Some(payload));
             self.tx.send(op).map_err(|e| {
@@ -384,7 +482,6 @@ impl RedisCacheDatabase {
             })?;
         }
 
-        log::debug!("Sent all delete commands for position: {position_id}");
         Ok(())
     }
 
@@ -395,46 +492,23 @@ impl RedisCacheDatabase {
     /// Returns an error if the command cannot be sent to the background task channel.
     pub fn delete_account_event(
         &self,
-        account_id: &AccountId,
-        event_id: &str,
+        _account_id: &AccountId,
+        _event_id: &str,
     ) -> anyhow::Result<()> {
-        self.delete_account_events_batch(account_id, &[event_id])
+        log::warn!("Deleting account events currently a no-op (pending redesign)");
+        Ok(())
     }
+}
 
-    /// Delete multiple account events from the database in a single batch operation.
-    ///
-    /// This is more efficient than calling `delete_account_event` multiple times
-    /// as it reduces the number of Redis operations and network round trips.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the command cannot be sent to the background task channel.
-    pub fn delete_account_events_batch(
-        &self,
-        account_id: &AccountId,
-        event_ids: &[impl AsRef<str>],
-    ) -> anyhow::Result<()> {
-        if event_ids.is_empty() {
-            return Ok(());
-        }
+fn blocking_recv<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+    let on_nautilus_runtime = tokio::runtime::Handle::try_current()
+        .ok()
+        .is_some_and(|h| h.id() == get_runtime().handle().id());
 
-        log::debug!(
-            "Deleting {} account events for account: {account_id}",
-            event_ids.len()
-        );
-        if log::log_enabled!(log::Level::Trace) {
-            log::trace!("Trader key: {}", self.trader_key);
-        }
-
-        let key = format!("{ACCOUNTS}{REDIS_DELIMITER}{account_id}");
-        let payload: Vec<Bytes> = event_ids
-            .iter()
-            .map(|id| Bytes::copy_from_slice(id.as_ref().as_bytes()))
-            .collect();
-        let op = DatabaseCommand::new(DatabaseOperation::DeleteFromList, key, Some(payload));
-        self.tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("Failed to send delete account events command: {e}"))
+    if on_nautilus_runtime {
+        tokio::task::block_in_place(|| rx.recv())
+    } else {
+        rx.recv()
     }
 }
 
@@ -453,24 +527,33 @@ async fn process_commands(
 
     // Buffering
     let mut buffer: VecDeque<DatabaseCommand> = VecDeque::new();
-    let mut last_drain = Instant::now();
     let buffer_interval = Duration::from_millis(config.buffer_interval_ms.unwrap_or(0) as u64);
+
+    // A sleep used to trigger periodic flushing of the buffer.
+    // When `buffer_interval` is zero we skip using the timer and flush immediately
+    // after every message.
+    let flush_timer = tokio::time::sleep(buffer_interval);
+    tokio::pin!(flush_timer);
 
     // Continue to receive and handle messages until channel is hung up
     loop {
-        if last_drain.elapsed() >= buffer_interval && !buffer.is_empty() {
-            drain_buffer(&mut con, &trader_key, &mut buffer).await;
-            last_drain = Instant::now();
-        } else if let Some(cmd) = rx.recv().await {
-            tracing::trace!("Received {cmd:?}");
+        tokio::select! {
+            maybe_cmd = rx.recv() => {
+                let result = handle_command(
+                    maybe_cmd,
+                    &mut buffer,
+                    buffer_interval,
+                    &mut con,
+                    &trader_key,
+                ).await;
 
-            if matches!(cmd.op_type, DatabaseOperation::Close) {
-                break;
+                if result.is_break() {
+                    break;
+                }
             }
-            buffer.push_back(cmd);
-        } else {
-            tracing::debug!("Command channel closed");
-            break;
+            () = &mut flush_timer, if !buffer_interval.is_zero() => {
+                flush_buffer(&mut buffer, &mut con, &trader_key, &mut flush_timer, buffer_interval).await;
+            }
         }
     }
 
@@ -481,6 +564,65 @@ async fn process_commands(
 
     log_task_stopped(CACHE_PROCESS);
     Ok(())
+}
+
+async fn handle_command(
+    maybe_cmd: Option<DatabaseCommand>,
+    buffer: &mut VecDeque<DatabaseCommand>,
+    buffer_interval: Duration,
+    con: &mut ConnectionManager,
+    trader_key: &str,
+) -> ControlFlow<()> {
+    let Some(cmd) = maybe_cmd else {
+        log::debug!("Command channel closed");
+        return ControlFlow::Break(());
+    };
+
+    log::trace!("Received {cmd:?}");
+
+    match cmd.op_type {
+        DatabaseOperation::Close => {
+            if !buffer.is_empty() {
+                drain_buffer(con, trader_key, buffer).await;
+            }
+            return ControlFlow::Break(());
+        }
+        DatabaseOperation::Flush(reply_tx) => {
+            if !buffer.is_empty() {
+                drain_buffer(con, trader_key, buffer).await;
+            }
+
+            if let Err(e) = redis::cmd(REDIS_FLUSHDB).query_async::<()>(con).await {
+                log::error!("Failed to flush database: {e:?}");
+            }
+            let _ = reply_tx.send(());
+            return ControlFlow::Continue(());
+        }
+        _ => {}
+    }
+
+    buffer.push_back(cmd);
+
+    if buffer_interval.is_zero() {
+        drain_buffer(con, trader_key, buffer).await;
+    }
+
+    ControlFlow::Continue(())
+}
+
+async fn flush_buffer(
+    buffer: &mut VecDeque<DatabaseCommand>,
+    con: &mut ConnectionManager,
+    trader_key: &str,
+    flush_timer: &mut Pin<&mut tokio::time::Sleep>,
+    buffer_interval: Duration,
+) {
+    if !buffer.is_empty() {
+        drain_buffer(con, trader_key, buffer).await;
+    }
+    flush_timer
+        .as_mut()
+        .reset(tokio::time::Instant::now() + buffer_interval);
 }
 
 async fn drain_buffer(
@@ -501,7 +643,7 @@ async fn drain_buffer(
         let collection = match get_collection_key(&key) {
             Ok(collection) => collection,
             Err(e) => {
-                tracing::error!("{e}");
+                log::error!("{e}");
                 continue; // Continue to next message
             }
         };
@@ -512,25 +654,25 @@ async fn drain_buffer(
             DatabaseOperation::Insert => {
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing INSERT for collection: {collection}, key: {key}");
-                    if let Err(e) = insert(&mut pipe, collection, &key, payload) {
-                        tracing::error!("{e}");
+                    if let Err(e) = insert(&mut pipe, collection, &key, &payload) {
+                        log::error!("{e}");
                     }
                 } else {
-                    tracing::error!("Null `payload` for `insert`");
+                    log::error!("Null `payload` for `insert`");
                 }
             }
             DatabaseOperation::Update => {
                 if let Some(payload) = msg.payload {
                     log::debug!("Processing UPDATE for collection: {collection}, key: {key}");
-                    if let Err(e) = update(&mut pipe, collection, &key, payload) {
-                        tracing::error!("{e}");
+                    if let Err(e) = update(&mut pipe, collection, &key, &payload) {
+                        log::error!("{e}");
                     }
                 } else {
-                    tracing::error!("Null `payload` for `update`");
+                    log::error!("Null `payload` for `update`");
                 }
             }
             DatabaseOperation::Delete => {
-                tracing::debug!(
+                log::debug!(
                     "Processing DELETE for collection: {}, key: {}, payload: {:?}",
                     collection,
                     key,
@@ -538,39 +680,24 @@ async fn drain_buffer(
                 );
                 // `payload` can be `None` for a delete operation
                 if let Err(e) = delete(&mut pipe, collection, &key, msg.payload) {
-                    tracing::error!("{e}");
-                }
-            }
-            DatabaseOperation::DeleteFromList => {
-                log::debug!("Processing DELETE_FROM_LIST for collection: {collection}, key: {key}");
-                // For deleting specific items from Redis lists (TBD if this remains)
-                if let Some(payload) = &msg.payload {
-                    if let Err(e) = delete_from_list(&mut pipe, collection, &key, payload) {
-                        tracing::error!("{e}");
-                    }
-                } else {
-                    tracing::error!("Null `payload` for `delete_from_list`");
+                    log::error!("{e}");
                 }
             }
             DatabaseOperation::Close => panic!("Close command should not be drained"),
+            DatabaseOperation::Flush(_) => panic!("Flush command should not be drained"),
         }
     }
 
     if let Err(e) = pipe.query_async::<()>(conn).await {
-        tracing::error!("{e}");
+        log::error!("{e}");
     }
 }
 
-fn insert(
-    pipe: &mut Pipeline,
-    collection: &str,
-    key: &str,
-    value: Vec<Bytes>,
-) -> anyhow::Result<()> {
-    check_slice_not_empty(value.as_slice(), stringify!(value))?;
+fn insert(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
+    check_slice_not_empty(value, stringify!(value))?;
 
     match collection {
-        INDEX => insert_index(pipe, key, &value),
+        INDEX => insert_index(pipe, key, value),
         GENERAL => {
             insert_string(pipe, key, value[0].as_ref());
             Ok(())
@@ -612,6 +739,10 @@ fn insert(
             Ok(())
         }
         HEALTH => {
+            insert_string(pipe, key, value[0].as_ref());
+            Ok(())
+        }
+        CUSTOM => {
             insert_string(pipe, key, value[0].as_ref());
             Ok(())
         }
@@ -686,13 +817,8 @@ fn insert_list(pipe: &mut Pipeline, key: &str, value: &[u8]) {
     pipe.rpush(key, value);
 }
 
-fn update(
-    pipe: &mut Pipeline,
-    collection: &str,
-    key: &str,
-    value: Vec<Bytes>,
-) -> anyhow::Result<()> {
-    check_slice_not_empty(value.as_slice(), stringify!(value))?;
+fn update(pipe: &mut Pipeline, collection: &str, key: &str, value: &[Bytes]) -> anyhow::Result<()> {
+    check_slice_not_empty(value, stringify!(value))?;
 
     match collection {
         ACCOUNTS => {
@@ -721,7 +847,7 @@ fn delete(
     key: &str,
     value: Option<Vec<Bytes>>,
 ) -> anyhow::Result<()> {
-    tracing::debug!(
+    log::debug!(
         "delete: collection={}, key={}, has_payload={}",
         collection,
         key,
@@ -823,128 +949,6 @@ fn delete_string(pipe: &mut Pipeline, key: &str) {
     pipe.del(key);
 }
 
-fn delete_from_list(
-    pipe: &mut Pipeline,
-    collection: &str,
-    key: &str,
-    payload: &[Bytes],
-) -> anyhow::Result<()> {
-    match collection {
-        ACCOUNTS => {
-            // payload contains one or more event_ids as strings
-            if payload.is_empty() {
-                return Ok(());
-            }
-
-            // Convert payload to vector of event_ids (avoid intermediate allocation)
-            let event_ids: Result<Vec<&str>, _> = payload
-                .iter()
-                .map(|bytes| std::str::from_utf8(bytes))
-                .collect();
-            let event_ids = event_ids?;
-
-            // The Python layer has already determined these events are safe to delete
-            // (they're not the last events). We can safely remove them from the Redis list.
-            // Since account events are stored as serialized objects, we need to find
-            // and remove items that contain the event_id(s) within their serialized data.
-            //
-            // Note: This implementation depends on exact JSON field matching pattern '"event_id":"<value>"'.
-            // If payload format changes (extra whitespace, different field ordering), consider:
-            // - Using RedisJSON for structured queries
-            // - Storing event_id as separate Redis field
-            // - Using more robust JSON parsing in LUA
-            let lua_script = r#"
-                local key = KEYS[1]
-                local total_removed = 0
-
-                -- Check if the key exists first
-                if redis.call('EXISTS', key) == 0 then
-                    return 0
-                end
-
-                local list_length = redis.call('LLEN', key)
-                if list_length == 0 then
-                    return 0
-                end
-
-                -- Capture TTL before modification for preservation
-                local original_ttl = redis.call('PTTL', key)
-
-                -- Create event_id set for fast lookup
-                local event_id_set = {}
-                for i = 1, #ARGV do
-                    event_id_set[ARGV[i]] = true
-                end
-
-                -- Memory-efficient batch processing: scan list in chunks without loading everything
-                local BATCH_SIZE = 100  -- Process in batches to limit memory usage
-                local temp_key = key .. ":purge_tmp"
-                local processed = 0
-
-                -- Ensure temp key doesn't exist
-                redis.call('DEL', temp_key)
-
-                while processed < list_length do
-                    local batch_end = math.min(processed + BATCH_SIZE - 1, list_length - 1)
-
-                    -- Get batch of items to check
-                    local batch_items = redis.call('LRANGE', key, processed, batch_end)
-
-                    -- Stream items individually to temp key (true constant memory)
-                    for _, item in ipairs(batch_items) do
-                        local should_keep = true
-
-                        -- Check if this item contains any event_id to delete
-                        for event_id, _ in pairs(event_id_set) do
-                            local pattern = '"event_id":"' .. event_id .. '"'
-                            if string.find(item, pattern, 1, true) then
-                                should_keep = false
-                                total_removed = total_removed + 1
-                                break
-                            end
-                        end
-
-                        -- Stream each kept item immediately (no accumulation)
-                        if should_keep then
-                            redis.call('RPUSH', temp_key, item)
-                        end
-                    end
-
-                    processed = processed + BATCH_SIZE
-                end
-
-                -- Atomically replace original key with filtered results
-                redis.call('DEL', key)
-                if redis.call('EXISTS', temp_key) == 1 then
-                    redis.call('RENAME', temp_key, key)
-
-                    -- Restore original TTL if it was set
-                    if original_ttl > 0 then
-                        redis.call('PEXPIRE', key, original_ttl)
-                    end
-                else
-                    -- No items kept, key remains deleted
-                end
-
-                return total_removed
-            "#;
-
-            // Add the script and arguments to the pipeline
-            pipe.cmd("EVAL").arg(lua_script).arg(1).arg(key);
-
-            // Add all event_ids as arguments
-            for event_id in event_ids {
-                pipe.arg(event_id);
-            }
-
-            Ok(())
-        }
-        _ => {
-            anyhow::bail!("Unsupported operation: `delete_from_list` for collection '{collection}'")
-        }
-    }
-}
-
 fn get_trader_key(trader_id: TraderId, instance_id: UUID4, config: &CacheConfig) -> String {
     let mut key = String::new();
 
@@ -970,23 +974,15 @@ fn get_collection_key(key: &str) -> anyhow::Result<&str> {
         })
 }
 
-fn get_index_key(key: &str) -> anyhow::Result<&str> {
-    key.split_once(REDIS_DELIMITER)
-        .map(|(_, index_key)| index_key)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Invalid `key`, missing a '{REDIS_DELIMITER}' delimiter, was {key}")
-        })
-}
-
-#[allow(dead_code)] // Under development
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct RedisCacheDatabaseAdapter {
     pub encoding: SerializationEncoding,
     pub database: RedisCacheDatabase,
 }
 
-#[allow(dead_code)] // Under development
-#[allow(unused)] // Under development
+#[allow(dead_code)]
+#[allow(unused)]
 #[async_trait::async_trait]
 impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     fn close(&mut self) -> anyhow::Result<()> {
@@ -995,12 +991,11 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
-        self.database.flushdb();
-        Ok(())
+        self.database.flushdb_sync()
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        tracing::debug!("Loading all data");
+        log::debug!("Loading all data");
 
         let (
             currencies,
@@ -1011,7 +1006,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
             positions,
             greeks,
             yield_curves,
-        ) = try_join!(
+        ) = tokio::try_join!(
             self.load_currencies(),
             self.load_instruments(),
             self.load_synthetics(),
@@ -1167,11 +1162,125 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
         todo!()
     }
 
-    fn delete_actor(&self, component_id: &ComponentId) -> anyhow::Result<()> {
+    fn load_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<AHashMap<String, Bytes>> {
         todo!()
     }
 
-    fn load_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<AHashMap<String, Bytes>> {
+    fn load_signals(&self, name: &str) -> anyhow::Result<Vec<Signal>> {
+        anyhow::bail!("Loading signals from Redis cache adapter not supported")
+    }
+
+    fn load_custom_data(&self, data_type: &DataType) -> anyhow::Result<Vec<CustomData>> {
+        self.database.load_custom_data(data_type)
+    }
+
+    fn load_order_snapshot(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> anyhow::Result<Option<OrderSnapshot>> {
+        anyhow::bail!("Loading order snapshots from Redis cache adapter not supported")
+    }
+
+    fn load_position_snapshot(
+        &self,
+        position_id: &PositionId,
+    ) -> anyhow::Result<Option<PositionSnapshot>> {
+        anyhow::bail!("Loading position snapshots from Redis cache adapter not supported")
+    }
+
+    fn load_quotes(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<QuoteTick>> {
+        anyhow::bail!("Loading quote data for Redis cache adapter not supported")
+    }
+
+    fn load_trades(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<TradeTick>> {
+        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+    }
+
+    fn load_funding_rates(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Vec<FundingRateUpdate>> {
+        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+    }
+
+    fn load_bars(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<Bar>> {
+        anyhow::bail!("Loading market data for Redis cache adapter not supported")
+    }
+
+    fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_instrument(&self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_order_snapshot(&self, snapshot: &OrderSnapshot) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_position(&self, position: &Position) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_position_snapshot(&self, snapshot: &PositionSnapshot) -> anyhow::Result<()> {
+        todo!()
+    }
+
+    fn add_order_book(&self, order_book: &OrderBook) -> anyhow::Result<()> {
+        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+    }
+
+    fn add_signal(&self, signal: &Signal) -> anyhow::Result<()> {
+        anyhow::bail!("Saving signals for Redis cache adapter not supported")
+    }
+
+    fn add_custom_data(&self, data: &CustomData) -> anyhow::Result<()> {
+        let json_bytes = serde_json::to_vec(data)
+            .map_err(|e| anyhow::anyhow!("CustomData serialization failed: {e}"))?;
+        let ts_init = data.ts_init().as_u64();
+        let key = format!(
+            "{CUSTOM}{REDIS_DELIMITER}{:020}{REDIS_DELIMITER}{}",
+            ts_init,
+            UUID4::new()
+        );
+        self.database
+            .insert(key, Some(vec![Bytes::from(json_bytes)]))
+    }
+
+    fn add_quote(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+    }
+
+    fn add_trade(&self, trade: &TradeTick) -> anyhow::Result<()> {
+        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+    }
+
+    fn add_funding_rate(&self, funding_rate: &FundingRateUpdate) -> anyhow::Result<()> {
+        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+    }
+
+    fn add_bar(&self, bar: &Bar) -> anyhow::Result<()> {
+        anyhow::bail!("Saving market data for Redis cache adapter not supported")
+    }
+
+    fn delete_actor(&self, component_id: &ComponentId) -> anyhow::Result<()> {
         todo!()
     }
 
@@ -1262,107 +1371,7 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 
     fn delete_account_event(&self, account_id: &AccountId, event_id: &str) -> anyhow::Result<()> {
-        let key = format!("{ACCOUNTS}{REDIS_DELIMITER}{account_id}");
-        let payload = vec![Bytes::from(event_id.to_string())];
-        let op = DatabaseCommand::new(DatabaseOperation::DeleteFromList, key, Some(payload));
-        self.database
-            .tx
-            .send(op)
-            .map_err(|e| anyhow::anyhow!("Failed to send delete account event command: {e}"))
-    }
-
-    fn add(&self, key: String, value: Bytes) -> anyhow::Result<()> {
         todo!()
-    }
-
-    fn add_currency(&self, currency: &Currency) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_instrument(&self, instrument: &InstrumentAny) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_account(&self, account: &AccountAny) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_order(&self, order: &OrderAny, client_id: Option<ClientId>) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_order_snapshot(&self, snapshot: &OrderSnapshot) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_position(&self, position: &Position) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_position_snapshot(&self, snapshot: &PositionSnapshot) -> anyhow::Result<()> {
-        todo!()
-    }
-
-    fn add_order_book(&self, order_book: &OrderBook) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
-    }
-
-    fn add_quote(&self, quote: &QuoteTick) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
-    }
-
-    fn load_quotes(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<QuoteTick>> {
-        anyhow::bail!("Loading quote data for Redis cache adapter not supported")
-    }
-
-    fn add_trade(&self, trade: &TradeTick) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
-    }
-
-    fn load_trades(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<TradeTick>> {
-        anyhow::bail!("Loading market data for Redis cache adapter not supported")
-    }
-
-    fn add_bar(&self, bar: &Bar) -> anyhow::Result<()> {
-        anyhow::bail!("Saving market data for Redis cache adapter not supported")
-    }
-
-    fn load_bars(&self, instrument_id: &InstrumentId) -> anyhow::Result<Vec<Bar>> {
-        anyhow::bail!("Loading market data for Redis cache adapter not supported")
-    }
-
-    fn add_signal(&self, signal: &Signal) -> anyhow::Result<()> {
-        anyhow::bail!("Saving signals for Redis cache adapter not supported")
-    }
-
-    fn load_signals(&self, name: &str) -> anyhow::Result<Vec<Signal>> {
-        anyhow::bail!("Loading signals from Redis cache adapter not supported")
-    }
-
-    fn add_custom_data(&self, data: &CustomData) -> anyhow::Result<()> {
-        anyhow::bail!("Saving custom data for Redis cache adapter not supported")
-    }
-
-    fn load_custom_data(&self, data_type: &DataType) -> anyhow::Result<Vec<CustomData>> {
-        anyhow::bail!("Loading custom data from Redis cache adapter not supported")
-    }
-
-    fn load_order_snapshot(
-        &self,
-        client_order_id: &ClientOrderId,
-    ) -> anyhow::Result<Option<OrderSnapshot>> {
-        anyhow::bail!("Loading order snapshots from Redis cache adapter not supported")
-    }
-
-    fn load_position_snapshot(
-        &self,
-        position_id: &PositionId,
-    ) -> anyhow::Result<Option<PositionSnapshot>> {
-        anyhow::bail!("Loading position snapshots from Redis cache adapter not supported")
     }
 
     fn index_venue_order_id(
@@ -1414,9 +1423,6 @@ impl CacheDatabaseAdapter for RedisCacheDatabaseAdapter {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -1447,17 +1453,5 @@ mod tests {
     fn test_get_collection_key_invalid() {
         let key = "no_delimiter";
         assert!(get_collection_key(key).is_err());
-    }
-
-    #[rstest]
-    fn test_get_index_key_valid() {
-        let key = "index:123";
-        assert_eq!(get_index_key(key).unwrap(), "123");
-    }
-
-    #[rstest]
-    fn test_get_index_key_invalid() {
-        let key = "no_delimiter";
-        assert!(get_index_key(key).is_err());
     }
 }

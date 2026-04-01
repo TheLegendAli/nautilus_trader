@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,10 +14,19 @@
 // -------------------------------------------------------------------------------------------------
 
 use alloy::primitives::{Address, U256};
+use nautilus_core::UnixNanos;
+use nautilus_model::{
+    defi::{PoolIdentifier, PoolLiquidityUpdate, PoolLiquidityUpdateType, SharedChain, SharedDex},
+    identifiers::InstrumentId,
+};
 
 /// Represents a burn event that occurs when liquidity is removed from a position in a liquidity pool.
 #[derive(Debug, Clone)]
 pub struct BurnEvent {
+    /// The decentralized exchange where the event happened.
+    pub dex: SharedDex,
+    /// The unique identifier for the pool.
+    pub pool_identifier: PoolIdentifier,
     /// The block number when the burn occurred.
     pub block_number: u64,
     /// The unique hash identifier of the transaction containing this event.
@@ -44,7 +53,9 @@ impl BurnEvent {
     /// Creates a new [`BurnEvent`] instance with the specified parameters.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
+        dex: SharedDex,
+        pool_identifier: PoolIdentifier,
         block_number: u64,
         transaction_hash: String,
         transaction_index: u32,
@@ -57,6 +68,8 @@ impl BurnEvent {
         amount1: U256,
     ) -> Self {
         Self {
+            dex,
+            pool_identifier,
             block_number,
             transaction_hash,
             transaction_index,
@@ -68,5 +81,37 @@ impl BurnEvent {
             amount0,
             amount1,
         }
+    }
+
+    /// Converts a burn event into a `PoolLiquidityUpdate`.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn to_pool_liquidity_update(
+        &self,
+        chain: SharedChain,
+        dex: SharedDex,
+        instrument_id: InstrumentId,
+        pool_identifier: PoolIdentifier,
+        timestamp: Option<UnixNanos>,
+    ) -> PoolLiquidityUpdate {
+        PoolLiquidityUpdate::new(
+            chain,
+            dex,
+            instrument_id,
+            pool_identifier,
+            PoolLiquidityUpdateType::Burn,
+            self.block_number,
+            self.transaction_hash.clone(),
+            self.transaction_index,
+            self.log_index,
+            None,
+            self.owner,
+            self.amount,
+            self.amount0,
+            self.amount1,
+            self.tick_lower,
+            self.tick_upper,
+            timestamp,
+        )
     }
 }

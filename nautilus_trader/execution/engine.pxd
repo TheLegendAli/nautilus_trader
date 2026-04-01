@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,6 +17,7 @@ from nautilus_trader.cache.cache cimport Cache
 from nautilus_trader.common.component cimport Component
 from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.common.generators cimport PositionIdGenerator
+from nautilus_trader.core.message cimport Command
 from nautilus_trader.core.rust.model cimport OmsType
 from nautilus_trader.core.rust.model cimport OrderSide
 from nautilus_trader.execution.client cimport ExecutionClient
@@ -24,19 +25,20 @@ from nautilus_trader.execution.messages cimport BatchCancelOrders
 from nautilus_trader.execution.messages cimport CancelAllOrders
 from nautilus_trader.execution.messages cimport CancelOrder
 from nautilus_trader.execution.messages cimport ModifyOrder
+from nautilus_trader.execution.messages cimport QueryAccount
 from nautilus_trader.execution.messages cimport QueryOrder
 from nautilus_trader.execution.messages cimport SubmitOrder
 from nautilus_trader.execution.messages cimport SubmitOrderList
-from nautilus_trader.execution.messages cimport TradingCommand
 from nautilus_trader.model.events.order cimport OrderEvent
 from nautilus_trader.model.events.order cimport OrderFilled
 from nautilus_trader.model.events.position cimport PositionEvent
+from nautilus_trader.model.identifiers cimport AccountId
+from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.identifiers cimport PositionId
 from nautilus_trader.model.identifiers cimport StrategyId
 from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.instruments.base cimport Instrument
-from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 from nautilus_trader.model.orders.base cimport Order
 from nautilus_trader.model.position cimport Position
@@ -55,8 +57,16 @@ cdef class ExecutionEngine(Component):
     cdef readonly str snapshot_positions_timer_name
     cdef list[PositionEvent] _pending_position_events
 
+    cdef readonly dict[StrategyId, str] _topic_cache_order_events
+    cdef readonly dict[StrategyId, str] _topic_cache_position_events
+    cdef readonly dict[InstrumentId, str] _topic_cache_fill_events
+    cdef readonly dict[InstrumentId, str] _topic_cache_cancel_events
+    cdef readonly dict[ClientId, str] _topic_cache_commands
+
     cdef readonly bint debug
     """If debug mode is active (will provide extra debug logging).\n\n:returns: `bool`"""
+    cdef readonly bint allow_overfills
+    """If order fills exceeding order quantity are allowed (logs warning instead of raising).\n\n:returns: `bool`"""
     cdef readonly bint manage_own_order_books
     """If the execution engine should maintain own order books based on commands and events.\n\n:returns: `bool`"""
     cdef readonly bint snapshot_orders
@@ -65,6 +75,20 @@ cdef class ExecutionEngine(Component):
     """If position state snapshots should be persisted.\n\n:returns: `bool`"""
     cdef readonly double snapshot_positions_interval_secs
     """The interval (seconds) at which additional position state snapshots are persisted.\n\n:returns: `double`"""
+    cdef readonly object purge_closed_orders_interval_mins
+    """The interval (minutes) between purging closed orders from the cache.\n\n:returns: `int or None`"""
+    cdef readonly object purge_closed_orders_buffer_mins
+    """The buffer (minutes) from when an order was closed before it can be purged.\n\n:returns: `int or None`"""
+    cdef readonly object purge_closed_positions_interval_mins
+    """The interval (minutes) between purging closed positions from the cache.\n\n:returns: `int or None`"""
+    cdef readonly object purge_closed_positions_buffer_mins
+    """The buffer (minutes) from when a position was closed before it can be purged.\n\n:returns: `int or None`"""
+    cdef readonly object purge_account_events_interval_mins
+    """The interval (minutes) between purging account events from the cache.\n\n:returns: `int or None`"""
+    cdef readonly object purge_account_events_lookback_mins
+    """The lookback window (minutes) for account events before they can be purged.\n\n:returns: `int or None`"""
+    cdef readonly bint purge_from_database
+    """If purging operations will also delete from the backing database.\n\n:returns: `bool`"""
     cdef readonly int command_count
     """The total count of commands received by the engine.\n\n:returns: `int`"""
     cdef readonly int event_count
@@ -77,6 +101,7 @@ cdef class ExecutionEngine(Component):
     cpdef bint check_connected(self)
     cpdef bint check_disconnected(self)
     cpdef bint check_residuals(self)
+    cpdef set[ClientId] get_external_client_ids(self)
     cpdef StrategyId get_external_order_claim(self, InstrumentId instrument_id)
     cpdef set[InstrumentId] get_external_order_claims_instruments(self)
     cpdef set[ExecutionClient] get_clients_for_orders(self, list[Order] orders)
@@ -98,9 +123,14 @@ cdef class ExecutionEngine(Component):
 
 # -- INTERNAL -------------------------------------------------------------------------------------
 
+    cdef str _get_order_events_topic(self, StrategyId strategy_id)
+    cdef str _get_position_events_topic(self, StrategyId strategy_id)
+    cdef str _get_fill_events_topic(self, InstrumentId instrument_id)
+    cdef str _get_cancel_events_topic(self, InstrumentId instrument_id)
+    cdef str _get_commands_topic(self, ClientId client_id)
+    cpdef ExecutionClient _find_client_for_command(self, Command command)
+
     cpdef void _set_position_id_counts(self)
-    cpdef Price _last_px_for_conversion(self, InstrumentId instrument_id, OrderSide order_side)
-    cpdef void _set_order_base_qty(self, Order order, Quantity base_qty)
     cpdef void _deny_order(self, Order order, str reason)
     cpdef object _get_or_init_own_order_book(self, InstrumentId instrument_id)
     cpdef void _add_own_book_order(self, Order order)
@@ -109,34 +139,43 @@ cdef class ExecutionEngine(Component):
 
     cpdef void stop_clients(self)
     cpdef void load_cache(self)
-    cpdef void execute(self, TradingCommand command)
+    cpdef void execute(self, Command command)
     cpdef void process(self, OrderEvent event)
     cpdef void flush_db(self)
 
 # -- COMMAND HANDLERS -----------------------------------------------------------------------------
 
-    cpdef void _execute_command(self, TradingCommand command)
+    cpdef void _execute_command(self, Command command)
     cpdef void _handle_submit_order(self, ExecutionClient client, SubmitOrder command)
     cpdef void _handle_submit_order_list(self, ExecutionClient client, SubmitOrderList command)
     cpdef void _handle_modify_order(self, ExecutionClient client, ModifyOrder command)
     cpdef void _handle_cancel_order(self, ExecutionClient client, CancelOrder command)
     cpdef void _handle_cancel_all_orders(self, ExecutionClient client, CancelAllOrders command)
     cpdef void _handle_batch_cancel_orders(self, ExecutionClient client, BatchCancelOrders command)
+    cpdef void _handle_query_account(self, ExecutionClient client, QueryAccount command)
     cpdef void _handle_query_order(self, ExecutionClient client, QueryOrder command)
 
 # -- EVENT HANDLERS -------------------------------------------------------------------------------
 
     cpdef void _handle_event(self, OrderEvent event)
     cpdef OmsType _determine_oms_type(self, OrderFilled fill)
-    cpdef void _determine_position_id(self, OrderFilled fill, OmsType oms_type)
-    cpdef PositionId _determine_hedging_position_id(self, OrderFilled fill)
+    cpdef void _determine_position_id(self, OrderFilled fill, OmsType oms_type, Order order=*)
+    cpdef PositionId _determine_hedging_position_id(self, OrderFilled fill, Order order=*)
     cpdef PositionId _determine_netting_position_id(self, OrderFilled fill)
-    cpdef void _apply_event_to_order(self, Order order, OrderEvent event)
+    cdef bint _check_overfill(self, Order order, OrderFilled fill)
+    cpdef bint _apply_event_to_order(self, Order order, OrderEvent event)
     cpdef void _handle_order_fill(self, Order order, OrderFilled fill, OmsType oms_type)
-    cpdef Position _open_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type)
+    cdef bint _is_leg_fill(self, OrderFilled fill)
+    cdef void _handle_position_update(self, Instrument instrument, OrderFilled fill, OmsType oms_type)
+    cpdef void _handle_leg_fill_without_order(self, OrderFilled fill)
+    cpdef void _open_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type)
+    cpdef void _reopen_position(self, Position position, OmsType oms_type)
     cpdef void _update_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type)
     cpdef bint _will_flip_position(self, Position position, OrderFilled fill)
     cpdef void _flip_position(self, Instrument instrument, Position position, OrderFilled fill, OmsType oms_type)
     cpdef void _create_order_state_snapshot(self, Order order)
     cpdef void _create_position_state_snapshot(self, Position position, bint open_only)
     cpdef void _snapshot_open_position_states(self, TimeEvent event)
+    cpdef void _purge_closed_orders(self, TimeEvent event)
+    cpdef void _purge_closed_positions(self, TimeEvent event)
+    cpdef void _purge_account_events(self, TimeEvent event)

@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -36,7 +36,11 @@ use crate::identifiers::InstrumentId;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OrderBookDeltas {
     /// The instrument ID for the book.
@@ -76,17 +80,13 @@ impl OrderBookDeltas {
     /// # Errors
     ///
     /// Returns an error if `deltas` is empty.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `deltas` is empty when unwrapping the last element.
+    #[allow(clippy::missing_panics_doc)] // Guarded by predicate check above
     pub fn new_checked(
         instrument_id: InstrumentId,
         deltas: Vec<OrderBookDelta>,
     ) -> anyhow::Result<Self> {
         check_predicate_true(!deltas.is_empty(), "`deltas` cannot be empty")?;
-        // SAFETY: We asserted `deltas` is not empty
-        let last = deltas.last().unwrap();
+        let last = deltas.last().expect("deltas not empty");
         let flags = last.flags;
         let sequence = last.sequence;
         let ts_event = last.ts_event;
@@ -183,9 +183,6 @@ impl DerefMut for OrderBookDeltas_API {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use std::{

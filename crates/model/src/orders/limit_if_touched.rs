@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -42,7 +42,11 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct LimitIfTouchedOrder {
     pub price: Price,
@@ -229,6 +233,12 @@ impl LimitIfTouchedOrder {
     }
 }
 
+impl PartialEq for LimitIfTouchedOrder {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_order_id == other.client_order_id
+    }
+}
+
 impl Deref for LimitIfTouchedOrder {
     type Target = OrderCore;
 
@@ -408,6 +418,10 @@ impl Order for LimitIfTouchedOrder {
         self.leaves_qty
     }
 
+    fn overfill_qty(&self) -> Quantity {
+        self.overfill_qty
+    }
+
     fn avg_px(&self) -> Option<f64> {
         self.avg_px
     }
@@ -457,16 +471,28 @@ impl Order for LimitIfTouchedOrder {
     }
 
     fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
+        let is_order_filled = matches!(event, OrderEventAny::Filled(_));
+        let is_order_triggered = matches!(event, OrderEventAny::Triggered(_));
+        let ts_event = if is_order_triggered {
+            Some(event.ts_event())
+        } else {
+            None
+        };
+
+        self.core.apply(event.clone())?;
+
         if let OrderEventAny::Updated(ref event) = event {
             self.update(event);
-        };
-        let is_order_filled = matches!(event, OrderEventAny::Filled(_));
+        }
 
-        self.core.apply(event)?;
+        if is_order_triggered {
+            self.is_triggered = true;
+            self.ts_triggered = ts_event;
+        }
 
         if is_order_filled {
             self.core.set_slippage(self.price);
-        };
+        }
 
         Ok(())
     }
@@ -481,7 +507,7 @@ impl Order for LimitIfTouchedOrder {
         }
 
         self.quantity = event.quantity;
-        self.leaves_qty = self.quantity - self.filled_qty;
+        self.leaves_qty = self.quantity.saturating_sub(self.filled_qty);
     }
 
     fn is_triggered(&self) -> Option<bool> {
@@ -580,9 +606,6 @@ impl From<OrderInitialized> for LimitIfTouchedOrder {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -694,7 +717,7 @@ mod tests {
             .build();
     }
 
-    #[test]
+    #[rstest]
     fn test_limit_if_touched_order_update() {
         // Create and accept a basic limit-if-touched order
         let order = OrderTestBuilder::new(OrderType::LimitIfTouched)
@@ -729,7 +752,7 @@ mod tests {
         assert_eq!(accepted_order.quantity(), updated_quantity);
     }
 
-    #[test]
+    #[rstest]
     fn test_limit_if_touched_order_from_order_initialized() {
         // Create an OrderInitialized event with all required fields for a LimitIfTouchedOrder
         let order_initialized = OrderInitializedBuilder::default()
@@ -760,7 +783,7 @@ mod tests {
         assert_eq!(order.trigger_type, order_initialized.trigger_type.unwrap());
     }
 
-    #[test]
+    #[rstest]
     fn test_limit_if_touched_order_sets_slippage_when_filled() {
         // Create a limit-if-touched order
         let order = OrderTestBuilder::new(OrderType::LimitIfTouched)
@@ -806,7 +829,7 @@ mod tests {
 
         assert!(
             (actual_slippage - expected_slippage).abs() < 0.001,
-            "Expected slippage around {expected_slippage}, got {actual_slippage}"
+            "Expected slippage around {expected_slippage}, was {actual_slippage}"
         );
     }
 }

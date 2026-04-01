@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{str::FromStr, sync::Arc};
+use std::str::FromStr;
 
 use nautilus_core::{
     UUID4, UnixNanos,
@@ -27,41 +27,40 @@ use pyo3::{
 };
 use ustr::Ustr;
 
-use crate::timer::{TimeEvent, TimeEventCallback, TimeEventHandlerV2};
+use crate::timer::{TimeEvent, TimeEventCallback, TimeEventHandler};
 
 #[pyo3::pyclass(
     module = "nautilus_trader.core.nautilus_pyo3.common",
     name = "TimeEventHandler"
 )]
-#[derive(Clone)]
 /// Temporary time event handler for Python inter-operatbility
 ///
 /// TODO: Remove once control flow moves into Rust
 ///
 /// `TimeEventHandler` associates a `TimeEvent` with a callback function that is triggered
 /// when the event's timestamp is reached.
-#[allow(non_camel_case_types)]
 #[derive(Debug)]
+#[allow(non_camel_case_types)]
 pub struct TimeEventHandler_Py {
     /// The time event.
     pub event: TimeEvent,
     /// The callable python object.
-    pub callback: Arc<PyObject>,
+    pub callback: Py<PyAny>,
 }
 
-impl From<TimeEventHandlerV2> for TimeEventHandler_Py {
+impl From<TimeEventHandler> for TimeEventHandler_Py {
     /// # Panics
     ///
-    /// Panics if the provided `TimeEventHandlerV2` contains a Rust callback,
+    /// Panics if the provided `TimeEventHandler` contains a Rust callback,
     /// since only Python callbacks are supported by this handler.
-    fn from(value: TimeEventHandlerV2) -> Self {
+    fn from(value: TimeEventHandler) -> Self {
         Self {
             event: value.event,
             callback: match value.callback {
                 #[cfg(feature = "python")]
                 TimeEventCallback::Python(callback) => callback,
-                TimeEventCallback::Rust(_) => {
-                    panic!("Python time event handler is not supported for Rust callback")
+                TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
+                    panic!("Python time event handler is not supported for Rust callbacks")
                 }
             },
         }
@@ -69,34 +68,36 @@ impl From<TimeEventHandlerV2> for TimeEventHandler_Py {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TimeEvent {
+    /// Creates a valid nanoseconds interval that is guaranteed to be positive.
+    ///
+    /// Coerces zero to one to ensure a valid `NonZeroU64`.
+    /// Represents a time event occurring at the event timestamp.
+    ///
+    /// A `TimeEvent` carries metadata such as the event's name, a unique event ID,
+    /// and timestamps indicating when the event was scheduled to occur and when it was initialized.
     #[new]
     fn py_new(name: &str, event_id: UUID4, ts_event: u64, ts_init: u64) -> Self {
         Self::new(Ustr::from(name), event_id, ts_event.into(), ts_init.into())
     }
 
     fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
+        let py_tuple: &Bound<'_, PyTuple> = state.cast::<PyTuple>()?;
 
-        let ts_event = py_tuple
-            .get_item(2)?
-            .downcast::<PyInt>()?
-            .extract::<u64>()?;
-        let ts_init: u64 = py_tuple
-            .get_item(3)?
-            .downcast::<PyInt>()?
-            .extract::<u64>()?;
+        let ts_event = py_tuple.get_item(2)?.cast::<PyInt>()?.extract::<u64>()?;
+        let ts_init: u64 = py_tuple.get_item(3)?.cast::<PyInt>()?.extract::<u64>()?;
 
         self.name = Ustr::from(
             py_tuple
                 .get_item(0)?
-                .downcast::<PyString>()?
+                .cast::<PyString>()?
                 .extract::<&str>()?,
         );
         self.event_id = UUID4::from_str(
             py_tuple
                 .get_item(1)?
-                .downcast::<PyString>()?
+                .cast::<PyString>()?
                 .extract::<&str>()?,
         )
         .map_err(to_pyvalue_err)?;
@@ -106,7 +107,7 @@ impl TimeEvent {
         Ok(())
     }
 
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
+    fn __getstate__(&self, py: Python) -> PyResult<Py<PyAny>> {
         (
             self.name.to_string(),
             self.event_id.to_string(),
@@ -116,7 +117,7 @@ impl TimeEvent {
             .into_py_any(py)
     }
 
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
         let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
         let state = self.__getstate__(py)?;
         (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
@@ -141,10 +142,6 @@ impl TimeEvent {
     }
 
     fn __repr__(&self) -> String {
-        format!("{}('{}')", stringify!(TimeEvent), self)
-    }
-
-    fn __str__(&self) -> String {
         self.to_string()
     }
 
@@ -175,43 +172,41 @@ impl TimeEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU64, sync::Arc};
+    use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
     use nautilus_core::{
         UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND, python::IntoPyObjectNautilusExt,
         time::get_atomic_clock_realtime,
     };
     use pyo3::prelude::*;
-    use tokio::time::Duration;
 
     use crate::{
+        live::timer::LiveTimer,
         runner::{TimeEventSender, set_time_event_sender},
         testing::wait_until,
-        timer::{LiveTimer, TimeEvent, TimeEventCallback},
+        timer::{TimeEvent, TimeEventCallback},
     };
 
     #[pyfunction]
-    const fn receive_event(_py: Python, _event: TimeEvent) -> PyResult<()> {
+    const fn receive_event(_py: Python, _event: TimeEvent) {
         // TODO: Assert the length of a handler vec
-        Ok(())
     }
 
     #[derive(Debug)]
     struct TestTimeEventSender;
 
     impl TimeEventSender for TestTimeEventSender {
-        fn send(&self, _handler: crate::timer::TimeEventHandlerV2) {
+        fn send(&self, _handler: crate::timer::TimeEventHandler) {
             // Test implementation - just ignore the events
         }
     }
 
     #[tokio::test]
     async fn test_live_timer_starts_and_stops() {
-        pyo3::prepare_freethreaded_python();
-
         set_time_event_sender(Arc::new(TestTimeEventSender));
 
-        let callback = Python::with_gil(|py| {
+        Python::initialize();
+        let callback = Python::attach(|py| {
             let callable = wrap_pyfunction!(receive_event, py).unwrap();
             let callable = callable.into_py_any_unwrap(py);
             TimeEventCallback::from(callable)
@@ -246,11 +241,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_live_timer_with_stop_time() {
-        pyo3::prepare_freethreaded_python();
-
         set_time_event_sender(Arc::new(TestTimeEventSender));
 
-        let callback = Python::with_gil(|py| {
+        Python::initialize();
+        let callback = Python::attach(|py| {
             let callable = wrap_pyfunction!(receive_event, py).unwrap();
             let callable = callable.into_py_any_unwrap(py);
             TimeEventCallback::from(callable)
@@ -285,11 +279,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_live_timer_with_zero_interval_and_immediate_stop_time() {
-        pyo3::prepare_freethreaded_python();
-
         set_time_event_sender(Arc::new(TestTimeEventSender));
 
-        let callback = Python::with_gil(|py| {
+        Python::initialize();
+        let callback = Python::attach(|py| {
             let callable = wrap_pyfunction!(receive_event, py).unwrap();
             let callable = callable.into_py_any_unwrap(py);
             TimeEventCallback::from(callable)

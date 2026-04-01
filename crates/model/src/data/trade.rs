@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -35,7 +35,11 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct TradeTick {
     /// The trade instrument ID.
@@ -164,9 +168,6 @@ impl HasTsInit for TradeTick {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use std::{
@@ -555,10 +556,10 @@ mod tests {
     fn test_from_pyobject(stub_trade_ethusdt_buyer: TradeTick) {
         use pyo3::{IntoPyObjectExt, Python};
 
-        pyo3::prepare_freethreaded_python();
         let trade = stub_trade_ethusdt_buyer;
 
-        Python::with_gil(|py| {
+        Python::initialize();
+        Python::attach(|py| {
             let tick_pyobject = trade.into_py_any(py).unwrap();
             let parsed_tick = TradeTick::from_pyobject(tick_pyobject.bind(py)).unwrap();
             assert_eq!(parsed_tick, trade);

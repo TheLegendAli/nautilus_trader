@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -15,11 +15,13 @@
 
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use arrow::record_batch::RecordBatch;
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     file::{
+        metadata::KeyValue,
         properties::WriterProperties,
         reader::{FileReader, SerializedFileReader},
         statistics::Statistics,
@@ -34,7 +36,7 @@ use parquet::{
 pub async fn write_batch_to_parquet(
     batch: RecordBatch,
     path: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
 ) -> anyhow::Result<()> {
@@ -56,7 +58,7 @@ pub async fn write_batch_to_parquet(
 pub async fn write_batches_to_parquet(
     batches: &[RecordBatch],
     path: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
 ) -> anyhow::Result<()> {
@@ -73,11 +75,45 @@ pub async fn write_batches_to_parquet(
         &object_path,
         compression,
         max_row_group_size,
+        None,
     )
     .await
 }
 
-/// Writes multiple `RecordBatch` items to an object store URI, with optional compression and row group sizing.
+/// Reads a Parquet file from an object store and returns all record batches plus
+/// the Arrow schema from the builder. The builder's schema includes metadata restored
+/// from the file's `ARROW:schema` key_value_metadata; use it for decoding instead of
+/// each batch's schema (which has metadata stripped).
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be read or Parquet parsing fails.
+pub async fn read_parquet_from_object_store(
+    object_store: Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+) -> anyhow::Result<(Vec<RecordBatch>, Arc<arrow::datatypes::Schema>)> {
+    let result: object_store::GetResult = object_store.get(path).await?;
+    let data = result.bytes().await?;
+    if data.is_empty() {
+        return Ok((
+            Vec::new(),
+            Arc::new(arrow::datatypes::Schema::new(
+                Vec::<arrow::datatypes::Field>::new(),
+            )),
+        ));
+    }
+    let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
+    let schema = builder.schema().clone();
+    let reader = builder.build()?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch?);
+    }
+    Ok((batches, schema))
+}
+
+/// Writes multiple `RecordBatch` items to an object store URI, with optional compression,
+/// row group sizing, and key_value_metadata (e.g. for instrument "class" so it survives roundtrip).
 ///
 /// # Errors
 ///
@@ -88,14 +124,19 @@ pub async fn write_batches_to_object_store(
     path: &ObjectPath,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
+    key_value_metadata: Option<Vec<KeyValue>>,
 ) -> anyhow::Result<()> {
     // Create a temporary buffer to write the parquet data
     let mut buffer = Vec::new();
 
-    let writer_props = WriterProperties::builder()
+    let mut props_builder = WriterProperties::builder()
         .set_compression(compression.unwrap_or(parquet::basic::Compression::SNAPPY))
-        .set_max_row_group_size(max_row_group_size.unwrap_or(5000))
-        .build();
+        .set_max_row_group_row_count(Some(max_row_group_size.unwrap_or(5000)));
+
+    if let Some(kv) = key_value_metadata {
+        props_builder = props_builder.set_key_value_metadata(Some(kv));
+    }
+    let writer_props = props_builder.build();
 
     let mut writer = ArrowWriter::try_new(&mut buffer, batches[0].schema(), Some(writer_props))?;
     for batch in batches {
@@ -109,6 +150,56 @@ pub async fn write_batches_to_object_store(
     Ok(())
 }
 
+/// Deduplicates a slice of `RecordBatch` items, removing rows that are identical across all columns.
+///
+/// Rows are compared by encoding each row to a canonical byte sequence using Arrow's row format.
+/// Only the first occurrence of each unique row is retained; the relative order of unique rows
+/// is preserved.
+///
+/// # Errors
+///
+/// Returns an error if the row converter cannot be constructed or if the `take` kernel fails.
+fn deduplicate_record_batches(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schema = batches[0].schema();
+
+    let fields: Vec<arrow_row::SortField> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow_row::SortField::new(f.data_type().clone()))
+        .collect();
+
+    let converter = arrow_row::RowConverter::new(fields)?;
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut result: Vec<RecordBatch> = Vec::new();
+
+    for batch in batches {
+        let rows = converter.convert_columns(batch.columns())?;
+        let mut indices: Vec<u32> = Vec::new();
+
+        for (i, row) in rows.iter().enumerate() {
+            if seen.insert(row.as_ref().to_vec()) {
+                indices.push(i as u32);
+            }
+        }
+
+        if !indices.is_empty() {
+            let index_array = arrow::array::UInt32Array::from(indices);
+            let deduped_columns: Vec<arrow::array::ArrayRef> = batch
+                .columns()
+                .iter()
+                .map(|col| arrow::compute::take(col.as_ref(), &index_array, None))
+                .collect::<Result<_, _>>()?;
+            result.push(RecordBatch::try_new(schema.clone(), deduped_columns)?);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Combines multiple Parquet files using object store with storage options
 ///
 /// # Errors
@@ -117,9 +208,10 @@ pub async fn write_batches_to_object_store(
 pub async fn combine_parquet_files(
     file_paths: Vec<&str>,
     new_file_path: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
+    deduplicate: Option<bool>,
 ) -> anyhow::Result<()> {
     if file_paths.len() <= 1 {
         return Ok(());
@@ -153,6 +245,7 @@ pub async fn combine_parquet_files(
         &new_object_path,
         compression,
         max_row_group_size,
+        deduplicate,
     )
     .await
 }
@@ -168,17 +261,30 @@ pub async fn combine_parquet_files_from_object_store(
     new_file_path: &ObjectPath,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
+    deduplicate: Option<bool>,
 ) -> anyhow::Result<()> {
     if file_paths.len() <= 1 {
         return Ok(());
     }
 
     let mut all_batches: Vec<RecordBatch> = Vec::new();
+    let mut schema_with_metadata: Option<Arc<arrow::datatypes::Schema>> = None;
 
     // Read all files from object store
     for path in &file_paths {
-        let data = object_store.get(path).await?.bytes().await?;
+        let result: object_store::GetResult = object_store.get(path).await?;
+        let data = result.bytes().await?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
+
+        // Capture the schema from the first file's builder; it includes the Arrow
+        // schema-level metadata (e.g. bar_type, instrument_id) restored from the
+        // Parquet ARROW:schema key_value_metadata entry.  Individual RecordBatch
+        // objects returned by the reader have this metadata stripped, so we need
+        // to preserve it separately and re-apply it when writing the combined file.
+        if schema_with_metadata.is_none() {
+            schema_with_metadata = Some(builder.schema().clone());
+        }
+
         let mut reader = builder.build()?;
 
         for batch in reader.by_ref() {
@@ -186,19 +292,42 @@ pub async fn combine_parquet_files_from_object_store(
         }
     }
 
+    // Re-apply the preserved schema metadata to all collected batches so that
+    // write_batches_to_object_store (which uses batches[0].schema()) can encode
+    // the correct Arrow schema metadata into the combined output file.
+    if let Some(schema) = &schema_with_metadata {
+        all_batches = all_batches
+            .into_iter()
+            .map(|b| {
+                RecordBatch::try_new(schema.clone(), b.columns().to_vec())
+                    .expect("schema re-application failed")
+            })
+            .collect();
+    }
+
+    // Deduplicate rows if requested
+    let batches_to_write = if deduplicate.unwrap_or(false) {
+        deduplicate_record_batches(&all_batches)?
+    } else {
+        all_batches
+    };
+
     // Write combined batches to new location
     write_batches_to_object_store(
-        &all_batches,
+        &batches_to_write,
         object_store.clone(),
         new_file_path,
         compression,
         max_row_group_size,
+        None,
     )
     .await?;
 
     // Remove the merged files
     for path in &file_paths {
-        object_store.delete(path).await?;
+        if path != new_file_path {
+            object_store.delete(path).await?;
+        }
     }
 
     Ok(())
@@ -209,13 +338,9 @@ pub async fn combine_parquet_files_from_object_store(
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, metadata parsing fails, or the column is missing or has no statistics.
-///
-/// # Panics
-///
-/// Panics if the Parquet metadata's min/max unwrap operations fail unexpectedly.
 pub async fn min_max_from_parquet_metadata(
     file_path: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
     column_name: &str,
 ) -> anyhow::Result<(u64, u64)> {
     let (object_store, base_path, _) = create_object_store_from_path(file_path, storage_options)?;
@@ -233,17 +358,14 @@ pub async fn min_max_from_parquet_metadata(
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, metadata parsing fails, or the column is missing or has no statistics.
-///
-/// # Panics
-///
-/// Panics if the Parquet metadata's min/max unwrap operations fail unexpectedly.
 pub async fn min_max_from_parquet_metadata_object_store(
     object_store: Arc<dyn ObjectStore>,
     file_path: &ObjectPath,
     column_name: &str,
 ) -> anyhow::Result<(u64, u64)> {
     // Download the parquet file from object store
-    let data = object_store.get(file_path).await?.bytes().await?;
+    let result: object_store::GetResult = object_store.get(file_path).await?;
+    let data = result.bytes().await?;
     let reader = SerializedFileReader::new(data)?;
 
     let metadata = reader.metadata();
@@ -304,7 +426,7 @@ pub async fn min_max_from_parquet_metadata_object_store(
 /// Supports multiple cloud storage providers:
 /// - AWS S3: `s3://bucket/path`
 /// - Google Cloud Storage: `gs://bucket/path` or `gcs://bucket/path`
-/// - Azure Blob Storage: `azure://account/container/path` or `abfs://container@account.dfs.core.windows.net/path`
+/// - Azure Blob Storage: `az://account/container/path` or `abfs://container@account.dfs.core.windows.net/path`
 /// - HTTP/WebDAV: `http://` or `https://`
 /// - Local files: `file://path` or plain paths
 ///
@@ -317,21 +439,38 @@ pub async fn min_max_from_parquet_metadata_object_store(
 ///   - For Azure: `account_name`, `account_key`, `sas_token`, etc.
 ///
 /// Returns a tuple of (`ObjectStore`, `base_path`, `normalized_uri`)
+#[allow(unused_variables, clippy::needless_pass_by_value)]
 pub fn create_object_store_from_path(
     path: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let uri = normalize_path_to_uri(path);
 
     match uri.as_str() {
+        #[cfg(feature = "cloud")]
         s if s.starts_with("s3://") => create_s3_store(&uri, storage_options),
+        #[cfg(feature = "cloud")]
         s if s.starts_with("gs://") || s.starts_with("gcs://") => {
             create_gcs_store(&uri, storage_options)
         }
-        s if s.starts_with("azure://") => create_azure_store(&uri, storage_options),
+        #[cfg(feature = "cloud")]
+        s if s.starts_with("az://") => create_azure_store(&uri, storage_options),
+        #[cfg(feature = "cloud")]
         s if s.starts_with("abfs://") => create_abfs_store(&uri, storage_options),
+        #[cfg(feature = "cloud")]
         s if s.starts_with("http://") || s.starts_with("https://") => {
             create_http_store(&uri, storage_options)
+        }
+        #[cfg(not(feature = "cloud"))]
+        s if s.starts_with("s3://")
+            || s.starts_with("gs://")
+            || s.starts_with("gcs://")
+            || s.starts_with("az://")
+            || s.starts_with("abfs://")
+            || s.starts_with("http://")
+            || s.starts_with("https://") =>
+        {
+            anyhow::bail!("Cloud storage support requires the 'cloud' feature: {uri}")
         }
         s if s.starts_with("file://") => create_local_store(&uri, true),
         _ => create_local_store(&uri, false), // Fallback: assume local path
@@ -346,7 +485,7 @@ pub fn create_object_store_from_path(
 /// Supported URI schemes:
 /// - `s3://` for AWS S3
 /// - `gs://` or `gcs://` for Google Cloud Storage
-/// - `azure://` or `abfs://` for Azure Blob Storage
+/// - `az://` or `abfs://` for Azure Blob Storage
 /// - `http://` or `https://` for HTTP/WebDAV
 /// - `file://` for local files
 ///
@@ -419,25 +558,45 @@ fn path_to_file_uri(path: &str) -> String {
     }
 }
 
+/// Converts a file:// URI to a native path for the current platform.
+/// On Windows, "file:///C:/x/y" becomes "C:\x\y" so LocalFileSystem and std::fs work correctly.
+#[cfg(windows)]
+pub(crate) fn file_uri_to_native_path(uri: &str) -> String {
+    let without_scheme = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("file:"))
+        .unwrap_or(uri);
+    // Strip leading slash so "/C:/x/y" -> "C:/x/y", then use native separators
+    let without_leading = without_scheme.trim_start_matches('/');
+    without_leading.replace('/', "\\")
+}
+
+/// Converts a file:// URI to a path string for Unix (no-op; object_store accepts slash paths).
+#[cfg(not(windows))]
+pub(crate) fn file_uri_to_native_path(uri: &str) -> String {
+    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+}
+
 /// Helper function to create local file system object store
 fn create_local_store(
     uri: &str,
     is_file_uri: bool,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let path = if is_file_uri {
-        uri.strip_prefix("file://").unwrap_or(uri)
+        file_uri_to_native_path(uri)
     } else {
-        uri
+        uri.to_string()
     };
 
-    let local_store = object_store::local::LocalFileSystem::new_with_prefix(path)?;
+    let local_store = object_store::local::LocalFileSystem::new_with_prefix(&path)?;
     Ok((Arc::new(local_store), String::new(), uri.to_string()))
 }
 
-/// Helper function to create S3 object store with options
+/// Helper function to create S3 object store with options.
+#[cfg(feature = "cloud")]
 fn create_s3_store(
     uri: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let (url, path) = parse_url_and_path(uri)?;
     let bucket = extract_host(&url, "Invalid S3 URI: missing bucket")?;
@@ -479,10 +638,11 @@ fn create_s3_store(
     Ok((Arc::new(s3_store), path, uri.to_string()))
 }
 
-/// Helper function to create GCS object store with options
+/// Helper function to create GCS object store with options.
+#[cfg(feature = "cloud")]
 fn create_gcs_store(
     uri: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let (url, path) = parse_url_and_path(uri)?;
     let bucket = extract_host(&url, "Invalid GCS URI: missing bucket")?;
@@ -527,29 +687,19 @@ fn create_gcs_store(
     Ok((Arc::new(gcs_store), path, uri.to_string()))
 }
 
-/// Helper function to create Azure object store with options
+/// Helper function to create Azure object store with options.
+#[cfg(feature = "cloud")]
 fn create_azure_store(
     uri: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let (url, _) = parse_url_and_path(uri)?;
-    let account = extract_host(&url, "Invalid Azure URI: missing account")?;
+    let container = extract_host(&url, "Invalid Azure URI: missing container")?;
 
-    let path_segments: Vec<&str> = url.path().trim_start_matches('/').split('/').collect();
-    if path_segments.is_empty() || path_segments[0].is_empty() {
-        anyhow::bail!("Invalid Azure URI: missing container");
-    }
+    let path = url.path().trim_start_matches('/').to_string();
 
-    let container = path_segments[0];
-    let path = if path_segments.len() > 1 {
-        path_segments[1..].join("/")
-    } else {
-        String::new()
-    };
-
-    let mut builder = object_store::azure::MicrosoftAzureBuilder::new()
-        .with_account(&account)
-        .with_container_name(container);
+    let mut builder =
+        object_store::azure::MicrosoftAzureBuilder::new().with_container_name(container);
 
     // Apply storage options if provided
     if let Some(options) = storage_options {
@@ -597,9 +747,10 @@ fn create_azure_store(
 }
 
 /// Helper function to create Azure object store from abfs:// URI with options.
+#[cfg(feature = "cloud")]
 fn create_abfs_store(
     uri: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let (url, path) = parse_url_and_path(uri)?;
     let host = extract_host(&url, "Invalid ABFS URI: missing host")?;
@@ -667,9 +818,10 @@ fn create_abfs_store(
 }
 
 /// Helper function to create HTTP object store with options.
+#[cfg(feature = "cloud")]
 fn create_http_store(
     uri: &str,
-    storage_options: Option<std::collections::HashMap<String, String>>,
+    storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let (url, path) = parse_url_and_path(uri)?;
     let base_url = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
@@ -691,6 +843,7 @@ fn create_http_store(
 }
 
 /// Helper function to parse URL and extract path component.
+#[cfg(feature = "cloud")]
 fn parse_url_and_path(uri: &str) -> anyhow::Result<(url::Url, String)> {
     let url = url::Url::parse(uri)?;
     let path = url.path().trim_start_matches('/').to_string();
@@ -698,23 +851,22 @@ fn parse_url_and_path(uri: &str) -> anyhow::Result<(url::Url, String)> {
 }
 
 /// Helper function to extract host from URL with error handling.
+#[cfg(feature = "cloud")]
 fn extract_host(url: &url::Url, error_msg: &str) -> anyhow::Result<String> {
     url.host_str()
         .map(ToString::to_string)
-        .ok_or_else(|| anyhow::anyhow!("{}", error_msg))
+        .ok_or_else(|| anyhow::anyhow!("{error_msg}"))
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    #[cfg(feature = "cloud")]
+    use ahash::AHashMap;
+    use rstest::rstest;
 
     use super::*;
 
-    #[test]
+    #[rstest]
     fn test_create_object_store_from_path_local() {
         // Create a temporary directory for testing
         let temp_dir = std::env::temp_dir().join("nautilus_test");
@@ -734,9 +886,10 @@ mod tests {
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
-    #[test]
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_create_object_store_from_path_s3() {
-        let mut options = HashMap::new();
+        let mut options = AHashMap::new();
         options.insert(
             "endpoint_url".to_string(),
             "https://test.endpoint.com".to_string(),
@@ -752,28 +905,29 @@ mod tests {
         assert_eq!(uri, "s3://test-bucket/path");
     }
 
-    #[test]
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_create_object_store_from_path_azure() {
-        let mut options = HashMap::new();
+        let mut options = AHashMap::new();
         options.insert("account_name".to_string(), "testaccount".to_string());
         // Use a valid base64 encoded key for testing
         options.insert("account_key".to_string(), "dGVzdGtleQ==".to_string()); // "testkey" in base64
 
-        let result =
-            create_object_store_from_path("azure://testaccount/container/path", Some(options));
+        let result = create_object_store_from_path("az://container/path", Some(options));
         if let Err(e) = &result {
             println!("Azure Error: {e:?}");
         }
         assert!(result.is_ok());
         let (_, base_path, uri) = result.unwrap();
         assert_eq!(base_path, "path");
-        assert_eq!(uri, "azure://testaccount/container/path");
+        assert_eq!(uri, "az://container/path");
     }
 
-    #[test]
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_create_object_store_from_path_gcs() {
         // Test GCS without service account (will use default credentials or fail gracefully)
-        let mut options = HashMap::new();
+        let mut options = AHashMap::new();
         options.insert("project_id".to_string(), "test-project".to_string());
 
         let result = create_object_store_from_path("gs://test-bucket/path", Some(options));
@@ -792,7 +946,8 @@ mod tests {
         }
     }
 
-    #[test]
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_create_object_store_from_path_empty_options() {
         let result = create_object_store_from_path("s3://test-bucket/path", None);
         assert!(result.is_ok());
@@ -801,7 +956,8 @@ mod tests {
         assert_eq!(uri, "s3://test-bucket/path");
     }
 
-    #[test]
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_parse_url_and_path() {
         let result = parse_url_and_path("s3://bucket/path/to/file");
         assert!(result.is_ok());
@@ -811,7 +967,8 @@ mod tests {
         assert_eq!(path, "path/to/file");
     }
 
-    #[test]
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_extract_host() {
         let url = url::Url::parse("s3://test-bucket/path").unwrap();
         let result = extract_host(&url, "Test error");
@@ -819,7 +976,7 @@ mod tests {
         assert_eq!(result.unwrap(), "test-bucket");
     }
 
-    #[test]
+    #[rstest]
     fn test_normalize_path_to_uri() {
         // Unix absolute paths
         assert_eq!(normalize_path_to_uri("/tmp/test"), "file:///tmp/test");
@@ -856,7 +1013,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[rstest]
     fn test_is_absolute_path() {
         // Unix absolute paths
         assert!(is_absolute_path("/tmp/test"));
@@ -885,7 +1042,7 @@ mod tests {
         assert!(!is_absolute_path("\\"));
     }
 
-    #[test]
+    #[rstest]
     fn test_path_to_file_uri() {
         // Unix absolute paths
         assert_eq!(path_to_file_uri("/tmp/test"), "file:///tmp/test");

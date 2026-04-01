@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -27,7 +27,7 @@ from nautilus_trader.persistence.funcs import filename_to_class
     ("s", "expected"),
     [
         (TradeTick, "trade_tick"),
-        (OrderBookDelta, "order_book_delta"),
+        (OrderBookDelta, "order_book_deltas"),
         (pd.DataFrame, "custom_data_frame"),
     ],
 )
@@ -39,7 +39,7 @@ def test_class_to_filename(s, expected):
     ("filename", "expected"),
     [
         ("trade_tick", TradeTick),
-        ("order_book_delta", OrderBookDelta),
+        ("order_book_deltas", OrderBookDelta),
         ("quote_tick", QuoteTick),
         ("nonexistent_filename", None),
     ],

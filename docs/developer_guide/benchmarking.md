@@ -7,14 +7,18 @@ use each tool and the conventions you should follow when adding new benches.
 
 ## Tooling overview
 
-Nautilus Trader relies on **two complementary benchmarking frameworks**:
+NautilusTrader relies on **two complementary benchmarking frameworks**:
 
 | Framework | What is it? | What it measures | When to prefer it |
 |-----------|-------------|------------------|-------------------|
-| [**Criterion**](https://docs.rs/criterion/latest/criterion/) | Statistical benchmark harness that produces detailed HTML reports and performs outlier detection. | Wall-clock run time with confidence intervals. | End-to-end scenarios, anything slower than ≈100 ns, visual comparisons. |
-| [**iai**](https://docs.rs/iai/latest/iai/) | Deterministic micro-benchmark harness that counts retired CPU instructions via hardware counters. | Exact instruction counts (noise-free). | Ultra-fast functions, CI gating via instruction diff. |
+| [**Criterion**](https://docs.rs/criterion/latest/criterion/) | Statistical benchmark harness that produces detailed HTML reports and performs outlier detection. | Wall‑clock run time with confidence intervals. | End‑to‑end scenarios, anything slower than ≈100 ns, visual comparisons. |
+| [**iai**](https://docs.rs/iai/latest/iai/) | Deterministic micro‑benchmark harness that counts retired CPU instructions via hardware counters. | Exact instruction counts (noise‑free). | Ultra‑fast functions, CI gating via instruction diff. |
 
 Most hot code paths benefit from **both** kinds of measurements.
+
+:::note
+iai is deterministic (immune to system noise) but results are machine-specific. Use it for regression detection within CI, not for cross-machine comparisons.
+:::
 
 ---
 
@@ -34,9 +38,14 @@ them:
 
 ```toml
 [[bench]]
-name = "foo_criterion"             # file stem in benches/
+name = "foo_criterion"
 path = "benches/foo_criterion.rs"
-harness = false                    # disable the default libtest harness
+harness = false
+
+[[bench]]
+name = "foo_iai"
+path = "benches/foo_iai.rs"
+harness = false
 ```
 
 ---
@@ -55,7 +64,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_my_algo(c: &mut Criterion) {
-    let data = prepare_data(); // heavy set-up done once
+    let data = prepare_data(); // Heavy set-up done once
 
     c.bench_function("my_algo", |b| {
         b.iter(|| my_algo(black_box(&data)));
@@ -100,37 +109,55 @@ Criterion writes HTML reports to `target/criterion/`; open `target/criterion/rep
 
 ### Generating a flamegraph
 
-`cargo-flamegraph` (a thin wrapper around Linux `perf`) lets you see a sampled
-call-stack profile of a single benchmark.
+`cargo-flamegraph` lets you see a sampled call-stack profile of a single
+benchmark. On Linux it uses `perf`, and on macOS it uses `DTrace`.
 
-1. Install once per machine (the crate is called `flamegraph`; it installs a
-   `cargo flamegraph` subcommand automatically). Linux requires `perf` to be
-   available (`sudo apt install linux-tools-common linux-tools-$(uname -r)` on
-   Debian/Ubuntu):
+1. Install `cargo-flamegraph` once per machine (it installs a `cargo flamegraph`
+   subcommand automatically).
 
    ```bash
    cargo install flamegraph
    ```
 
-2. Run a specific bench with the symbol-rich `bench` profile:
+2. Run a specific bench with the symbol-rich `bench` profile.
 
    ```bash
    # example: the matching benchmark in nautilus-common
    cargo flamegraph --bench matching -p nautilus-common --profile bench
    ```
 
-3. Open the generated `flamegraph.svg` (or `.png`) in your browser and zoom
-   into hot paths.
+3. Open the generated `flamegraph.svg` in your browser and zoom into hot paths.
 
-   If you see an error mentioning `perf_event_paranoid` you need to relax the
-   kernel’s perf restrictions for the current session (root required):
+#### Linux
 
-   ```bash
-   sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'
-   ```
+On Linux, `perf` must be available. On Debian/Ubuntu, you can install it with:
 
-   A value of `1` is typically enough; set it back to `2` (default) or make
-   the change permanent via `/etc/sysctl.conf` if desired.
+```bash
+sudo apt install linux-tools-common linux-tools-$(uname -r)
+```
+
+If you see an error mentioning `perf_event_paranoid` you need to relax the
+kernel’s perf restrictions for the current session (root required):
+
+```bash
+sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'
+```
+
+A value of `1` is typically enough; set it back to `2` (default) or make
+the change permanent via `/etc/sysctl.conf` if desired.
+
+#### macOS
+
+On macOS, `DTrace` requires root permissions, so you must run `cargo flamegraph`
+with `sudo`.
+
+:::warning
+Running with `sudo` creates files in `target/` owned by root, causing permission errors with subsequent `cargo` commands. You may need to remove root-owned files manually or run `sudo cargo clean`.
+:::
+
+```bash
+sudo cargo flamegraph --bench matching -p nautilus-common --profile bench
+```
 
 Because `[profile.bench]` keeps full debug symbols the SVG will show readable
 function names without bloating production binaries (which still use
@@ -145,9 +172,9 @@ function names without bloating production binaries (which still use
 
 ## Templates
 
-Ready-to-copy starter files live in `docs/dev_templates/`.
+Ready-to-copy starter files live in [`docs/dev_templates/`](../dev_templates/):
 
-- **Criterion**: `criterion_template.rs`
-- **iai**: `iai_template.rs`
+- **Criterion**: [`criterion_template.rs`](../dev_templates/criterion_template.rs)
+- **iai**: [`iai_template.rs`](../dev_templates/iai_template.rs)
 
 Copy the template into `benches/`, adjust imports and names, and start measuring!

@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,6 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_VENUE
+from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProviderConfig
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 from nautilus_trader.config import PositiveFloat
@@ -27,21 +28,26 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
 
     Parameters
     ----------
+    instrument_config : PolymarketInstrumentProviderConfig, optional
+        The Polymarket instrument provider config.
     venue : Venue, default POLYMARKET_VENUE
         The venue for the client.
     private_key : str, optional
         The private key for the wallet on the **Polygon** network.
         If ``None`` then will source the `POLYMARKET_PK` environment variable.
     signature_type : int, default 0 (EOA)
-        The Polymarket signature type.
+        The Polymarket signature type:
+        - 0: EOA (Externally Owned Account)
+        - 1: Email/Magic Wallet Proxy
+        - 2: Browser Wallet Proxy
     funder : str, optional
         The wallet address (public key) on the **Polygon** network used for funding USDC.
         If ``None`` then will source the `POLYMARKET_FUNDER` environment variable.
     api_key : str, optional
-        The Polymarket API public key.
+        The Polymarket API key.
         If ``None`` then will source the `POLYMARKET_API_KEY` environment variable.
     api_secret : str, optional
-        The Polymarket API public key.
+        The Polymarket API secret.
         If ``None`` then will source the `POLYMARKET_API_SECRET` environment variable.
     passphrase : str, optional
         The Polymarket API passphrase.
@@ -54,14 +60,20 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
         The delay (seconds) prior to the first websocket connection to allow initial subscriptions to arrive.
     ws_connection_delay_secs : PositiveFloat, default 0.1
         The delay (seconds) prior to making a new websocket connection to allow non-initial subscriptions to arrive.
+    ws_max_subscriptions_per_connection : PositiveInt, default 200
+        The maximum number of subscriptions per WebSocket connection (Polymarket limit is 500).
     update_instruments_interval_mins: PositiveInt or None, default 60
         The interval (minutes) between updating Polymarket instruments.
     compute_effective_deltas : bool, default False
         If True, computes effective deltas by comparing old and new order book states,
         reducing snapshot size. This takes ~1 millisecond, so is not recommended for latency-sensitive strategies.
+    drop_quotes_missing_side : bool, default True
+        If True, drops QuoteTick messages when bid or ask prices are missing (can occur near market resolution).
+        If False, uses boundary prices (0.001/0.999) with zero volume for missing sides.
 
     """
 
+    instrument_config: PolymarketInstrumentProviderConfig | None = None
     venue: Venue = POLYMARKET_VENUE
     private_key: str | None = None
     signature_type: int = 0
@@ -73,8 +85,10 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
     base_url_ws: str | None = None
     ws_connection_initial_delay_secs: PositiveFloat = 5
     ws_connection_delay_secs: PositiveFloat = 0.1
+    ws_max_subscriptions_per_connection: PositiveInt = 200
     update_instruments_interval_mins: PositiveInt | None = 60
     compute_effective_deltas: bool = False
+    drop_quotes_missing_side: bool = True
 
 
 class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
@@ -83,22 +97,27 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
 
     Parameters
     ----------
+    instrument_config : PolymarketInstrumentProviderConfig, optional
+        The Polymarket instrument provider config.
     venue : Venue, default POLYMARKET_VENUE
         The venue for the client.
     private_key : str, optional
         The private key for the wallet on the **Polygon** network.
         If ``None`` then will source the `POLYMARKET_PK` environment variable.
     signature_type : int, default 0 (EOA)
-        The Polymarket signature type.
+        The Polymarket signature type:
+        - 0: EOA (Externally Owned Account)
+        - 1: Email/Magic Wallet Proxy
+        - 2: Browser Wallet Proxy
     funder : str, optional
         The wallet address (public key) on the **Polygon** network used for funding USDC.
         If ``None`` then will source the `POLYMARKET_FUNDER` environment variable.
     api_key : str, optional
-        The Polymarket API public key.
+        The Polymarket API key.
         If ``None`` then will source the `POLYMARKET_API_KEY` environment variable.
     api_secret : str, optional
-        The Polymarket API public key.
-        If ``None`` then will source the `POLYMARKET_API_SECRET` environment variables.
+        The Polymarket API secret.
+        If ``None`` then will source the `POLYMARKET_API_SECRET` environment variable.
     passphrase : str, optional
         The Polymarket API passphrase.
         If ``None`` then will source the `POLYMARKET_PASSPHRASE` environment variable.
@@ -106,6 +125,10 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
         The HTTP client custom endpoint override.
     base_url_ws : str, optional
         The WebSocket client custom endpoint override.
+    base_url_data_api : str, optional
+        The Data API custom endpoint override (default https://data-api.polymarket.com).
+    ws_max_subscriptions_per_connection : PositiveInt, default 200
+        The maximum number of subscriptions per WebSocket connection (Polymarket limit is 500).
     max_retries : PositiveInt, optional
         The maximum number of times a submit or cancel order request will be retried.
     retry_delay_initial_ms : PositiveInt, optional
@@ -119,9 +142,12 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
     log_raw_ws_messages : bool, default False
         If raw websocket messages should be logged with INFO level.
         Note: there will be a performance penalty parsing the JSON without an efficient msgspec decoder.
+    ack_timeout_secs : PositiveFloat, default 5.0
+        The timeout (seconds) to wait for order/trade acknowledgment from cache.
 
     """
 
+    instrument_config: PolymarketInstrumentProviderConfig | None = None
     venue: Venue = POLYMARKET_VENUE
     private_key: str | None = None
     signature_type: int = 0
@@ -131,8 +157,11 @@ class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
     passphrase: str | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
+    base_url_data_api: str | None = None
+    ws_max_subscriptions_per_connection: PositiveInt = 200
     max_retries: PositiveInt | None = None
     retry_delay_initial_ms: PositiveInt | None = None
     retry_delay_max_ms: PositiveInt | None = None
     generate_order_history_from_trades: bool = False
     log_raw_ws_messages: bool = False
+    ack_timeout_secs: PositiveFloat = 5.0

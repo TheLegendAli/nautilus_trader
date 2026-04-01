@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -180,9 +180,9 @@ cdef class Cfd(Instrument):
             margin_maint=margin_maint or Decimal(0),
             maker_fee=maker_fee or Decimal(0),
             taker_fee=taker_fee or Decimal(0),
-            tick_scheme_name=tick_scheme_name,
             ts_event=ts_event,
             ts_init=ts_init,
+            tick_scheme_name=tick_scheme_name,
             info=info,
         )
 
@@ -222,6 +222,7 @@ cdef class Cfd(Instrument):
             taker_fee=Decimal(values.get("taker_fee", 0)),
             ts_event=values["ts_event"],
             ts_init=values["ts_init"],
+            tick_scheme_name=values.get("tick_scheme_name"),
             info=values["info"],
         )
 
@@ -252,6 +253,7 @@ cdef class Cfd(Instrument):
             "taker_fee": str(obj.taker_fee),
             "ts_event": obj.ts_event,
             "ts_init": obj.ts_init,
+            "tick_scheme_name": obj.tick_scheme_name,
             "info": obj.info,
         }
 
@@ -296,7 +298,7 @@ cdef class Cfd(Instrument):
             price_increment=Price.from_raw_c(pyo3_instrument.price_increment.raw, pyo3_instrument.price_precision),
             size_increment=Quantity.from_raw_c(pyo3_instrument.size_increment.raw, pyo3_instrument.size_precision),
             base_currency=Currency.from_str_c(pyo3_instrument.base_currency.code) if pyo3_instrument.base_currency is not None else None,
-            lot_size=Quantity.from_str_c(pyo3_instrument.lot_size) if pyo3_instrument.lot_size is not None else None,
+            lot_size=Quantity.from_raw_c(pyo3_instrument.lot_size.raw, pyo3_instrument.lot_size.precision) if pyo3_instrument.lot_size is not None else None,
             max_quantity=Quantity.from_raw_c(pyo3_instrument.max_quantity.raw, pyo3_instrument.max_quantity.precision) if pyo3_instrument.max_quantity is not None else None,
             min_quantity=Quantity.from_raw_c(pyo3_instrument.min_quantity.raw, pyo3_instrument.min_quantity.precision) if pyo3_instrument.min_quantity is not None else None,
             max_notional=Money.from_str_c(str(pyo3_instrument.max_notional)) if pyo3_instrument.max_notional is not None else None,

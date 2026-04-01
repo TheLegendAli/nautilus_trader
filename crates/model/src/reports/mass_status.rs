@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -12,6 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
+
+use std::fmt::Display;
 
 use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
@@ -28,7 +30,11 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct ExecutionMassStatus {
     /// The client ID for the report.
@@ -117,7 +123,7 @@ impl ExecutionMassStatus {
     }
 }
 
-impl std::fmt::Display for ExecutionMassStatus {
+impl Display for ExecutionMassStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -134,9 +140,6 @@ impl std::fmt::Display for ExecutionMassStatus {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use nautilus_core::UnixNanos;
@@ -144,7 +147,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
+        enums::{
+            LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, TimeInForce,
+        },
         identifiers::{
             AccountId, ClientId, InstrumentId, PositionId, TradeId, Venue, VenueOrderId,
         },
@@ -204,12 +209,13 @@ mod tests {
         PositionStatusReport::new(
             AccountId::from("IB-DU123456"),
             InstrumentId::from("AAPL.NASDAQ"),
-            PositionSide::Long,
+            PositionSideSpecified::Long,
             Quantity::from("50"),
-            Some(PositionId::from("P-001")),
             UnixNanos::from(2_000_000_000),
             UnixNanos::from(3_000_000_000),
-            None,
+            None,                            // report_id
+            Some(PositionId::from("P-001")), // venue_position_id
+            None,                            // avg_px_open
         )
     }
 
@@ -317,21 +323,23 @@ mod tests {
         let position_report2 = PositionStatusReport::new(
             AccountId::from("IB-DU123456"),
             InstrumentId::from("AAPL.NASDAQ"), // Same instrument ID
-            PositionSide::Short,
+            PositionSideSpecified::Short,
             Quantity::from("25"),
-            None,
             UnixNanos::from(2_100_000_000),
             UnixNanos::from(3_100_000_000),
+            None,
+            None,
             None,
         );
         let position_report3 = PositionStatusReport::new(
             AccountId::from("IB-DU123456"),
             InstrumentId::from("MSFT.NASDAQ"), // Different instrument
-            PositionSide::Long,
+            PositionSideSpecified::Long,
             Quantity::from("100"),
-            None,
             UnixNanos::from(2_200_000_000),
             UnixNanos::from(3_200_000_000),
+            None,
+            None,
             None,
         );
 

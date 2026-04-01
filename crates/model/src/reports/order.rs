@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::fmt::Display;
+use std::{fmt::Display, str::FromStr};
 
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
@@ -25,6 +25,7 @@ use crate::{
         TriggerType,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, VenueOrderId},
+    orders::Order,
     types::{Price, Quantity},
 };
 
@@ -33,7 +34,11 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OrderStatusReport {
     /// The account ID associated with the position.
@@ -68,6 +73,10 @@ pub struct OrderStatusReport {
     pub order_list_id: Option<OrderListId>,
     /// The position ID associated with the order (assigned by the venue).
     pub venue_position_id: Option<PositionId>,
+    /// The reported linked client order IDs related to contingency orders.
+    pub linked_order_ids: Option<Vec<ClientOrderId>>,
+    /// The parent order ID for contingent child orders, if available.
+    pub parent_order_id: Option<ClientOrderId>,
     /// The orders contingency type.
     pub contingency_type: ContingencyType,
     /// The order expiration (UNIX epoch nanoseconds), zero for no expiration.
@@ -85,7 +94,7 @@ pub struct OrderStatusReport {
     /// The trailing offset type.
     pub trailing_offset_type: TrailingOffsetType,
     /// The order average fill price.
-    pub avg_px: Option<f64>,
+    pub avg_px: Option<Decimal>,
     /// The quantity of the `LIMIT` order to display on the public book (iceberg).
     pub display_qty: Option<Quantity>,
     /// If the order will only provide liquidity (make a market).
@@ -135,6 +144,8 @@ impl OrderStatusReport {
             ts_init,
             order_list_id: None,
             venue_position_id: None,
+            linked_order_ids: None,
+            parent_order_id: None,
             contingency_type: ContingencyType::default(),
             expire_time: None,
             price: None,
@@ -166,6 +177,23 @@ impl OrderStatusReport {
         self
     }
 
+    /// Sets the linked client order IDs.
+    #[must_use]
+    pub fn with_linked_order_ids(
+        mut self,
+        linked_order_ids: impl IntoIterator<Item = ClientOrderId>,
+    ) -> Self {
+        self.linked_order_ids = Some(linked_order_ids.into_iter().collect());
+        self
+    }
+
+    /// Sets the parent order ID.
+    #[must_use]
+    pub const fn with_parent_order_id(mut self, parent_order_id: ClientOrderId) -> Self {
+        self.parent_order_id = Some(parent_order_id);
+        self
+    }
+
     /// Sets the venue position ID.
     #[must_use]
     pub const fn with_venue_position_id(mut self, venue_position_id: PositionId) -> Self {
@@ -181,10 +209,25 @@ impl OrderStatusReport {
     }
 
     /// Sets the average price.
-    #[must_use]
-    pub const fn with_avg_px(mut self, avg_px: f64) -> Self {
-        self.avg_px = Some(avg_px);
-        self
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `avg_px` cannot be converted to a valid `Decimal`.
+    pub fn with_avg_px(mut self, avg_px: f64) -> anyhow::Result<Self> {
+        if !avg_px.is_finite() {
+            anyhow::bail!(
+                "avg_px must be finite, was: {} (is_nan: {}, is_infinite: {})",
+                avg_px,
+                avg_px.is_nan(),
+                avg_px.is_infinite()
+            );
+        }
+
+        self.avg_px =
+            Some(Decimal::from_str(&avg_px.to_string()).map_err(|e| {
+                anyhow::anyhow!("Failed to convert avg_px to Decimal: {avg_px} ({e})")
+            })?);
+        Ok(self)
     }
 
     /// Sets the trigger price.
@@ -273,6 +316,32 @@ impl OrderStatusReport {
         self.contingency_type = contingency_type;
         self
     }
+
+    /// Returns whether the order has been updated based on this report.
+    ///
+    /// An order is considered updated if any of the following differ:
+    /// - Price (if both the order and report have a price).
+    /// - Trigger price (if both the order and report have a trigger price).
+    /// - Quantity.
+    #[must_use]
+    pub fn is_order_updated(&self, order: &impl Order) -> bool {
+        if order.has_price()
+            && let Some(report_price) = self.price
+            && let Some(order_price) = order.price()
+            && order_price != report_price
+        {
+            return true;
+        }
+
+        if let Some(order_trigger_price) = order.trigger_price()
+            && let Some(report_trigger_price) = self.trigger_price
+            && order_trigger_price != report_trigger_price
+        {
+            return true;
+        }
+
+        order.quantity() != self.quantity
+    }
 }
 
 impl Display for OrderStatusReport {
@@ -296,6 +365,8 @@ impl Display for OrderStatusReport {
                 client_order_id={:?}, \
                 order_list_id={:?}, \
                 venue_position_id={:?}, \
+                linked_order_ids={:?}, \
+                parent_order_id={:?}, \
                 contingency_type={}, \
                 expire_time={:?}, \
                 price={:?}, \
@@ -327,6 +398,8 @@ impl Display for OrderStatusReport {
             self.client_order_id,
             self.order_list_id,
             self.venue_position_id,
+            self.linked_order_ids,
+            self.parent_order_id,
             self.contingency_type,
             self.expire_time,
             self.price,
@@ -345,14 +418,11 @@ impl Display for OrderStatusReport {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use nautilus_core::UnixNanos;
     use rstest::*;
-    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
@@ -363,6 +433,7 @@ mod tests {
         identifiers::{
             AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, VenueOrderId,
         },
+        orders::builder::OrderTestBuilder,
         types::{Price, Quantity},
     };
 
@@ -409,6 +480,8 @@ mod tests {
         // Test default values
         assert_eq!(report.order_list_id, None);
         assert_eq!(report.venue_position_id, None);
+        assert_eq!(report.linked_order_ids, None);
+        assert_eq!(report.parent_order_id, None);
         assert_eq!(report.contingency_type, ContingencyType::default());
         assert_eq!(report.expire_time, None);
         assert_eq!(report.price, None);
@@ -452,17 +525,19 @@ mod tests {
     }
 
     #[rstest]
-    fn test_order_status_report_builder_methods() {
+    #[allow(clippy::panic_in_result_fn)]
+    fn test_order_status_report_builder_methods() -> anyhow::Result<()> {
         let report = test_order_status_report()
             .with_client_order_id(ClientOrderId::from("O-19700101-000000-001-001-2"))
             .with_order_list_id(OrderListId::from("OL-001"))
             .with_venue_position_id(PositionId::from("P-001"))
+            .with_parent_order_id(ClientOrderId::from("O-PARENT"))
             .with_price(Price::from("1.00000"))
-            .with_avg_px(1.00001)
+            .with_avg_px(1.00001)?
             .with_trigger_price(Price::from("0.99000"))
             .with_trigger_type(TriggerType::Default)
-            .with_limit_offset(Decimal::from_f64_retain(0.0001).unwrap())
-            .with_trailing_offset(Decimal::from_f64_retain(0.0002).unwrap())
+            .with_limit_offset(dec!(0.0001))
+            .with_trailing_offset(dec!(0.0002))
             .with_trailing_offset_type(TrailingOffsetType::BasisPoints)
             .with_display_qty(Quantity::from("50"))
             .with_expire_time(UnixNanos::from(4_000_000_000))
@@ -478,18 +553,16 @@ mod tests {
         );
         assert_eq!(report.order_list_id, Some(OrderListId::from("OL-001")));
         assert_eq!(report.venue_position_id, Some(PositionId::from("P-001")));
+        assert_eq!(
+            report.parent_order_id,
+            Some(ClientOrderId::from("O-PARENT"))
+        );
         assert_eq!(report.price, Some(Price::from("1.00000")));
-        assert_eq!(report.avg_px, Some(1.00001));
+        assert_eq!(report.avg_px, Some(dec!(1.00001)));
         assert_eq!(report.trigger_price, Some(Price::from("0.99000")));
         assert_eq!(report.trigger_type, Some(TriggerType::Default));
-        assert_eq!(
-            report.limit_offset,
-            Some(Decimal::from_f64_retain(0.0001).unwrap())
-        );
-        assert_eq!(
-            report.trailing_offset,
-            Some(Decimal::from_f64_retain(0.0002).unwrap())
-        );
+        assert_eq!(report.limit_offset, Some(dec!(0.0001)));
+        assert_eq!(report.trailing_offset, Some(dec!(0.0002)));
         assert_eq!(report.trailing_offset_type, TrailingOffsetType::BasisPoints);
         assert_eq!(report.display_qty, Some(Quantity::from("50")));
         assert_eq!(report.expire_time, Some(UnixNanos::from(4_000_000_000)));
@@ -498,6 +571,7 @@ mod tests {
         assert_eq!(report.cancel_reason, Some("User requested".to_string()));
         assert_eq!(report.ts_triggered, Some(UnixNanos::from(1_500_000_000)));
         assert_eq!(report.contingency_type, ContingencyType::Oco);
+        Ok(())
     }
 
     #[rstest]
@@ -601,7 +675,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_order_status_report_with_optional_fields() {
+    #[allow(clippy::panic_in_result_fn)]
+    fn test_order_status_report_with_optional_fields() -> anyhow::Result<()> {
         let mut report = test_order_status_report();
 
         // Initially no optional fields set
@@ -613,14 +688,15 @@ mod tests {
         // Test builder pattern with various optional fields
         report = report
             .with_price(Price::from("1.00000"))
-            .with_avg_px(1.00001)
+            .with_avg_px(1.00001)?
             .with_post_only(true)
             .with_reduce_only(true);
 
         assert_eq!(report.price, Some(Price::from("1.00000")));
-        assert_eq!(report.avg_px, Some(1.00001));
+        assert_eq!(report.avg_px, Some(dec!(1.00001)));
         assert!(report.post_only);
         assert!(report.reduce_only);
+        Ok(())
     }
 
     #[rstest]
@@ -674,5 +750,226 @@ mod tests {
         assert_eq!(report.ts_last, UnixNanos::from(2_000_000_000));
         assert_eq!(report.ts_init, UnixNanos::from(3_000_000_000));
         assert_eq!(report.ts_triggered, Some(UnixNanos::from(1_500_000_000)));
+    }
+
+    #[rstest]
+    fn test_is_order_updated_returns_true_when_price_differs() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .quantity(Quantity::from(100))
+            .price(Price::from("1.00000"))
+            .build();
+
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00100")); // Different price
+
+        assert!(report.is_order_updated(&order));
+    }
+
+    #[rstest]
+    fn test_is_order_updated_returns_true_when_trigger_price_differs() {
+        let order = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .quantity(Quantity::from(100))
+            .trigger_price(Price::from("0.99000"))
+            .build();
+
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::StopMarket,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_trigger_price(Price::from("0.99100")); // Different trigger price
+
+        assert!(report.is_order_updated(&order));
+    }
+
+    #[rstest]
+    fn test_is_order_updated_returns_true_when_quantity_differs() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .quantity(Quantity::from(100))
+            .price(Price::from("1.00000"))
+            .build();
+
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("200"), // Different quantity
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00000"));
+
+        assert!(report.is_order_updated(&order));
+    }
+
+    #[rstest]
+    fn test_is_order_updated_returns_false_when_all_match() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .quantity(Quantity::from(100))
+            .price(Price::from("1.00000"))
+            .build();
+
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"), // Same quantity
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00000")); // Same price
+
+        assert!(!report.is_order_updated(&order));
+    }
+
+    #[rstest]
+    fn test_is_order_updated_returns_false_when_order_has_no_price() {
+        // Market orders have no price, so only quantity comparison matters
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .quantity(Quantity::from(100))
+            .build();
+
+        let report = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            OrderStatus::Accepted,
+            Quantity::from("100"), // Same quantity
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00000")); // Report has price, but order doesn't
+
+        assert!(!report.is_order_updated(&order));
+    }
+
+    #[rstest]
+    fn test_is_order_updated_stop_limit_order_with_both_prices() {
+        let order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .quantity(Quantity::from(100))
+            .price(Price::from("1.00000"))
+            .trigger_price(Price::from("0.99000"))
+            .build();
+
+        // Same everything
+        let report_same = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::StopLimit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00000"))
+        .with_trigger_price(Price::from("0.99000"));
+
+        assert!(!report_same.is_order_updated(&order));
+
+        // Different limit price
+        let report_diff_price = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::StopLimit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00100")) // Different
+        .with_trigger_price(Price::from("0.99000"));
+
+        assert!(report_diff_price.is_order_updated(&order));
+
+        // Different trigger price
+        let report_diff_trigger = OrderStatusReport::new(
+            AccountId::from("SIM-001"),
+            InstrumentId::from("AUDUSD.SIM"),
+            None,
+            VenueOrderId::from("1"),
+            OrderSide::Buy,
+            OrderType::StopLimit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("100"),
+            Quantity::from("0"),
+            UnixNanos::from(1_000_000_000),
+            UnixNanos::from(2_000_000_000),
+            UnixNanos::from(3_000_000_000),
+            None,
+        )
+        .with_price(Price::from("1.00000"))
+        .with_trigger_price(Price::from("0.99100")); // Different
+
+        assert!(report_diff_trigger.is_order_updated(&order));
     }
 }

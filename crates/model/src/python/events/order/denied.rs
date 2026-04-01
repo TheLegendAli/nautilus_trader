@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -28,7 +28,12 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderDenied {
+    /// Represents an event where an order has been denied by the Nautilus system.
+    ///
+    /// This could be due an unsupported feature, a risk limit exceedance, or for
+    /// any other reason that an otherwise valid order is not able to be submitted.
     #[allow(clippy::too_many_arguments)]
     #[new]
     fn py_new(
@@ -76,8 +81,56 @@ impl OrderDenied {
         from_dict_pyo3(py, values)
     }
 
+    #[getter]
+    #[pyo3(name = "trader_id")]
+    fn py_trader_id(&self) -> TraderId {
+        self.trader_id
+    }
+
+    #[getter]
+    #[pyo3(name = "strategy_id")]
+    fn py_strategy_id(&self) -> StrategyId {
+        self.strategy_id
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_id")]
+    fn py_instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    #[getter]
+    #[pyo3(name = "client_order_id")]
+    fn py_client_order_id(&self) -> ClientOrderId {
+        self.client_order_id
+    }
+
+    #[getter]
+    #[pyo3(name = "reason")]
+    fn py_reason(&self) -> String {
+        self.reason.to_string()
+    }
+
+    #[getter]
+    #[pyo3(name = "event_id")]
+    fn py_event_id(&self) -> UUID4 {
+        self.event_id
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
+    }
+
     #[pyo3(name = "to_dict")]
-    fn py_to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("type", stringify!(OrderDenied))?;
         dict.set_item("trader_id", self.trader_id.to_string())?;

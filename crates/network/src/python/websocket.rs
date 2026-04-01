@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -14,85 +14,188 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
-use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use pyo3::{create_exception, exceptions::PyException, prelude::*};
+use nautilus_core::{
+    collections::into_ustr_vec,
+    python::{clone_py_object, to_pyruntime_err, to_pyvalue_err},
+};
+use pyo3::{Py, create_exception, exceptions::PyException, prelude::*, types::PyBytes};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::{
+    RECONNECTED,
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
-    websocket::{Consumer, WebSocketClient, WebSocketConfig, WriterCommand},
+    websocket::{
+        WebSocketClient, WebSocketConfig,
+        types::{MessageHandler, PingHandler, WriterCommand},
+    },
 };
 
-// Python exception class for websocket errors
 create_exception!(network, WebSocketClientError, PyException);
 
+#[allow(clippy::needless_pass_by_value)]
 fn to_websocket_pyerr(e: tokio_tungstenite::tungstenite::Error) -> PyErr {
     PyErr::new::<WebSocketClientError, _>(e.to_string())
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl WebSocketConfig {
+    /// Configuration for WebSocket client connections.
+    ///
+    /// This struct contains only static configuration settings. Runtime callbacks
+    /// (message handler, ping handler) are passed separately to `connect()`.
+    ///
+    /// # Connection Modes
+    ///
+    /// ## Handler Mode
+    ///
+    /// - Use with `crate.websocket.WebSocketClient.connect`.
+    /// - Pass a message handler to `connect()` to receive messages via callback.
+    /// - Client spawns internal task to read messages and call handler.
+    /// - Supports automatic reconnection with exponential backoff.
+    /// - Reconnection config fields (`reconnect_*`) are active.
+    /// - Best for long-lived connections, Python bindings, callback-based APIs.
+    ///
+    /// ## Stream Mode
+    ///
+    /// - Use with `crate.websocket.WebSocketClient.connect_stream`.
+    /// - Returns a `MessageReader` stream for the caller to read from.
+    /// - **Does NOT support automatic reconnection** (reader owned by caller).
+    /// - Reconnection config fields are ignored.
+    /// - On disconnect, client transitions to CLOSED state and caller must manually reconnect.
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (url, handler, headers, heartbeat=None, heartbeat_msg=None, ping_handler=None, reconnect_timeout_ms=10_000, reconnect_delay_initial_ms=2_000, reconnect_delay_max_ms=30_000, reconnect_backoff_factor=1.5, reconnect_jitter_ms=100))]
+    #[pyo3(signature = (
+        url,
+        headers,
+        heartbeat=None,
+        heartbeat_msg=None,
+        reconnect_timeout_ms=10_000,
+        reconnect_delay_initial_ms=2_000,
+        reconnect_delay_max_ms=30_000,
+        reconnect_backoff_factor=1.5,
+        reconnect_jitter_ms=100,
+        reconnect_max_attempts=None,
+        idle_timeout_ms=None,
+    ))]
     fn py_new(
         url: String,
-        handler: PyObject,
         headers: Vec<(String, String)>,
         heartbeat: Option<u64>,
         heartbeat_msg: Option<String>,
-        ping_handler: Option<PyObject>,
         reconnect_timeout_ms: Option<u64>,
         reconnect_delay_initial_ms: Option<u64>,
         reconnect_delay_max_ms: Option<u64>,
         reconnect_backoff_factor: Option<f64>,
         reconnect_jitter_ms: Option<u64>,
+        reconnect_max_attempts: Option<u32>,
+        idle_timeout_ms: Option<u64>,
     ) -> Self {
         Self {
             url,
-            handler: Consumer::Python(Some(Arc::new(handler))),
             headers,
             heartbeat,
             heartbeat_msg,
-            ping_handler: ping_handler.map(Arc::new),
             reconnect_timeout_ms,
             reconnect_delay_initial_ms,
             reconnect_delay_max_ms,
             reconnect_backoff_factor,
             reconnect_jitter_ms,
+            reconnect_max_attempts,
+            idle_timeout_ms,
         }
     }
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl WebSocketClient {
-    /// Create a websocket client.
+    /// Creates a websocket client in **handler mode** with automatic reconnection.
     ///
-    /// # Safety
+    /// The handler is called for each incoming message on an internal task.
+    /// Automatic reconnection is **enabled** with exponential backoff. On disconnection,
+    /// the client automatically attempts to reconnect and replaces the internal reader
+    /// (the handler continues working seamlessly).
     ///
-    /// - Throws an Exception if it is unable to make websocket connection.
+    /// Use handler mode for simplified connection management, automatic reconnection, Python
+    /// bindings, or callback-based message handling.
+    ///
+    /// See `WebSocketConfig` documentation for comparison with stream mode.
     #[staticmethod]
-    #[pyo3(name = "connect", signature = (config, post_connection= None, post_reconnection= None, post_disconnection= None, keyed_quotas = Vec::new(), default_quota = None))]
+    #[pyo3(name = "connect", signature = (loop_, config, handler, ping_handler = None, post_reconnection = None, keyed_quotas = Vec::new(), default_quota = None))]
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_connect(
+        loop_: Py<PyAny>,
         config: WebSocketConfig,
-        post_connection: Option<PyObject>,
-        post_reconnection: Option<PyObject>,
-        post_disconnection: Option<PyObject>,
+        handler: Py<PyAny>,
+        ping_handler: Option<Py<PyAny>>,
+        post_reconnection: Option<Py<PyAny>>,
         keyed_quotas: Vec<(String, Quota)>,
         default_quota: Option<Quota>,
         py: Python<'_>,
     ) -> PyResult<Bound<'_, PyAny>> {
+        let call_soon_threadsafe: Py<PyAny> = loop_.getattr(py, "call_soon_threadsafe")?;
+        let call_soon_clone = clone_py_object(&call_soon_threadsafe);
+        let handler_clone = clone_py_object(&handler);
+
+        let message_handler: MessageHandler = Arc::new(move |msg: Message| {
+            if matches!(msg, Message::Text(ref text) if text.as_str() == RECONNECTED) {
+                return;
+            }
+
+            Python::attach(|py| {
+                let py_bytes = match &msg {
+                    Message::Binary(data) => PyBytes::new(py, data),
+                    Message::Text(text) => PyBytes::new(py, text.as_bytes()),
+                    _ => return,
+                };
+
+                if let Err(e) = call_soon_clone.call1(py, (&handler_clone, py_bytes)) {
+                    log::error!("Error scheduling message handler on event loop: {e}");
+                }
+            });
+        });
+
+        let ping_handler_fn = ping_handler.map(|ping_handler| {
+            let ping_handler_clone = clone_py_object(&ping_handler);
+            let call_soon_clone = clone_py_object(&call_soon_threadsafe);
+
+            let ping_handler_fn: PingHandler = Arc::new(move |data: Vec<u8>| {
+                Python::attach(|py| {
+                    let py_bytes = PyBytes::new(py, &data);
+                    if let Err(e) = call_soon_clone.call1(py, (&ping_handler_clone, py_bytes)) {
+                        log::error!("Error scheduling ping handler on event loop: {e}");
+                    }
+                });
+            });
+            ping_handler_fn
+        });
+
+        let post_reconnection_fn = post_reconnection.map(|callback| {
+            let callback_clone = clone_py_object(&callback);
+            Arc::new(move || {
+                Python::attach(|py| {
+                    if let Err(e) = callback_clone.call0(py) {
+                        log::error!("Error calling post_reconnection handler: {e}");
+                    }
+                });
+            }) as std::sync::Arc<dyn Fn() + Send + Sync>
+        });
+
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Self::connect(
                 config,
-                post_connection,
-                post_reconnection,
-                post_disconnection,
+                Some(message_handler),
+                ping_handler_fn,
+                post_reconnection_fn,
                 keyed_quotas,
                 default_quota,
             )
@@ -101,33 +204,40 @@ impl WebSocketClient {
         })
     }
 
-    /// Closes the client heart beat and reader task.
+    /// Set disconnect mode to true.
     ///
-    /// The connection is not completely closed the till all references
-    /// to the client are gone and the client is dropped.
-    ///
-    /// # Safety
-    ///
-    /// - The client should not be used after closing it.
-    /// - Any auto-reconnect job should be aborted before closing the client.
+    /// Controller task will periodically check the disconnect mode
+    /// and shutdown the client if it is alive
     #[pyo3(name = "disconnect")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_disconnect<'py>(slf: PyRef<'_, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let connection_mode = slf.connection_mode.clone();
+        let state_notify = slf.state_notify.clone();
         let mode = ConnectionMode::from_atomic(&connection_mode);
-        tracing::debug!("Close from mode {mode}");
+        log::debug!("Close from mode {mode}");
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             match ConnectionMode::from_atomic(&connection_mode) {
                 ConnectionMode::Closed => {
-                    tracing::warn!("WebSocket already closed");
+                    log::debug!("WebSocket already closed");
                 }
                 ConnectionMode::Disconnect => {
-                    tracing::warn!("WebSocket already disconnecting");
+                    log::debug!("WebSocket already disconnecting");
                 }
                 _ => {
                     connection_mode.store(ConnectionMode::Disconnect.as_u8(), Ordering::SeqCst);
-                    while !ConnectionMode::from_atomic(&connection_mode).is_closed() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    state_notify.notify_one();
+
+                    let timeout = tokio::time::timeout(Duration::from_secs(5), async {
+                        while !ConnectionMode::from_atomic(&connection_mode).is_closed() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await;
+
+                    if timeout.is_err() {
+                        log::error!("Timeout waiting for WebSocket to close, forcing closed state");
+                        connection_mode.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
                     }
                 }
             }
@@ -136,31 +246,42 @@ impl WebSocketClient {
         })
     }
 
-    /// Check if the client is still alive.
+    /// Check if the client connection is active.
     ///
-    /// Even if the connection is disconnected the client will still be alive
-    /// and trying to reconnect.
-    ///
-    /// This is particularly useful for checking why a `send` failed. It could
-    /// be because the connection disconnected and the client is still alive
-    /// and reconnecting. In such cases the send can be retried after some
-    /// delay.
+    /// Returns `true` if the client is connected and has not been signalled to disconnect.
+    /// The client will automatically retry connection based on its configuration.
     #[pyo3(name = "is_active")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_is_active(slf: PyRef<'_, Self>) -> bool {
         !slf.controller_task.is_finished()
     }
 
+    /// Check if the client is reconnecting.
+    ///
+    /// Returns `true` if the client lost connection and is attempting to reestablish it.
+    /// The client will automatically retry connection based on its configuration.
     #[pyo3(name = "is_reconnecting")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_is_reconnecting(slf: PyRef<'_, Self>) -> bool {
         slf.is_reconnecting()
     }
 
+    /// Check if the client is disconnecting.
+    ///
+    /// Returns `true` if the client is in disconnect mode.
     #[pyo3(name = "is_disconnecting")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_is_disconnecting(slf: PyRef<'_, Self>) -> bool {
         slf.is_disconnecting()
     }
 
+    /// Check if the client is closed.
+    ///
+    /// Returns `true` if the client has been explicitly disconnected or reached
+    /// maximum reconnection attempts. In this state, the client cannot be reused
+    /// and a new client must be created for further connections.
     #[pyo3(name = "is_closed")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_is_closed(slf: PyRef<'_, Self>) -> bool {
         slf.is_closed()
     }
@@ -172,6 +293,7 @@ impl WebSocketClient {
     /// - Raises `PyRuntimeError` if not able to send data.
     #[pyo3(name = "send")]
     #[pyo3(signature = (data, keys=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_send<'py>(
         slf: PyRef<'_, Self>,
         data: Vec<u8>,
@@ -181,18 +303,29 @@ impl WebSocketClient {
         let rate_limiter = slf.rate_limiter.clone();
         let writer_tx = slf.writer_tx.clone();
         let mode = slf.connection_mode.clone();
+        let keys = keys.map(into_ustr_vec);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if !ConnectionMode::from_atomic(&mode).is_active() {
                 let msg = "Cannot send data: connection not active".to_string();
-                tracing::error!("{msg}");
+                log::error!("{msg}");
                 return Err(to_pyruntime_err(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     msg,
                 )));
             }
-            rate_limiter.await_keys_ready(keys).await;
-            tracing::trace!("Sending binary: {data:?}");
+
+            tokio::select! {
+                () = rate_limiter.await_keys_ready(keys.as_deref()) => {}
+                () = poll_until_closed(&mode) => {
+                    return Err(to_pyruntime_err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "Connection closed while waiting for rate limit",
+                    )));
+                }
+            }
+
+            log::trace!("Sending binary: {data:?}");
 
             let msg = Message::Binary(data.into());
             writer_tx
@@ -201,21 +334,14 @@ impl WebSocketClient {
         })
     }
 
-    /// Send UTF-8 encoded bytes as text data to the server, respecting rate limits.
+    /// Sends the given text `data` to the server.
     ///
-    /// `data`: The byte data to be sent, which will be converted to a UTF-8 string.
-    /// `keys`: Optional list of rate limit keys. If provided, the function will wait for rate limits to be met for each key before sending the data.
-    ///
-    /// # Errors
-    /// - Raises `PyRuntimeError` if unable to send the data.
-    ///
-    /// # Example
-    ///
-    /// When a request is made the URL should be split into all relevant keys within it.
-    ///
-    /// For request /foo/bar, should pass keys ["foo/bar", "foo"] for rate limiting.
+    /// Returns `Ok(())` when the message is enqueued to the writer channel. This does NOT
+    /// guarantee delivery: if a disconnect occurs concurrently, the writer task may drop the
+    /// message. During reconnection, messages are buffered and replayed on the new connection.
     #[pyo3(name = "send_text")]
     #[pyo3(signature = (data, keys=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_send_text<'py>(
         slf: PyRef<'_, Self>,
         data: Vec<u8>,
@@ -227,17 +353,28 @@ impl WebSocketClient {
         let rate_limiter = slf.rate_limiter.clone();
         let writer_tx = slf.writer_tx.clone();
         let mode = slf.connection_mode.clone();
+        let keys = keys.map(into_ustr_vec);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if !ConnectionMode::from_atomic(&mode).is_active() {
-                let err = std::io::Error::new(
+                let e = std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     "Cannot send text: connection not active",
                 );
-                return Err(to_pyruntime_err(err));
+                return Err(to_pyruntime_err(e));
             }
-            rate_limiter.await_keys_ready(keys).await;
-            tracing::trace!("Sending text: {data}");
+
+            tokio::select! {
+                () = rate_limiter.await_keys_ready(keys.as_deref()) => {}
+                () = poll_until_closed(&mode) => {
+                    return Err(to_pyruntime_err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "Connection closed while waiting for rate limit",
+                    )));
+                }
+            }
+
+            log::trace!("Sending text: {data}");
 
             let msg = Message::Text(data);
             writer_tx
@@ -246,30 +383,27 @@ impl WebSocketClient {
         })
     }
 
-    /// Send pong bytes data to the server.
-    ///
-    /// # Errors
-    ///
-    /// - Raises `PyRuntimeError` if not able to send data.
+    /// Sends a pong frame back to the server.
     #[pyo3(name = "send_pong")]
+    #[allow(clippy::needless_pass_by_value)]
     fn py_send_pong<'py>(
         slf: PyRef<'_, Self>,
         data: Vec<u8>,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let data_str = String::from_utf8(data.clone()).map_err(to_pyvalue_err)?;
         let writer_tx = slf.writer_tx.clone();
         let mode = slf.connection_mode.clone();
+        let data_len = data.len();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if !ConnectionMode::from_atomic(&mode).is_active() {
-                let err = std::io::Error::new(
+                let e = std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     "Cannot send pong: connection not active",
                 );
-                return Err(to_pyruntime_err(err));
+                return Err(to_pyruntime_err(e));
             }
-            tracing::trace!("Sending pong: {data_str}");
+            log::trace!("Sending pong frame ({data_len} bytes)");
 
             let msg = Message::Pong(data.into());
             writer_tx
@@ -279,9 +413,19 @@ impl WebSocketClient {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
+async fn poll_until_closed(mode: &Arc<AtomicU8>) {
+    loop {
+        if matches!(
+            ConnectionMode::from_atomic(mode),
+            ConnectionMode::Disconnect | ConnectionMode::Closed
+        ) {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[cfg(test)]
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
@@ -289,7 +433,7 @@ mod tests {
 
     use futures_util::{SinkExt, StreamExt};
     use nautilus_core::python::IntoPyObjectNautilusExt;
-    use pyo3::{prelude::*, prepare_freethreaded_python};
+    use pyo3::{prelude::*, types::PyBytes};
     use tokio::{
         net::TcpListener,
         task::{self, JoinHandle},
@@ -298,13 +442,13 @@ mod tests {
     use tokio_tungstenite::{
         accept_hdr_async,
         tungstenite::{
+            Message,
             handshake::server::{self, Callback},
             http::HeaderValue,
         },
     };
-    use tracing_test::traced_test;
 
-    use crate::websocket::{WebSocketClient, WebSocketConfig};
+    use crate::websocket::{MessageHandler, WebSocketClient, WebSocketConfig};
 
     struct TestServer {
         task: JoinHandle<()>,
@@ -318,6 +462,7 @@ mod tests {
     }
 
     impl Callback for TestCallback {
+        #[allow(clippy::panic_in_result_fn)]
         fn on_request(
             self,
             request: &server::Request,
@@ -360,7 +505,7 @@ mod tests {
                                 tokio_tungstenite::tungstenite::protocol::Message::Text(txt)
                                     if txt == "close-now" =>
                                 {
-                                    tracing::debug!("Forcibly closing from server side");
+                                    log::debug!("Forcibly closing from server side");
                                     // This sends a close frame, then stops reading
                                     let _ = websocket.close(None).await;
                                     break;
@@ -397,8 +542,8 @@ mod tests {
         }
     }
 
-    fn create_test_handler() -> (PyObject, PyObject) {
-        let code_raw = r"
+    fn create_test_handler() -> (Py<PyAny>, Py<PyAny>) {
+        let code_raw = "
 class Counter:
     def __init__(self):
         self.count = 0
@@ -423,7 +568,7 @@ counter = Counter()
         let code = CString::new(code_raw).unwrap();
         let filename = CString::new("test".to_string()).unwrap();
         let module = CString::new("test".to_string()).unwrap();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let pymod = PyModule::from_code(py, &code, &filename, &module).unwrap();
 
             let counter = pymod.getattr("counter").unwrap().into_py_any_unwrap(py);
@@ -437,11 +582,11 @@ counter = Counter()
     }
 
     #[tokio::test]
-    #[traced_test]
     async fn basic_client_test() {
-        prepare_freethreaded_python();
-
         const N: usize = 10;
+
+        Python::initialize();
+
         let mut success_count = 0;
         let header_key = "hello-custom-key".to_string();
         let header_value = "hello-custom-value".to_string();
@@ -451,7 +596,6 @@ counter = Counter()
 
         let config = WebSocketConfig::py_new(
             format!("ws://127.0.0.1:{}", server.port),
-            Python::with_gil(|py| handler.clone_ref(py)),
             vec![(header_key, header_value)],
             None,
             None,
@@ -461,20 +605,37 @@ counter = Counter()
             None,
             None,
             None,
+            None,
         );
-        let client = WebSocketClient::connect(config, None, None, None, Vec::new(), None)
-            .await
-            .unwrap();
 
-        // Send messages that increment the count
+        let handler_clone = Python::attach(|py| handler.clone_ref(py));
+
+        let message_handler: MessageHandler = std::sync::Arc::new(move |msg: Message| {
+            Python::attach(|py| {
+                let data = match msg {
+                    Message::Binary(data) => data.to_vec(),
+                    Message::Text(text) => text.as_bytes().to_vec(),
+                    _ => return,
+                };
+                let py_bytes = PyBytes::new(py, &data);
+                if let Err(e) = handler_clone.call1(py, (py_bytes,)) {
+                    log::error!("Error calling handler: {e}");
+                }
+            });
+        });
+
+        let client =
+            WebSocketClient::connect(config, Some(message_handler), None, None, vec![], None)
+                .await
+                .unwrap();
+
         for _ in 0..N {
             client.send_bytes(b"ping".to_vec(), None).await.unwrap();
             success_count += 1;
         }
 
-        // Check count is same as number messages sent
         sleep(Duration::from_secs(1)).await;
-        let count_value: usize = Python::with_gil(|py| {
+        let count_value: usize = Python::attach(|py| {
             counter
                 .getattr(py, "get_count")
                 .unwrap()
@@ -495,9 +656,8 @@ counter = Counter()
             success_count += 1;
         }
 
-        // Check count is same as number messages sent
         sleep(Duration::from_secs(1)).await;
-        let count_value: usize = Python::with_gil(|py| {
+        let count_value: usize = Python::attach(|py| {
             counter
                 .getattr(py, "get_count")
                 .unwrap()
@@ -509,26 +669,22 @@ counter = Counter()
         assert_eq!(count_value, success_count);
         assert_eq!(success_count, N + N);
 
-        // Cleanup
         client.disconnect().await;
         assert!(client.is_disconnected());
     }
 
     #[tokio::test]
-    #[traced_test]
     async fn message_ping_test() {
-        prepare_freethreaded_python();
+        Python::initialize();
 
         let header_key = "hello-custom-key".to_string();
         let header_value = "hello-custom-value".to_string();
 
         let (checker, handler) = create_test_handler();
 
-        // Initialize test server and config
         let server = TestServer::setup(header_key.clone(), header_value.clone()).await;
         let config = WebSocketConfig::py_new(
             format!("ws://127.0.0.1:{}", server.port),
-            Python::with_gil(|py| handler.clone_ref(py)),
             vec![(header_key, header_value)],
             Some(1),
             Some("heartbeat message".to_string()),
@@ -538,14 +694,32 @@ counter = Counter()
             None,
             None,
             None,
+            None,
         );
-        let client = WebSocketClient::connect(config, None, None, None, Vec::new(), None)
-            .await
-            .unwrap();
 
-        // Check if ping message has the correct message
+        let handler_clone = Python::attach(|py| handler.clone_ref(py));
+
+        let message_handler: MessageHandler = std::sync::Arc::new(move |msg: Message| {
+            Python::attach(|py| {
+                let data = match msg {
+                    Message::Binary(data) => data.to_vec(),
+                    Message::Text(text) => text.as_bytes().to_vec(),
+                    _ => return,
+                };
+                let py_bytes = PyBytes::new(py, &data);
+                if let Err(e) = handler_clone.call1(py, (py_bytes,)) {
+                    log::error!("Error calling handler: {e}");
+                }
+            });
+        });
+
+        let client =
+            WebSocketClient::connect(config, Some(message_handler), None, None, vec![], None)
+                .await
+                .unwrap();
+
         sleep(Duration::from_secs(2)).await;
-        let check_value: bool = Python::with_gil(|py| {
+        let check_value: bool = Python::attach(|py| {
             checker
                 .getattr(py, "get_check")
                 .unwrap()
@@ -556,7 +730,6 @@ counter = Counter()
         });
         assert!(check_value);
 
-        // Cleanup
         client.disconnect().await;
         assert!(client.is_disconnected());
     }

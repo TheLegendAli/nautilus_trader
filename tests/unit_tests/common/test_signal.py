@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -65,7 +65,7 @@ class TestSignalSerialization:
         assert callable(SignalClass.from_dict)
 
     @pytest.mark.parametrize(
-        "value_type,test_value,signal_name",
+        ("value_type", "test_value", "signal_name"),
         [
             (int, 42, "roundtrip_int"),
             (float, 3.14159, "roundtrip_float"),

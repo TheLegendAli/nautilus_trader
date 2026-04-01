@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -19,7 +19,11 @@
 //! parts of the NautilusTrader system, including data requests, execution commands,
 //! and system control messages.
 
-use nautilus_model::data::Data;
+use nautilus_model::{
+    data::{Data, FundingRateUpdate, InstrumentStatus, option_chain::OptionGreeks},
+    events::{AccountState, OrderEventAny},
+    instruments::InstrumentAny,
+};
 use strum::Display;
 
 pub mod data;
@@ -31,6 +35,7 @@ pub mod defi;
 
 // Re-exports
 pub use data::{DataResponse, SubscribeCommand, UnsubscribeCommand};
+pub use execution::ExecutionReport;
 
 // TODO: Refine this to reduce disparity between enum sizes
 #[allow(clippy::large_enum_variant)]
@@ -38,6 +43,20 @@ pub use data::{DataResponse, SubscribeCommand, UnsubscribeCommand};
 pub enum DataEvent {
     Response(DataResponse),
     Data(Data),
+    Instrument(InstrumentAny), // TODO: Eventually this can be `Data` once Cython is gone
+    FundingRate(FundingRateUpdate),
+    InstrumentStatus(InstrumentStatus),
+    OptionGreeks(OptionGreeks),
+    // nautilus-import-ok: conditional compilation import
     #[cfg(feature = "defi")]
     DeFi(nautilus_model::defi::data::DefiData),
+}
+
+/// Execution event variants for order events and reports.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Display)]
+pub enum ExecutionEvent {
+    Order(OrderEventAny),
+    Report(ExecutionReport),
+    Account(AccountState),
 }

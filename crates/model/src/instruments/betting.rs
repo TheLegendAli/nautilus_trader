@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -16,7 +16,7 @@
 use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
-    UnixNanos,
+    Params, UnixNanos,
     correctness::{FAILED, check_equal_u8},
 };
 use rust_decimal::Decimal;
@@ -38,10 +38,14 @@ use crate::{
 
 /// Represents a betting instrument with complete market and selection details.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct BettingInstrument {
     /// The instrument ID.
@@ -110,6 +114,8 @@ pub struct BettingInstrument {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// Additional instrument metadata as a JSON-serializable dictionary.
+    pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the data object was initialized.
@@ -160,6 +166,7 @@ impl BettingInstrument {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> anyhow::Result<Self> {
@@ -212,6 +219,7 @@ impl BettingInstrument {
             margin_maint: margin_maint.unwrap_or(dec!(1)),
             maker_fee: maker_fee.unwrap_or_default(),
             taker_fee: taker_fee.unwrap_or_default(),
+            info,
             ts_event,
             ts_init,
         })
@@ -257,6 +265,7 @@ impl BettingInstrument {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Self {
@@ -294,6 +303,7 @@ impl BettingInstrument {
             margin_maint,
             maker_fee,
             taker_fee,
+            info,
             ts_event,
             ts_init,
         )
@@ -416,6 +426,22 @@ impl Instrument for BettingInstrument {
         self.ts_init
     }
 
+    fn margin_init(&self) -> Decimal {
+        self.margin_init
+    }
+
+    fn margin_maint(&self) -> Decimal {
+        self.margin_maint
+    }
+
+    fn maker_fee(&self) -> Decimal {
+        self.maker_fee
+    }
+
+    fn taker_fee(&self) -> Decimal {
+        self.taker_fee
+    }
+
     fn strike_price(&self) -> Option<Price> {
         None
     }
@@ -437,18 +463,79 @@ impl Instrument for BettingInstrument {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// Tests
-////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
-    use crate::instruments::{BettingInstrument, stubs::*};
+    use crate::{
+        enums::{AssetClass, InstrumentClass},
+        identifiers::InstrumentId,
+        instruments::{BettingInstrument, Instrument, stubs::*},
+        types::{Currency, Price, Quantity},
+    };
 
     #[rstest]
-    fn test_equality(betting: BettingInstrument) {
-        let cloned = betting;
-        assert_eq!(betting, cloned);
+    fn test_trait_accessors(betting: BettingInstrument) {
+        assert_eq!(betting.asset_class(), AssetClass::Alternative);
+        assert_eq!(betting.instrument_class(), InstrumentClass::SportsBetting);
+        assert_eq!(betting.quote_currency(), Currency::GBP());
+        assert!(!betting.is_inverse());
+        assert_eq!(betting.price_precision(), 2);
+        assert_eq!(betting.size_precision(), 2);
+        assert_eq!(betting.price_increment(), Price::from("0.01"));
+        assert_eq!(betting.size_increment(), Quantity::from("0.01"));
+        assert_eq!(betting.margin_init(), dec!(1));
+        assert_eq!(betting.margin_maint(), dec!(1));
+    }
+
+    #[rstest]
+    fn test_new_checked_price_precision_mismatch() {
+        let result = BettingInstrument::new_checked(
+            InstrumentId::from("1-123.BETFAIR"),
+            "1-123".into(),
+            6423,
+            "Football".into(),
+            1,
+            "NFL".into(),
+            1,
+            "NFL".into(),
+            "GB".into(),
+            0.into(),
+            "ODDS".into(),
+            "1-123".into(),
+            "Winner".into(),
+            "SPECIAL".into(),
+            0.into(),
+            50214,
+            "Team".into(),
+            0.0,
+            Currency::GBP(),
+            4, // mismatch
+            2,
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_serialization_roundtrip(betting: BettingInstrument) {
+        let json = serde_json::to_string(&betting).unwrap();
+        let deserialized: BettingInstrument = serde_json::from_str(&json).unwrap();
+        assert_eq!(betting, deserialized);
     }
 }

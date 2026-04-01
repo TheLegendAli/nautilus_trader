@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
 #  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -71,8 +71,8 @@ class DatabentoInstrumentProvider(InstrumentProvider):
         super().__init__(config=config)
 
         self._clock = clock
-        self._config = config
-        self._live_api_key = live_api_key or http_client.key
+        self._config = config or InstrumentProviderConfig()
+        self._live_api_key = live_api_key or http_client.api_key
         self._live_gateway = live_gateway
 
         self._http_client = http_client
@@ -186,7 +186,7 @@ class DatabentoInstrumentProvider(InstrumentProvider):
         try:
             await asyncio.gather(
                 asyncio.ensure_future(
-                    live_client.start(callback=receive_instruments, callback_pyo3=print),
+                    live_client.start(callback=receive_instruments, callback_pyo3=lambda _: None),
                 ),
                 monitor_inactivity(),
             )
@@ -211,25 +211,6 @@ class DatabentoInstrumentProvider(InstrumentProvider):
         instrument_id: InstrumentId,
         filters: dict | None = None,
     ) -> None:
-        """
-        Load the latest instrument definition for the given instrument ID into the
-        provider by requesting the latest instrument definition message from Databento.
-
-        The Databento dataset will be determined from either the filters, or the venue for the
-        instrument ID.
-
-        Parameters
-        ----------
-        instrument_id : InstrumentId
-            The instrument ID to load.
-        filters : dict, optional
-            The optional filters for the instrument definition request.
-
-        Warnings
-        --------
-        Calling this method will incur a cost to your Databento account in USD.
-
-        """
         await self.load_ids_async([instrument_id], filters=filters)
 
     async def get_range(

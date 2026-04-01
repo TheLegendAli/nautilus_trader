@@ -1,5 +1,5 @@
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -17,56 +17,82 @@ use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     ops::Neg,
+    str::FromStr,
 };
 
-use nautilus_core::python::{
-    IntoPyObjectNautilusExt, get_pytype_name, to_pytype_err, to_pyvalue_err,
-};
-use pyo3::{
-    conversion::IntoPyObjectExt,
-    prelude::*,
-    pyclass::CompareOp,
-    types::{PyFloat, PyTuple},
-};
+use nautilus_core::python::{get_pytype_name, to_pytype_err, to_pyvalue_err};
+use pyo3::{basic::CompareOp, conversion::IntoPyObjectExt, prelude::*, types::PyFloat};
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::types::{Quantity, quantity::QuantityRaw};
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Quantity {
+    /// Represents a quantity with a non-negative value and specified precision.
+    ///
+    /// Capable of storing either a whole number (no decimal places) of 'contracts'
+    /// or 'shares' (instruments denominated in whole units) or a decimal value
+    /// containing decimal places for instruments denominated in fractional units.
+    ///
+    /// Handles up to `FIXED_PRECISION` decimals of precision.
+    ///
+    /// - `QUANTITY_MAX` - Maximum representable quantity value.
+    /// - `QUANTITY_MIN` - 0 (non-negative values only).
     #[new]
     fn py_new(value: f64, precision: u8) -> PyResult<Self> {
         Self::new_checked(value, precision).map_err(to_pyvalue_err)
     }
 
-    fn __setstate__(&mut self, state: &Bound<'_, PyAny>) -> PyResult<()> {
-        let py_tuple: &Bound<'_, PyTuple> = state.downcast::<PyTuple>()?;
-        self.raw = py_tuple.get_item(0)?.extract::<QuantityRaw>()?;
-        self.precision = py_tuple.get_item(1)?.extract::<u8>()?;
-        Ok(())
+    fn __reduce__(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let from_raw = py.get_type::<Self>().getattr("from_raw")?;
+        let args = (self.raw, self.precision).into_py_any(py)?;
+        (from_raw, args).into_py_any(py)
     }
 
-    fn __getstate__(&self, py: Python) -> PyResult<PyObject> {
-        (self.raw, self.precision).into_py_any(py)
+    fn __richcmp__(
+        &self,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyAny>> {
+        if let Ok(other_qty) = other.extract::<Self>() {
+            let result = match op {
+                CompareOp::Eq => self.eq(&other_qty),
+                CompareOp::Ne => self.ne(&other_qty),
+                CompareOp::Ge => self.ge(&other_qty),
+                CompareOp::Gt => self.gt(&other_qty),
+                CompareOp::Le => self.le(&other_qty),
+                CompareOp::Lt => self.lt(&other_qty),
+            };
+            result.into_py_any(py)
+        } else if let Ok(other_dec) = other.extract::<Decimal>() {
+            let result = match op {
+                CompareOp::Eq => self.as_decimal() == other_dec,
+                CompareOp::Ne => self.as_decimal() != other_dec,
+                CompareOp::Ge => self.as_decimal() >= other_dec,
+                CompareOp::Gt => self.as_decimal() > other_dec,
+                CompareOp::Le => self.as_decimal() <= other_dec,
+                CompareOp::Lt => self.as_decimal() < other_dec,
+            };
+            result.into_py_any(py)
+        } else {
+            Ok(py.NotImplemented())
+        }
     }
 
-    fn __reduce__(&self, py: Python) -> PyResult<PyObject> {
-        let safe_constructor = py.get_type::<Self>().getattr("_safe_constructor")?;
-        let state = self.__getstate__(py)?;
-        (safe_constructor, PyTuple::empty(py), state).into_py_any(py)
+    fn __hash__(&self) -> isize {
+        let mut h = DefaultHasher::new();
+        self.hash(&mut h);
+        h.finish() as isize
     }
 
-    #[staticmethod]
-    fn _safe_constructor() -> PyResult<Self> {
-        Ok(Self::zero(0)) // Safe default
-    }
-
-    fn __add__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __add__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (self.as_f64() + other_float).into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (self.as_decimal() + other_qty.as_decimal()).into_py_any(py)
+            (*self + other_qty).into_py_any(py)
         } else if let Ok(other_dec) = other.extract::<Decimal>() {
             (self.as_decimal() + other_dec).into_py_any(py)
         } else {
@@ -77,12 +103,12 @@ impl Quantity {
         }
     }
 
-    fn __radd__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __radd__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (other_float + self.as_f64()).into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty.as_decimal() + self.as_decimal()).into_py_any(py)
+            (other_qty + *self).into_py_any(py)
         } else if let Ok(other_dec) = other.extract::<Decimal>() {
             (other_dec + self.as_decimal()).into_py_any(py)
         } else {
@@ -93,12 +119,17 @@ impl Quantity {
         }
     }
 
-    fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __sub__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (self.as_f64() - other_float).into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (self.as_decimal() - other_qty.as_decimal()).into_py_any(py)
+            if other_qty.raw > self.raw {
+                return Err(to_pyvalue_err(format!(
+                    "Quantity subtraction would result in negative value: {self} - {other_qty}"
+                )));
+            }
+            (*self - other_qty).into_py_any(py)
         } else if let Ok(other_dec) = other.extract::<Decimal>() {
             (self.as_decimal() - other_dec).into_py_any(py)
         } else {
@@ -109,12 +140,17 @@ impl Quantity {
         }
     }
 
-    fn __rsub__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __rsub__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (other_float - self.as_f64()).into_py_any(py)
         } else if let Ok(other_qty) = other.extract::<Self>() {
-            (other_qty.as_decimal() - self.as_decimal()).into_py_any(py)
+            if self.raw > other_qty.raw {
+                return Err(to_pyvalue_err(format!(
+                    "Quantity subtraction would result in negative value: {other_qty} - {self}"
+                )));
+            }
+            (other_qty - *self).into_py_any(py)
         } else if let Ok(other_dec) = other.extract::<Decimal>() {
             (other_dec - self.as_decimal()).into_py_any(py)
         } else {
@@ -125,7 +161,7 @@ impl Quantity {
         }
     }
 
-    fn __mul__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __mul__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (self.as_f64() * other_float).into_py_any(py)
@@ -141,7 +177,7 @@ impl Quantity {
         }
     }
 
-    fn __rmul__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __rmul__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (other_float * self.as_f64()).into_py_any(py)
@@ -157,7 +193,7 @@ impl Quantity {
         }
     }
 
-    fn __truediv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __truediv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (self.as_f64() / other_float).into_py_any(py)
@@ -173,7 +209,7 @@ impl Quantity {
         }
     }
 
-    fn __rtruediv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __rtruediv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (other_float / self.as_f64()).into_py_any(py)
@@ -189,7 +225,7 @@ impl Quantity {
         }
     }
 
-    fn __floordiv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __floordiv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (self.as_f64() / other_float).floor().into_py_any(py)
@@ -207,7 +243,7 @@ impl Quantity {
         }
     }
 
-    fn __rfloordiv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __rfloordiv__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (other_float / self.as_f64()).floor().into_py_any(py)
@@ -225,7 +261,7 @@ impl Quantity {
         }
     }
 
-    fn __mod__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __mod__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (self.as_f64() % other_float).into_py_any(py)
@@ -241,7 +277,7 @@ impl Quantity {
         }
     }
 
-    fn __rmod__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<PyObject> {
+    fn __rmod__(&self, other: &Bound<'_, PyAny>, py: Python) -> PyResult<Py<PyAny>> {
         if other.is_instance_of::<PyFloat>() {
             let other_float: f64 = other.extract()?;
             (other_float % self.as_f64()).into_py_any(py)
@@ -261,14 +297,12 @@ impl Quantity {
         self.as_decimal().neg()
     }
 
-    fn __pos__(&self) -> Decimal {
-        let mut value = self.as_decimal();
-        value.set_sign_positive(true);
-        value
+    fn __pos__(&self) -> Self {
+        *self
     }
 
-    fn __abs__(&self) -> Decimal {
-        self.as_decimal().abs()
+    fn __abs__(&self) -> Self {
+        *self
     }
 
     fn __int__(&self) -> u64 {
@@ -283,36 +317,6 @@ impl Quantity {
     fn __round__(&self, ndigits: Option<u32>) -> Decimal {
         self.as_decimal()
             .round_dp_with_strategy(ndigits.unwrap_or(0), RoundingStrategy::MidpointNearestEven)
-    }
-
-    fn __richcmp__(&self, other: PyObject, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
-        if let Ok(other_qty) = other.extract::<Self>(py) {
-            match op {
-                CompareOp::Eq => self.eq(&other_qty).into_py_any_unwrap(py),
-                CompareOp::Ne => self.ne(&other_qty).into_py_any_unwrap(py),
-                CompareOp::Ge => self.ge(&other_qty).into_py_any_unwrap(py),
-                CompareOp::Gt => self.gt(&other_qty).into_py_any_unwrap(py),
-                CompareOp::Le => self.le(&other_qty).into_py_any_unwrap(py),
-                CompareOp::Lt => self.lt(&other_qty).into_py_any_unwrap(py),
-            }
-        } else if let Ok(other_dec) = other.extract::<Decimal>(py) {
-            match op {
-                CompareOp::Eq => (self.as_decimal() == other_dec).into_py_any_unwrap(py),
-                CompareOp::Ne => (self.as_decimal() != other_dec).into_py_any_unwrap(py),
-                CompareOp::Ge => (self.as_decimal() >= other_dec).into_py_any_unwrap(py),
-                CompareOp::Gt => (self.as_decimal() > other_dec).into_py_any_unwrap(py),
-                CompareOp::Le => (self.as_decimal() <= other_dec).into_py_any_unwrap(py),
-                CompareOp::Lt => (self.as_decimal() < other_dec).into_py_any_unwrap(py),
-            }
-        } else {
-            py.NotImplemented()
-        }
-    }
-
-    fn __hash__(&self) -> isize {
-        let mut h = DefaultHasher::new();
-        self.hash(&mut h);
-        h.finish() as isize
     }
 
     fn __repr__(&self) -> String {
@@ -333,12 +337,14 @@ impl Quantity {
         self.precision
     }
 
+    /// Creates a new `Quantity` instance from the given `raw` fixed-point value and `precision`.
     #[staticmethod]
     #[pyo3(name = "from_raw")]
     fn py_from_raw(raw: QuantityRaw, precision: u8) -> Self {
         Self::from_raw(raw, precision)
     }
 
+    /// Creates a new `Quantity` instance with a value of zero with the given `precision`.
     #[staticmethod]
     #[pyo3(name = "zero")]
     #[pyo3(signature = (precision = 0))]
@@ -354,20 +360,68 @@ impl Quantity {
 
     #[staticmethod]
     #[pyo3(name = "from_str")]
-    fn py_from_str(value: &str) -> Self {
-        Self::from(value)
+    fn py_from_str(value: &str) -> PyResult<Self> {
+        Self::from_str(value).map_err(to_pyvalue_err)
     }
 
+    /// Creates a new `Quantity` from a `Decimal` value with precision inferred from the decimal's scale.
+    ///
+    /// The precision is determined by the scale of the decimal (number of decimal places).
+    /// The value is rounded to the inferred precision using banker's rounding (round half to even).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The inferred precision exceeds `FIXED_PRECISION`.
+    /// - The decimal value cannot be converted to the raw representation.
+    /// - Overflow occurs during scaling.
+    #[staticmethod]
+    #[pyo3(name = "from_decimal")]
+    fn py_from_decimal(decimal: Decimal) -> PyResult<Self> {
+        Self::from_decimal(decimal).map_err(to_pyvalue_err)
+    }
+
+    /// Creates a new `Quantity` from a `Decimal` value with specified precision.
+    ///
+    /// Uses pure integer arithmetic on the Decimal's mantissa and scale for fast conversion.
+    /// The value is rounded to the specified precision using banker's rounding (round half to even).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `precision` exceeds `FIXED_PRECISION`.
+    /// - The decimal value is negative.
+    /// - The decimal value cannot be converted to the raw representation.
+    /// - Overflow occurs during scaling.
+    #[staticmethod]
+    #[pyo3(name = "from_decimal_dp")]
+    fn py_from_decimal_dp(decimal: Decimal, precision: u8) -> PyResult<Self> {
+        Self::from_decimal_dp(decimal, precision).map_err(to_pyvalue_err)
+    }
+
+    /// Creates a new `Quantity` from a mantissa/exponent pair using pure integer arithmetic.
+    ///
+    /// The value is `mantissa * 10^exponent`. This avoids all floating-point and Decimal
+    /// operations, making it ideal for exchange data that arrives as mantissa/exponent pairs.
+    #[staticmethod]
+    #[pyo3(name = "from_mantissa_exponent")]
+    fn py_from_mantissa_exponent(mantissa: u64, exponent: i8, precision: u8) -> Self {
+        Self::from_mantissa_exponent(mantissa, exponent, precision)
+    }
+
+    /// Returns `true` if the value of this instance is zero.
     #[pyo3(name = "is_zero")]
     fn py_is_zero(&self) -> bool {
         self.is_zero()
     }
 
+    /// Returns `true` if the value of this instance is position (> 0).
     #[pyo3(name = "is_positive")]
     fn py_is_positive(&self) -> bool {
         self.is_positive()
     }
 
+    /// Returns the value of this instance as a `Decimal`.
     #[pyo3(name = "as_decimal")]
     fn py_as_decimal(&self) -> Decimal {
         self.as_decimal()
@@ -381,5 +435,14 @@ impl Quantity {
     #[pyo3(name = "to_formatted_str")]
     fn py_to_formatted_str(&self) -> String {
         self.to_formatted_string()
+    }
+
+    /// Computes a saturating subtraction between two quantities, logging when clamped.
+    ///
+    /// When `rhs` is greater than `self`, the result is clamped to zero and a warning is logged.
+    /// Precision follows the `Sub` implementation: uses the maximum precision of both operands.
+    #[pyo3(name = "saturating_sub")]
+    fn py_saturating_sub(&self, other: Self) -> Self {
+        self.saturating_sub(other)
     }
 }
