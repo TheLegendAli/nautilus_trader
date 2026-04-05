@@ -310,7 +310,7 @@ impl Portfolio {
             },
             |account| match account {
                 AccountAny::Margin(margin_account) => margin_account.initial_margins(),
-                AccountAny::Cash(_) => {
+                AccountAny::Cash(_) | AccountAny::Betting(_) => {
                     log::warn!("Initial margins not applicable for cash account");
                     AHashMap::new()
                 }
@@ -332,7 +332,7 @@ impl Portfolio {
             },
             |account| match account {
                 AccountAny::Margin(margin_account) => margin_account.maintenance_margins(),
-                AccountAny::Cash(_) => {
+                AccountAny::Cash(_) | AccountAny::Betting(_) => {
                     log::warn!("Maintenance margins not applicable for cash account");
                     AHashMap::new()
                 }
@@ -770,20 +770,22 @@ impl Portfolio {
         };
 
         for (instrument, orders_open) in &orders_and_instruments {
-            let mut cache = self.cache.borrow_mut();
-            let account = if let Some(account) = cache.account_for_venue(&instrument.id().venue) {
-                account
-            } else {
-                log::error!(
-                    "Cannot update initial (order) margin: no account registered for {}",
-                    instrument.id().venue
-                );
-                initialized = false;
-                break;
+            let account = {
+                let cache = self.cache.borrow();
+                if let Some(account) = cache.account_for_venue(&instrument.id().venue) {
+                    account.clone()
+                } else {
+                    log::error!(
+                        "Cannot update initial (order) margin: no account registered for {}",
+                        instrument.id().venue
+                    );
+                    initialized = false;
+                    break;
+                }
             };
 
             let result = self.inner.borrow_mut().accounts.update_orders(
-                account,
+                &account,
                 instrument,
                 orders_open.iter().collect(),
                 self.clock.borrow().timestamp_ns(),
@@ -791,7 +793,10 @@ impl Portfolio {
 
             match result {
                 Some((updated_account, _)) => {
-                    cache.update_account(&updated_account).unwrap();
+                    self.cache
+                        .borrow_mut()
+                        .update_account(&updated_account)
+                        .unwrap();
                 }
                 None => {
                     initialized = false;
@@ -888,7 +893,7 @@ impl Portfolio {
             };
 
             let account = match account {
-                AccountAny::Cash(_) => continue,
+                AccountAny::Cash(_) | AccountAny::Betting(_) => continue,
                 AccountAny::Margin(margin_account) => margin_account,
             };
 
@@ -1692,7 +1697,7 @@ fn update_instrument_id(
         portfolio_clone.calculate_unrealized_pnl(instrument_id, None);
 
     if result_init.is_some()
-        && (matches!(account, AccountAny::Cash(_))
+        && (matches!(account, AccountAny::Cash(_) | AccountAny::Betting(_))
             || (result_maint.is_some() && result_unrealized_pnl.is_some()))
     {
         inner.borrow_mut().pending_calcs.remove(instrument_id);
@@ -1725,13 +1730,18 @@ fn update_order(
     };
 
     match account {
+        AccountAny::Margin(margin_account) => {
+            if !margin_account.base.calculate_account_state {
+                return;
+            }
+        }
         AccountAny::Cash(cash_account) => {
             if !cash_account.base.calculate_account_state {
                 return;
             }
         }
-        AccountAny::Margin(margin_account) => {
-            if !margin_account.base.calculate_account_state {
+        AccountAny::Betting(betting_account) => {
+            if !betting_account.base.calculate_account_state {
                 return;
             }
         }

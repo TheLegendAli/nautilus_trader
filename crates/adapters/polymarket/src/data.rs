@@ -441,9 +441,10 @@ impl PolymarketDataClient {
                             ts_event,
                             ts_init,
                         ) {
-                            Ok(quote) => {
+                            Ok(Some(quote)) => {
                                 Self::emit_quote_if_changed(ctx, instrument_id, quote);
                             }
+                            Ok(None) => {} // Missing best_bid/best_ask
                             Err(e) => {
                                 log::error!("Failed to parse quote from price change: {e}");
                             }
@@ -613,7 +614,7 @@ impl PolymarketDataClient {
                                 }
 
                                 // Emit instrument status based on WS active flag
-                                let ts = clock.get_time_ns();
+                                let ts_now = clock.get_time_ns();
                                 let action = if active {
                                     MarketStatusAction::Trading
                                 } else {
@@ -622,8 +623,8 @@ impl PolymarketDataClient {
                                 let status = InstrumentStatus::new(
                                     instrument_id,
                                     action,
-                                    ts,
-                                    ts,
+                                    ts_now,
+                                    ts_now,
                                     None,
                                     None,
                                     None,

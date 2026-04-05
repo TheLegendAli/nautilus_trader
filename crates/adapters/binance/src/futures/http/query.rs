@@ -602,7 +602,7 @@ pub struct BinanceNewAlgoOrderParams {
     #[builder(default)]
     pub reduce_only: Option<bool>,
     /// Activation price for TRAILING_STOP_MARKET orders.
-    #[serde(rename = "activationPrice", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "activatePrice", skip_serializing_if = "Option::is_none")]
     #[builder(default)]
     pub activation_price: Option<String>,
     /// Callback rate for TRAILING_STOP_MARKET orders (0.1 to 10, where 1 = 1%).
@@ -758,5 +758,96 @@ mod tests {
 
         assert_eq!(params.symbol.as_deref(), Some("BNBUSDT"));
         assert!(params.recv_window.is_none());
+    }
+
+    #[rstest]
+    fn test_new_algo_order_params_serialization_uses_activate_price() {
+        let params = BinanceNewAlgoOrderParamsBuilder::default()
+            .symbol("ETHUSDT")
+            .side(BinanceSide::Sell)
+            .order_type(BinanceFuturesOrderType::TrailingStopMarket)
+            .algo_type(BinanceAlgoType::Conditional)
+            .quantity("0.1")
+            .activation_price("10000.00")
+            .callback_rate("0.25")
+            .build()
+            .unwrap();
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            serde_urlencoded::from_str(&serialized).unwrap();
+
+        assert_eq!(query.get("activatePrice"), Some(&"10000.00".to_string()));
+        assert_eq!(query.get("callbackRate"), Some(&"0.25".to_string()));
+        assert!(!query.contains_key("activationPrice"));
+    }
+
+    #[rstest]
+    fn test_new_order_params_with_price_match_serializes_correctly() {
+        let params = BinanceNewOrderParams {
+            symbol: "BTCUSDT".to_string(),
+            side: BinanceSide::Buy,
+            order_type: BinanceFuturesOrderType::Limit,
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            price: None,
+            new_client_order_id: Some("test-order-001".to_string()),
+            stop_price: None,
+            reduce_only: None,
+            position_side: None,
+            close_position: None,
+            activation_price: None,
+            callback_rate: None,
+            working_type: None,
+            price_protect: None,
+            new_order_resp_type: None,
+            good_till_date: None,
+            recv_window: None,
+            price_match: Some(BinancePriceMatch::Opponent5),
+            self_trade_prevention_mode: None,
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            serde_urlencoded::from_str(&serialized).unwrap();
+
+        assert_eq!(query.get("priceMatch"), Some(&"OPPONENT_5".to_string()));
+        assert!(!query.contains_key("price"));
+        assert_eq!(query.get("symbol"), Some(&"BTCUSDT".to_string()));
+        assert_eq!(query.get("side"), Some(&"BUY".to_string()));
+        assert_eq!(query.get("type"), Some(&"LIMIT".to_string()));
+    }
+
+    #[rstest]
+    fn test_new_order_params_without_price_match_omits_field() {
+        let params = BinanceNewOrderParams {
+            symbol: "BTCUSDT".to_string(),
+            side: BinanceSide::Buy,
+            order_type: BinanceFuturesOrderType::Limit,
+            time_in_force: Some(BinanceTimeInForce::Gtc),
+            quantity: Some("0.001".to_string()),
+            price: Some("50000.00".to_string()),
+            new_client_order_id: Some("test-order-002".to_string()),
+            stop_price: None,
+            reduce_only: None,
+            position_side: None,
+            close_position: None,
+            activation_price: None,
+            callback_rate: None,
+            working_type: None,
+            price_protect: None,
+            new_order_resp_type: None,
+            good_till_date: None,
+            recv_window: None,
+            price_match: None,
+            self_trade_prevention_mode: None,
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            serde_urlencoded::from_str(&serialized).unwrap();
+
+        assert!(!query.contains_key("priceMatch"));
+        assert_eq!(query.get("price"), Some(&"50000.00".to_string()));
     }
 }

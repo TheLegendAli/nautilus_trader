@@ -21,7 +21,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
+    cache::fifo::FifoCache,
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
@@ -47,12 +48,12 @@ use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        LiquiditySide, OmsType, OrderSide, OrderType, PositionSideSpecified, TrailingOffsetType,
-        TriggerType,
+        AccountType, LiquiditySide, OmsType, OrderSide, OrderType, PositionSideSpecified,
+        TrailingOffsetType, TriggerType,
     },
     events::{
         AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
-        OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
+        OrderExpired, OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, Symbol, TradeId, Venue,
@@ -75,7 +76,7 @@ use super::{
         query::{
             BatchCancelItem, BinanceAllOrdersParamsBuilder, BinanceOpenOrdersParamsBuilder,
             BinanceOrderQueryParamsBuilder, BinancePositionRiskParamsBuilder,
-            BinanceUserTradesParamsBuilder,
+            BinanceSetLeverageParams, BinanceSetMarginTypeParams, BinanceUserTradesParamsBuilder,
         },
     },
     websocket::{
@@ -109,8 +110,8 @@ use crate::{
         },
         encoder::{decode_broker_id, encode_broker_id},
         enums::{
-            BinanceEnvironment, BinancePositionSide, BinanceProductType, BinanceSide,
-            BinanceTimeInForce, BinanceWorkingType,
+            BinanceEnvironment, BinancePositionSide, BinancePriceMatch, BinanceProductType,
+            BinanceSide, BinanceTimeInForce, BinanceWorkingType,
         },
         symbol::format_binance_symbol,
     },
@@ -190,6 +191,7 @@ impl BinanceFuturesExecutionClient {
             None, // recv_window
             None, // timeout_secs
             None, // proxy_url
+            config.treat_expired_as_canceled,
         )
         .context("failed to construct Binance Futures HTTP client")?;
 
@@ -299,7 +301,21 @@ impl BinanceFuturesExecutionClient {
 
     /// Converts Binance futures account info to Nautilus account state.
     fn create_account_state(&self, account_info: &BinanceFuturesAccountInfo) -> AccountState {
-        let ts_now = self.clock.get_time_ns();
+        Self::create_account_state_from(
+            account_info,
+            self.core.account_id,
+            self.core.account_type,
+            self.clock,
+        )
+    }
+
+    fn create_account_state_from(
+        account_info: &BinanceFuturesAccountInfo,
+        account_id: AccountId,
+        account_type: AccountType,
+        clock: &'static AtomicTime,
+    ) -> AccountState {
+        let ts_now = clock.get_time_ns();
 
         let balances: Vec<AccountBalance> = account_info
             .assets
@@ -350,8 +366,8 @@ impl BinanceFuturesExecutionClient {
         }
 
         AccountState::new(
-            self.core.account_id,
-            self.core.account_type,
+            account_id,
+            account_type,
             balances,
             margins,
             true, // reported
@@ -374,18 +390,29 @@ impl BinanceFuturesExecutionClient {
         Ok(self.create_account_state(&account_info))
     }
 
-    fn update_account_state(&self) -> anyhow::Result<()> {
-        let runtime = get_runtime();
-        let account_state = runtime.block_on(self.refresh_account_state())?;
+    fn update_account_state(&self) {
+        let http_client = self.http_client.clone();
+        let account_id = self.core.account_id;
+        let account_type = self.core.account_type;
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
 
-        let ts_now = self.clock.get_time_ns();
-        self.emitter.emit_account_state(
-            account_state.balances.clone(),
-            account_state.margins.clone(),
-            account_state.is_reported,
-            ts_now,
-        );
-        Ok(())
+        self.spawn_task("query_account", async move {
+            let account_info = http_client
+                .query_account()
+                .await
+                .context("Binance Futures account state request failed")?;
+            let account_state =
+                Self::create_account_state_from(&account_info, account_id, account_type, clock);
+            let ts_now = clock.get_time_ns();
+            emitter.emit_account_state(
+                account_state.balances.clone(),
+                account_state.margins.clone(),
+                account_state.is_reported,
+                ts_now,
+            );
+            Ok(())
+        });
     }
 
     async fn init_hedge_mode(&self) -> anyhow::Result<bool> {
@@ -436,6 +463,7 @@ impl BinanceFuturesExecutionClient {
                 strategy_id,
                 order_side,
                 order_type,
+                price,
             },
         );
 
@@ -447,20 +475,15 @@ impl BinanceFuturesExecutionClient {
             .and_then(|p| p.get_bool("close_position"))
             .unwrap_or(false);
 
-        // Convert trailing offset (basis points) to Binance callback rate (percentage).
-        // Binance accepts 1 decimal place (0.1% granularity = 10 bp increments).
+        let price_match = cmd
+            .params
+            .as_ref()
+            .and_then(|p| p.get_str("price_match"))
+            .map(BinancePriceMatch::from_param)
+            .transpose()?;
+
         let callback_rate = trailing_offset
-            .map(|offset| {
-                let rate = offset / rust_decimal::Decimal::ONE_HUNDRED;
-                let rounded = rate.round_dp(1);
-                if rounded != rate {
-                    anyhow::bail!(
-                        "Trailing offset {offset} bp is not a multiple of 10 bp \
-                         (Binance requires 0.1% granularity)"
-                    );
-                }
-                Ok(rounded.to_string())
-            })
+            .map(trailing_offset_to_callback_rate_string)
             .transpose()?;
 
         let working_type = match trigger_type {
@@ -504,7 +527,11 @@ impl BinanceFuturesExecutionClient {
                     None
                 },
                 quantity: Some(quantity.to_string()),
-                price: price.map(|p| p.to_string()),
+                price: if price_match.is_some() {
+                    None
+                } else {
+                    price.map(|p| p.to_string())
+                },
                 new_client_order_id: Some(client_id_str),
                 stop_price: trigger_price.map(|p| p.to_string()),
                 reduce_only: if reduce_only { Some(true) } else { None },
@@ -517,7 +544,7 @@ impl BinanceFuturesExecutionClient {
                 new_order_resp_type: None,
                 good_till_date: None,
                 recv_window: None,
-                price_match: None,
+                price_match,
                 self_trade_prevention_mode: None,
             };
 
@@ -598,6 +625,7 @@ impl BinanceFuturesExecutionClient {
                         reduce_only,
                         post_only,
                         position_side,
+                        price_match,
                     )
                     .await
             };
@@ -681,12 +709,29 @@ impl BinanceFuturesExecutionClient {
             cancel_builder.symbol(instrument_id.symbol.to_string());
 
             if let Some(venue_id) = venue_order_id {
-                cancel_builder.order_id(
-                    venue_id
-                        .inner()
-                        .parse::<i64>()
-                        .expect("venue_order_id should be numeric"),
-                );
+                match venue_id.inner().parse::<i64>() {
+                    Ok(order_id) => {
+                        cancel_builder.order_id(order_id);
+                    }
+                    Err(e) => {
+                        let ts_now = clock.get_time_ns();
+                        let rejected = OrderCancelRejected::new(
+                            trader_id,
+                            command.strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            format!("failed to parse venue_order_id: {e}").into(),
+                            UUID4::new(),
+                            ts_now,
+                            ts_now,
+                            false,
+                            venue_order_id,
+                            Some(account_id),
+                        );
+                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                        return;
+                    }
+                }
             }
 
             cancel_builder.orig_client_order_id(encode_broker_id(
@@ -694,38 +739,41 @@ impl BinanceFuturesExecutionClient {
                 BINANCE_NAUTILUS_FUTURES_BROKER_ID,
             ));
 
-            let params = cancel_builder.build().expect("valid cancel params");
+            let params = cancel_builder.build().unwrap();
+
+            // Pre-register before sending to avoid response racing the insert
+            let request_id = ws_client.next_request_id();
+            dispatch_state.pending_requests.insert(
+                request_id.clone(),
+                PendingRequest {
+                    client_order_id,
+                    venue_order_id,
+                    operation: PendingOperation::Cancel,
+                },
+            );
 
             self.spawn_task("cancel_order_ws", async move {
-                match ws_client.cancel_order(params).await {
-                    Ok(request_id) => {
-                        dispatch_state.pending_requests.insert(
-                            request_id,
-                            PendingRequest {
-                                client_order_id,
-                                venue_order_id,
-                                operation: PendingOperation::Cancel,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        let ts_now = clock.get_time_ns();
-                        let rejected = OrderCancelRejected::new(
-                            trader_id,
-                            command.strategy_id,
-                            command.instrument_id,
-                            client_order_id,
-                            format!("ws-cancel-order-error: {e}").into(),
-                            UUID4::new(),
-                            ts_now,
-                            ts_now,
-                            false,
-                            command.venue_order_id,
-                            Some(account_id),
-                        );
-                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
-                        anyhow::bail!("WS cancel order failed: {e}");
-                    }
+                if let Err(e) = ws_client
+                    .cancel_order_with_id(request_id.clone(), params)
+                    .await
+                {
+                    dispatch_state.pending_requests.remove(&request_id);
+                    let ts_now = clock.get_time_ns();
+                    let rejected = OrderCancelRejected::new(
+                        trader_id,
+                        command.strategy_id,
+                        command.instrument_id,
+                        client_order_id,
+                        format!("ws-cancel-order-error: {e}").into(),
+                        UUID4::new(),
+                        ts_now,
+                        ts_now,
+                        false,
+                        command.venue_order_id,
+                        Some(account_id),
+                    );
+                    emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                    anyhow::bail!("WS cancel order failed: {e}");
                 }
                 Ok(())
             });
@@ -790,51 +838,11 @@ impl BinanceFuturesExecutionClient {
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let runtime = get_runtime();
-        let handle = runtime.spawn(async move {
-            if let Err(e) = fut.await {
-                log::warn!("{description} failed: {e}");
-            }
-        });
-
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        crate::common::execution::spawn_task(&self.pending_tasks, description, fut);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
-    }
-
-    async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
-        let account_id = self.core.account_id;
-
-        if self.core.cache().account(&account_id).is_some() {
-            log::info!("Account {account_id} registered");
-            return Ok(());
-        }
-
-        let start = Instant::now();
-        let timeout = Duration::from_secs_f64(timeout_secs);
-        let interval = Duration::from_millis(10);
-
-        loop {
-            tokio::time::sleep(interval).await;
-
-            if self.core.cache().account(&account_id).is_some() {
-                log::info!("Account {account_id} registered");
-                return Ok(());
-            }
-
-            if start.elapsed() >= timeout {
-                anyhow::bail!(
-                    "Timeout waiting for account {account_id} to be registered after {timeout_secs}s"
-                );
-            }
-        }
+        crate::common::execution::abort_pending_tasks(&self.pending_tasks);
     }
 
     /// Returns the (price_precision, size_precision) for an instrument.
@@ -885,6 +893,50 @@ impl BinanceFuturesExecutionClient {
             None, // venue_position_id
             Some(entry_price),
         ))
+    }
+
+    async fn apply_futures_config(&self) -> anyhow::Result<()> {
+        if let Some(ref leverages) = self.config.futures_leverages {
+            for (symbol, leverage) in leverages {
+                let params = BinanceSetLeverageParams {
+                    symbol: symbol.clone(),
+                    leverage: *leverage,
+                    recv_window: None,
+                };
+                let response = self
+                    .http_client
+                    .set_leverage(&params)
+                    .await
+                    .context(format!("failed to set leverage for {symbol}"))?;
+                log::info!("Set leverage {} {}X", response.symbol, response.leverage);
+            }
+        }
+
+        if let Some(ref margin_types) = self.config.futures_margin_types {
+            for (symbol, margin_type) in margin_types {
+                let params = BinanceSetMarginTypeParams {
+                    symbol: symbol.clone(),
+                    margin_type: *margin_type,
+                    recv_window: None,
+                };
+                match self.http_client.set_margin_type(&params).await {
+                    Ok(_) => {
+                        log::info!("Set {symbol} margin type to {margin_type:?}");
+                    }
+                    Err(e) => {
+                        let err_str = format!("{e}");
+                        if err_str.contains("-4046") {
+                            log::info!("{symbol} margin type already {margin_type:?}");
+                        } else {
+                            return Err(e)
+                                .context(format!("failed to set margin type for {symbol}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -950,6 +1002,11 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             instruments
         };
 
+        // Apply configured leverage and margin types
+        self.apply_futures_config()
+            .await
+            .context("failed to apply futures config")?;
+
         // Create listen key for user data stream
         log::info!("Creating listen key for user data stream...");
         let listen_key_response = self
@@ -990,10 +1047,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             let product_type = self.product_type;
             let use_position_ids = self.config.use_position_ids;
             let default_taker_fee = self.config.default_taker_fee;
+            let treat_expired_as_canceled = self.config.treat_expired_as_canceled;
             let dispatch_state = self.dispatch_state.clone();
             let triggered_algo_ids = self.triggered_algo_order_ids.clone();
             let algo_client_ids = self.algo_client_order_ids.clone();
             let cancel = self.cancellation_token.clone();
+            let seen_trade_ids: Arc<Mutex<FifoCache<(ustr::Ustr, i64), 10_000>>> =
+                Arc::new(Mutex::new(FifoCache::new()));
 
             let ws_task = get_runtime().spawn(async move {
                 pin_mut!(stream);
@@ -1012,6 +1072,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                 &algo_client_ids,
                                 use_position_ids,
                                 default_taker_fee,
+                                treat_expired_as_canceled,
+                                &seen_trade_ids,
                             );
                         }
                         () = cancel.cancelled() => {
@@ -1076,7 +1138,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         self.emitter.send_account_state(account_state);
 
-        self.await_account_registered(30.0).await?;
+        crate::common::execution::await_account_registered(&self.core, self.core.account_id, 30.0)
+            .await?;
 
         // Connect WS trading client (primary order transport for USD-M)
         if let Some(ref mut ws_trading) = self.ws_trading_client {
@@ -1178,11 +1241,15 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         };
 
         let symbol = instrument_id.symbol.to_string();
-        let order_id = cmd.venue_order_id.as_ref().map(|id| {
-            id.inner()
-                .parse::<i64>()
-                .expect("venue_order_id should be numeric")
-        });
+        let order_id = cmd
+            .venue_order_id
+            .as_ref()
+            .map(|id| {
+                id.inner()
+                    .parse::<i64>()
+                    .context("failed to parse venue_order_id as numeric")
+            })
+            .transpose()?;
         let orig_client_order_id = cmd
             .client_order_id
             .map(|id| encode_broker_id(&id, BINANCE_NAUTILUS_FUTURES_BROKER_ID));
@@ -1208,6 +1275,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     self.core.account_id,
                     instrument_id,
                     size_precision,
+                    self.config.treat_expired_as_canceled,
                     ts_init,
                 )?;
                 Ok(Some(report))
@@ -1267,6 +1335,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                         self.core.account_id,
                         instrument_id,
                         size_precision,
+                        self.config.treat_expired_as_canceled,
                         ts_init,
                     ) {
                         reports.push(report);
@@ -1281,6 +1350,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                             self.core.account_id,
                             instrument.id(),
                             instrument.size_precision(),
+                            self.config.treat_expired_as_canceled,
                             ts_init,
                         )
                     {
@@ -1347,6 +1417,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     self.core.account_id,
                     instrument_id,
                     size_precision,
+                    self.config.treat_expired_as_canceled,
                     ts_init,
                 ) {
                     reports.push(report);
@@ -1495,7 +1566,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
     }
 
     fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
-        self.update_account_state()
+        self.update_account_state();
+        Ok(())
     }
 
     fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
@@ -1508,16 +1580,20 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let clock = self.clock;
 
         let symbol = command.instrument_id.symbol.to_string();
-        let order_id = command.venue_order_id.map(|id| {
-            id.inner()
-                .parse::<i64>()
-                .expect("venue_order_id should be numeric")
-        });
+        let order_id = command
+            .venue_order_id
+            .map(|id| {
+                id.inner()
+                    .parse::<i64>()
+                    .map_err(|e| anyhow::anyhow!("failed to parse venue_order_id: {e}"))
+            })
+            .transpose()?;
         let orig_client_order_id = Some(encode_broker_id(
             &command.client_order_id,
             BINANCE_NAUTILUS_FUTURES_BROKER_ID,
         ));
         let (_, size_precision) = self.get_instrument_precision(command.instrument_id);
+        let treat_expired_as_canceled = self.config.treat_expired_as_canceled;
 
         self.spawn_task("query_order", async move {
             let mut builder = BinanceOrderQueryParamsBuilder::default();
@@ -1530,7 +1606,9 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             if let Some(coid) = orig_client_order_id {
                 builder.orig_client_order_id(coid);
             }
-            let params = builder.build().expect("order query params");
+            let params = builder
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build order query params: {e}"))?;
 
             let result = http_client.query_order(&params).await;
 
@@ -1541,6 +1619,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                         account_id,
                         command.instrument_id,
                         size_precision,
+                        treat_expired_as_canceled,
                         ts_init,
                     )?;
 
@@ -1607,9 +1686,23 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             return Ok(());
         }
 
+        self.cancellation_token.cancel();
+
+        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.ws_task.lock().expect(MUTEX_POISONED).take() {
+            handle.abort();
+        }
+
+        if let Some(handle) = self.keepalive_task.lock().expect(MUTEX_POISONED).take() {
+            handle.abort();
+        }
+
+        self.abort_pending_tasks();
         self.core.set_stopped();
         self.core.set_disconnected();
-        self.abort_pending_tasks();
         log::info!("Stopped: client_id={}", self.core.client_id);
         Ok(())
     }
@@ -1638,12 +1731,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             }
 
             if let Some(offset) = order.trailing_offset() {
-                let rate = (offset / rust_decimal::Decimal::ONE_HUNDRED).round_dp(1);
-                if rate < rust_decimal::Decimal::new(1, 1)
-                    || rate > rust_decimal::Decimal::new(10, 0)
-                {
-                    anyhow::bail!("callbackRate {rate}% out of Binance range [0.1, 10.0]");
-                }
+                trailing_offset_to_callback_rate(offset)?;
             }
         }
 
@@ -1668,6 +1756,19 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             if order.is_reduce_only() {
                 anyhow::bail!("`close_position` cannot be combined with `reduce_only` on Binance");
             }
+        }
+
+        if let Some(pm_str) = cmd.params.as_ref().and_then(|p| p.get_str("price_match")) {
+            BinancePriceMatch::from_param(pm_str)?;
+            let order_type = order.order_type();
+            anyhow::ensure!(
+                !order.is_post_only(),
+                "price_match cannot be combined with post-only orders"
+            );
+            anyhow::ensure!(
+                order_type == OrderType::Limit,
+                "price_match is not supported for order type {order_type:?}"
+            );
         }
 
         log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
@@ -1769,50 +1870,54 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 .price(price.to_string());
 
             if let Some(venue_id) = venue_order_id {
-                modify_builder.order_id(
-                    venue_id
-                        .inner()
-                        .parse::<i64>()
-                        .expect("venue_order_id should be numeric"),
-                );
+                let order_id: i64 = venue_id
+                    .inner()
+                    .parse()
+                    .context("failed to parse venue_order_id as numeric")?;
+                modify_builder.order_id(order_id);
             }
 
             if let Some(client_id) = orig_client_order_id {
                 modify_builder.orig_client_order_id(client_id);
             }
 
-            let params = modify_builder.build().expect("valid modify params");
+            let params = modify_builder
+                .build()
+                .context("failed to build modify params")?;
+
+            // Pre-register before sending to avoid response racing the insert
+            let request_id = ws_client.next_request_id();
+            dispatch_state.pending_requests.insert(
+                request_id.clone(),
+                PendingRequest {
+                    client_order_id: command.client_order_id,
+                    venue_order_id,
+                    operation: PendingOperation::Modify,
+                },
+            );
 
             self.spawn_task("modify_order_ws", async move {
-                match ws_client.modify_order(params).await {
-                    Ok(request_id) => {
-                        dispatch_state.pending_requests.insert(
-                            request_id,
-                            PendingRequest {
-                                client_order_id: command.client_order_id,
-                                venue_order_id,
-                                operation: PendingOperation::Modify,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        let ts_now = clock.get_time_ns();
-                        let rejected = OrderModifyRejected::new(
-                            trader_id,
-                            command.strategy_id,
-                            command.instrument_id,
-                            command.client_order_id,
-                            format!("ws-modify-order-error: {e}").into(),
-                            UUID4::new(),
-                            ts_now,
-                            ts_now,
-                            false,
-                            command.venue_order_id,
-                            Some(account_id),
-                        );
-                        emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
-                        anyhow::bail!("WS modify order failed: {e}");
-                    }
+                if let Err(e) = ws_client
+                    .modify_order_with_id(request_id.clone(), params)
+                    .await
+                {
+                    dispatch_state.pending_requests.remove(&request_id);
+                    let ts_now = clock.get_time_ns();
+                    let rejected = OrderModifyRejected::new(
+                        trader_id,
+                        command.strategy_id,
+                        command.instrument_id,
+                        command.client_order_id,
+                        format!("ws-modify-order-error: {e}").into(),
+                        UUID4::new(),
+                        ts_now,
+                        ts_now,
+                        false,
+                        command.venue_order_id,
+                        Some(account_id),
+                    );
+                    emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
+                    anyhow::bail!("WS modify order failed: {e}");
                 }
                 Ok(())
             });
@@ -2076,6 +2181,8 @@ fn dispatch_ws_message(
     algo_client_ids: &Arc<AtomicSet<ClientOrderId>>,
     use_position_ids: bool,
     default_taker_fee: Decimal,
+    treat_expired_as_canceled: bool,
+    seen_trade_ids: &Arc<Mutex<FifoCache<(ustr::Ustr, i64), 10_000>>>,
 ) {
     match msg {
         BinanceFuturesWsStreamsMessage::OrderUpdate(update) => {
@@ -2089,6 +2196,8 @@ fn dispatch_ws_message(
                 dispatch_state,
                 use_position_ids,
                 default_taker_fee,
+                treat_expired_as_canceled,
+                seen_trade_ids,
             );
         }
         BinanceFuturesWsStreamsMessage::AlgoUpdate(update) => {
@@ -2166,6 +2275,8 @@ fn dispatch_order_update(
     dispatch_state: &WsDispatchState,
     use_position_ids: bool,
     default_taker_fee: Decimal,
+    treat_expired_as_canceled: bool,
+    seen_trade_ids: &Arc<Mutex<FifoCache<(ustr::Ustr, i64), 10_000>>>,
 ) {
     let order = &msg.order;
     let symbol_ustr = ustr::Ustr::from(order.symbol.as_str());
@@ -2230,6 +2341,7 @@ fn dispatch_order_update(
             taker_fee,
             quote_currency,
             venue_position_id,
+            seen_trade_ids,
         );
         return;
     }
@@ -2264,8 +2376,60 @@ fn dispatch_order_update(
                     false,
                 );
                 emitter.send_order_event(OrderEventAny::Accepted(accepted));
+
+                // Detect venue-assigned price changes (e.g. priceMatch orders)
+                if let Some(submitted_price) = identity.price {
+                    let venue_price: f64 = order.original_price.parse().unwrap_or(0.0);
+                    if venue_price > 0.0 {
+                        let venue_price = Price::new(venue_price, price_precision);
+                        let submitted_at_precision =
+                            Price::new(submitted_price.as_f64(), price_precision);
+
+                        if venue_price != submitted_at_precision {
+                            let quantity: f64 = order.original_qty.parse().unwrap_or(0.0);
+                            let trigger_price: f64 = order.stop_price.parse().unwrap_or(0.0);
+                            let updated = OrderUpdated::new(
+                                emitter.trader_id(),
+                                identity.strategy_id,
+                                identity.instrument_id,
+                                client_order_id,
+                                Quantity::new(quantity, size_precision),
+                                UUID4::new(),
+                                ts_event,
+                                ts_init,
+                                false,
+                                Some(venue_order_id),
+                                Some(account_id),
+                                Some(venue_price),
+                                if trigger_price > 0.0 {
+                                    Some(Price::new(trigger_price, price_precision))
+                                } else {
+                                    None
+                                },
+                                None,
+                                false,
+                            );
+                            emitter.send_order_event(OrderEventAny::Updated(updated));
+                        }
+                    }
+                }
             }
             BinanceExecutionType::Trade => {
+                let dedup_key = (order.symbol, order.trade_id);
+                let mut guard = seen_trade_ids.lock().expect(MUTEX_POISONED);
+                let is_duplicate = guard.contains(&dedup_key);
+                guard.add(dedup_key);
+                drop(guard);
+
+                if is_duplicate {
+                    log::debug!(
+                        "Duplicate trade_id={} for {}, skipping",
+                        order.trade_id,
+                        order.symbol
+                    );
+                    return;
+                }
+
                 ensure_accepted_emitted(
                     client_order_id,
                     account_id,
@@ -2326,7 +2490,7 @@ fn dispatch_order_update(
                     dispatch_state.cleanup_terminal(client_order_id);
                 }
             }
-            BinanceExecutionType::Canceled | BinanceExecutionType::Expired => {
+            BinanceExecutionType::Canceled => {
                 ensure_accepted_emitted(
                     client_order_id,
                     account_id,
@@ -2350,6 +2514,48 @@ fn dispatch_order_update(
                 );
                 dispatch_state.cleanup_terminal(client_order_id);
                 emitter.send_order_event(OrderEventAny::Canceled(canceled));
+            }
+            BinanceExecutionType::Expired => {
+                ensure_accepted_emitted(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    &identity,
+                    emitter,
+                    dispatch_state,
+                    ts_init,
+                );
+                dispatch_state.cleanup_terminal(client_order_id);
+
+                if treat_expired_as_canceled {
+                    let canceled = OrderCanceled::new(
+                        emitter.trader_id(),
+                        identity.strategy_id,
+                        identity.instrument_id,
+                        client_order_id,
+                        UUID4::new(),
+                        ts_event,
+                        ts_init,
+                        false,
+                        Some(venue_order_id),
+                        Some(account_id),
+                    );
+                    emitter.send_order_event(OrderEventAny::Canceled(canceled));
+                } else {
+                    let expired = OrderExpired::new(
+                        emitter.trader_id(),
+                        identity.strategy_id,
+                        identity.instrument_id,
+                        client_order_id,
+                        UUID4::new(),
+                        ts_event,
+                        ts_init,
+                        false,
+                        Some(venue_order_id),
+                        Some(account_id),
+                    );
+                    emitter.send_order_event(OrderEventAny::Expired(expired));
+                }
             }
             BinanceExecutionType::Amendment => {
                 let quantity: f64 = order.original_qty.parse().unwrap_or(0.0);
@@ -2389,6 +2595,21 @@ fn dispatch_order_update(
         // adapter could split a partially filled order across two positions.
         match order.execution_type {
             BinanceExecutionType::Trade => {
+                let dedup_key = (order.symbol, order.trade_id);
+                let mut guard = seen_trade_ids.lock().expect(MUTEX_POISONED);
+                let is_duplicate = guard.contains(&dedup_key);
+                guard.add(dedup_key);
+                drop(guard);
+
+                if is_duplicate {
+                    log::debug!(
+                        "Duplicate trade_id={} for {}, skipping",
+                        order.trade_id,
+                        order.symbol
+                    );
+                    return;
+                }
+
                 match parse_futures_order_update_to_fill(
                     msg,
                     account_id,
@@ -2409,6 +2630,7 @@ fn dispatch_order_update(
                     price_precision,
                     size_precision,
                     account_id,
+                    treat_expired_as_canceled,
                     ts_init,
                 ) {
                     Ok(status) => emitter.send_order_status_report(status),
@@ -2425,6 +2647,7 @@ fn dispatch_order_update(
                     price_precision,
                     size_precision,
                     account_id,
+                    treat_expired_as_canceled,
                     ts_init,
                 ) {
                     Ok(status) => emitter.send_order_status_report(status),
@@ -2485,6 +2708,7 @@ fn dispatch_exchange_generated_fill(
     taker_fee: Option<Decimal>,
     quote_currency: Currency,
     venue_position_id: Option<PositionId>,
+    seen_trade_ids: &Arc<Mutex<FifoCache<(ustr::Ustr, i64), 10_000>>>,
 ) {
     let order = &msg.order;
     let last_qty: f64 = order.last_filled_qty.parse().unwrap_or(0.0);
@@ -2503,6 +2727,21 @@ fn dispatch_exchange_generated_fill(
             order.symbol,
             order.client_order_id,
             order.order_status,
+        );
+        return;
+    }
+
+    let dedup_key = (order.symbol, order.trade_id);
+    let mut guard = seen_trade_ids.lock().expect(MUTEX_POISONED);
+    let is_duplicate = guard.contains(&dedup_key);
+    guard.add(dedup_key);
+    drop(guard);
+
+    if is_duplicate {
+        log::debug!(
+            "Duplicate trade_id={} for {}, skipping",
+            order.trade_id,
+            order.symbol
         );
         return;
     }
@@ -2535,6 +2774,7 @@ fn dispatch_exchange_generated_fill(
         price_precision,
         size_precision,
         account_id,
+        false, // Exchange-generated fills are not subject to expired-as-canceled
         ts_init,
     ) {
         Ok(status) => emitter.send_order_status_report(status),
@@ -2794,7 +3034,7 @@ fn dispatch_ws_trading_message(
                     ts_now,
                     ts_now,
                     false,
-                    None,
+                    pending.venue_order_id,
                     Some(account_id),
                 );
                 emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
@@ -2833,7 +3073,7 @@ fn dispatch_ws_trading_message(
                     ts_now,
                     ts_now,
                     false,
-                    None,
+                    pending.venue_order_id,
                     Some(account_id),
                 );
                 emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
@@ -2855,11 +3095,46 @@ fn dispatch_ws_trading_message(
     }
 }
 
+fn trailing_offset_to_callback_rate(offset: Decimal) -> anyhow::Result<Decimal> {
+    let rate = offset / rust_decimal::Decimal::ONE_HUNDRED;
+    let min_rate = rust_decimal::Decimal::new(1, 1);
+    let max_rate = rust_decimal::Decimal::new(100, 1);
+
+    if rate < min_rate || rate > max_rate {
+        anyhow::bail!("callbackRate {rate}% out of Binance range [{min_rate}, {max_rate}]");
+    }
+
+    Ok(rate)
+}
+
+fn trailing_offset_to_callback_rate_string(offset: Decimal) -> anyhow::Result<String> {
+    let rate = trailing_offset_to_callback_rate(offset)?;
+    Ok(format_callback_rate(rate))
+}
+
+fn format_callback_rate(rate: Decimal) -> String {
+    let normalized = rate.normalize();
+
+    if normalized.scale() == 0 {
+        format!("{normalized}.0")
+    } else {
+        normalized.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use nautilus_common::messages::{ExecutionEvent, ExecutionReport};
+    use nautilus_core::time::get_atomic_clock_realtime;
+    use nautilus_model::{
+        enums::{AccountType, OrderStatus},
+        identifiers::{StrategyId, TraderId},
+    };
     use rstest::rstest;
+    use serde::de::DeserializeOwned;
 
     use super::*;
+    use crate::common::testing::load_fixture_string;
 
     #[rstest]
     #[case::long(BinancePositionSide::Long, "ETHUSDT-PERP.BINANCE-LONG")]
@@ -2883,5 +3158,371 @@ mod tests {
         let instrument_id = InstrumentId::from("ETHUSDT-PERP.BINANCE");
         let result = make_venue_position_id(false, instrument_id, side);
         assert_eq!(result, None);
+    }
+
+    #[rstest]
+    fn test_trailing_offset_to_callback_rate_preserves_precision() {
+        let rate = trailing_offset_to_callback_rate(Decimal::from(25)).unwrap();
+        assert_eq!(rate, Decimal::new(25, 2));
+    }
+
+    #[rstest]
+    fn test_trailing_offset_to_callback_rate_string_formats_whole_percent() {
+        let rate = trailing_offset_to_callback_rate_string(Decimal::from(100)).unwrap();
+        assert_eq!(rate, "1.0");
+    }
+
+    #[rstest]
+    fn test_trailing_offset_to_callback_rate_rejects_out_of_range_values() {
+        let error = trailing_offset_to_callback_rate(Decimal::from(5)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "callbackRate 0.05% out of Binance range [0.1, 10.0]"
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_order_update_skips_duplicate_tracked_trade() {
+        let clock = get_atomic_clock_realtime();
+        let msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_trade.json");
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = create_tracked_dispatch_state(
+            ClientOrderId::from("TEST"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+        );
+        let seen_trade_ids = Arc::new(Mutex::new(FifoCache::new()));
+
+        dispatch_order_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            true,
+            Decimal::new(4, 4),
+            false,
+            &seen_trade_ids,
+        );
+        dispatch_order_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            true,
+            Decimal::new(4, 4),
+            false,
+            &seen_trade_ids,
+        );
+
+        let events = collect_events(&mut rx);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::Order(OrderEventAny::Accepted(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ExecutionEvent::Order(OrderEventAny::Filled(fill))
+                        if fill.trade_id == TradeId::new("12345678")
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_order_update_skips_duplicate_untracked_trade() {
+        let clock = get_atomic_clock_realtime();
+        let msg: BinanceFuturesOrderUpdateMsg = load_user_data_fixture("order_update_trade.json");
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = WsDispatchState::default();
+        let seen_trade_ids = Arc::new(Mutex::new(FifoCache::new()));
+
+        dispatch_order_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            true,
+            Decimal::new(4, 4),
+            false,
+            &seen_trade_ids,
+        );
+        dispatch_order_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            true,
+            Decimal::new(4, 4),
+            false,
+            &seen_trade_ids,
+        );
+
+        let events = collect_events(&mut rx);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ExecutionEvent::Report(ExecutionReport::Fill(fill))
+                        if fill.trade_id == TradeId::new("12345678")
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ExecutionEvent::Report(ExecutionReport::Order(status))
+                        if status.client_order_id == Some(ClientOrderId::from("TEST"))
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_order_update_skips_duplicate_exchange_generated_fill() {
+        let clock = get_atomic_clock_realtime();
+        let msg: BinanceFuturesOrderUpdateMsg =
+            load_user_data_fixture("order_update_calculated.json");
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let http_client = create_test_http_client(clock);
+        let dispatch_state = WsDispatchState::default();
+        let seen_trade_ids = Arc::new(Mutex::new(FifoCache::new()));
+
+        dispatch_order_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            true,
+            Decimal::new(4, 4),
+            false,
+            &seen_trade_ids,
+        );
+        dispatch_order_update(
+            &msg,
+            &emitter,
+            &http_client,
+            AccountId::from("BINANCE-001"),
+            BinanceProductType::UsdM,
+            clock,
+            &dispatch_state,
+            true,
+            Decimal::new(4, 4),
+            false,
+            &seen_trade_ids,
+        );
+
+        let events = collect_events(&mut rx);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ExecutionEvent::Report(ExecutionReport::Fill(fill))
+                        if fill.trade_id == TradeId::new("12345999")
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ExecutionEvent::Report(ExecutionReport::Order(status))
+                        if status.order_status == OrderStatus::Filled
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[rstest]
+    fn test_dispatch_ws_trading_message_emits_cancel_rejected_and_clears_pending_request() {
+        let clock = get_atomic_clock_realtime();
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let dispatch_state = create_tracked_dispatch_state(
+            ClientOrderId::from("TEST"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+        );
+        dispatch_state.pending_requests.insert(
+            "req-cancel".to_string(),
+            PendingRequest {
+                client_order_id: ClientOrderId::from("TEST"),
+                venue_order_id: Some(VenueOrderId::from("12345")),
+                operation: PendingOperation::Cancel,
+            },
+        );
+
+        dispatch_ws_trading_message(
+            BinanceFuturesWsTradingMessage::CancelRejected {
+                request_id: "req-cancel".to_string(),
+                code: -2011,
+                msg: "Unknown order sent".to_string(),
+            },
+            &emitter,
+            AccountId::from("BINANCE-001"),
+            clock,
+            &dispatch_state,
+        );
+
+        assert!(dispatch_state.pending_requests.get("req-cancel").is_none());
+
+        match rx
+            .try_recv()
+            .expect("Cancel rejection event should be emitted")
+        {
+            ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
+                assert_eq!(event.client_order_id, ClientOrderId::from("TEST"));
+                assert_eq!(event.account_id, Some(AccountId::from("BINANCE-001")));
+                assert!(event.reason.as_str().contains("code=-2011"));
+            }
+            other => panic!("Expected CancelRejected event, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_dispatch_ws_trading_message_emits_modify_rejected_and_clears_pending_request() {
+        let clock = get_atomic_clock_realtime();
+        let (emitter, mut rx) = create_test_emitter(clock);
+        let dispatch_state = create_tracked_dispatch_state(
+            ClientOrderId::from("TEST"),
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+        );
+        dispatch_state.pending_requests.insert(
+            "req-modify".to_string(),
+            PendingRequest {
+                client_order_id: ClientOrderId::from("TEST"),
+                venue_order_id: Some(VenueOrderId::from("12345")),
+                operation: PendingOperation::Modify,
+            },
+        );
+
+        dispatch_ws_trading_message(
+            BinanceFuturesWsTradingMessage::ModifyRejected {
+                request_id: "req-modify".to_string(),
+                code: -4028,
+                msg: "Price or quantity not changed".to_string(),
+            },
+            &emitter,
+            AccountId::from("BINANCE-001"),
+            clock,
+            &dispatch_state,
+        );
+
+        assert!(dispatch_state.pending_requests.get("req-modify").is_none());
+
+        match rx
+            .try_recv()
+            .expect("Modify rejection event should be emitted")
+        {
+            ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) => {
+                assert_eq!(event.client_order_id, ClientOrderId::from("TEST"));
+                assert_eq!(event.account_id, Some(AccountId::from("BINANCE-001")));
+                assert!(event.reason.as_str().contains("code=-4028"));
+            }
+            other => panic!("Expected ModifyRejected event, was {other:?}"),
+        }
+    }
+
+    fn collect_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) -> Vec<ExecutionEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn create_test_emitter(
+        clock: &'static AtomicTime,
+    ) -> (
+        ExecutionEventEmitter,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TESTER-001"),
+            AccountId::from("BINANCE-001"),
+            AccountType::Margin,
+            None,
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(tx);
+        (emitter, rx)
+    }
+
+    fn create_test_http_client(clock: &'static AtomicTime) -> BinanceFuturesHttpClient {
+        BinanceFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Mainnet,
+            clock,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("Test HTTP client should be created")
+    }
+
+    fn create_tracked_dispatch_state(
+        client_order_id: ClientOrderId,
+        instrument_id: InstrumentId,
+    ) -> WsDispatchState {
+        let dispatch_state = WsDispatchState::default();
+        dispatch_state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                instrument_id,
+                strategy_id: StrategyId::from("TEST-STRATEGY"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                price: None,
+            },
+        );
+        dispatch_state
+    }
+
+    fn load_user_data_fixture<T: DeserializeOwned>(filename: &str) -> T {
+        let path = format!("futures/user_data_json/{filename}");
+        serde_json::from_str(&load_fixture_string(&path))
+            .unwrap_or_else(|e| panic!("Failed to parse fixture {path}: {e}"))
     }
 }

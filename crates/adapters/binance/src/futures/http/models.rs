@@ -943,6 +943,7 @@ impl BinanceFuturesOrder {
         account_id: AccountId,
         instrument_id: InstrumentId,
         size_precision: u8,
+        treat_expired_as_canceled: bool,
         ts_init: UnixNanos,
     ) -> anyhow::Result<OrderStatusReport> {
         let ts_event = self
@@ -962,7 +963,9 @@ impl BinanceFuturesOrder {
 
         let order_type = self.order_type.to_nautilus_order_type();
         let time_in_force = self.time_in_force.to_nautilus_time_in_force();
-        let order_status = self.status.to_nautilus_order_status();
+        let order_status = self
+            .status
+            .to_nautilus_order_status(treat_expired_as_canceled);
 
         let quantity: Decimal = self.orig_qty.parse().context("invalid orig_qty")?;
         let filled_qty: Decimal = self.executed_qty.parse().context("invalid executed_qty")?;
@@ -1029,7 +1032,7 @@ impl BinanceTimeInForce {
 impl BinanceOrderStatus {
     /// Converts to Nautilus order status.
     #[must_use]
-    pub fn to_nautilus_order_status(&self) -> OrderStatus {
+    pub fn to_nautilus_order_status(&self, treat_expired_as_canceled: bool) -> OrderStatus {
         match self {
             Self::New | Self::PendingNew => OrderStatus::Accepted,
             Self::PartiallyFilled => OrderStatus::PartiallyFilled,
@@ -1037,8 +1040,13 @@ impl BinanceOrderStatus {
             Self::Canceled => OrderStatus::Canceled,
             Self::PendingCancel => OrderStatus::PendingCancel,
             Self::Rejected => OrderStatus::Rejected,
-            Self::Expired => OrderStatus::Expired,
-            Self::ExpiredInMatch => OrderStatus::Expired,
+            Self::Expired | Self::ExpiredInMatch => {
+                if treat_expired_as_canceled {
+                    OrderStatus::Canceled
+                } else {
+                    OrderStatus::Expired
+                }
+            }
             Self::Unknown => OrderStatus::Initialized,
         }
     }
@@ -1496,8 +1504,14 @@ mod tests {
         assert_eq!(order.order_id, 12345678);
         assert_eq!(order.symbol.as_str(), "BTCUSDT");
         assert_eq!(order.status, BinanceOrderStatus::New);
+        assert_eq!(order.time_in_force, BinanceTimeInForce::Gtc);
         assert_eq!(order.side, BinanceSide::Buy);
         assert_eq!(order.order_type, BinanceFuturesOrderType::Limit);
+        assert_eq!(order.price_match, Some(BinancePriceMatch::None));
+        assert_eq!(
+            order.self_trade_prevention_mode,
+            Some(BinanceSelfTradePreventionMode::None)
+        );
     }
 
     #[rstest]
@@ -1667,7 +1681,7 @@ mod tests {
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
         let report = order
-            .to_order_status_report(account_id, instrument_id, 3, ts_init)
+            .to_order_status_report(account_id, instrument_id, 3, false, ts_init)
             .unwrap();
 
         assert_eq!(
@@ -1709,5 +1723,19 @@ mod tests {
             report.client_order_id,
             Some(ClientOrderId::from("my-algo-order-1")),
         );
+    }
+
+    #[rstest]
+    #[case(BinanceOrderStatus::Expired, false, OrderStatus::Expired)]
+    #[case(BinanceOrderStatus::Expired, true, OrderStatus::Canceled)]
+    #[case(BinanceOrderStatus::ExpiredInMatch, false, OrderStatus::Expired)]
+    #[case(BinanceOrderStatus::ExpiredInMatch, true, OrderStatus::Canceled)]
+    fn test_to_nautilus_order_status_expired_respects_treat_as_canceled(
+        #[case] status: BinanceOrderStatus,
+        #[case] treat_expired_as_canceled: bool,
+        #[case] expected: OrderStatus,
+    ) {
+        let result = status.to_nautilus_order_status(treat_expired_as_canceled);
+        assert_eq!(result, expected);
     }
 }

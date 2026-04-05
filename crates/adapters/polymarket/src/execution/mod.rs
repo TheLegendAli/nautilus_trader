@@ -472,8 +472,8 @@ impl PolymarketExecutionClient {
                     }
                 }
                 Err(e) => {
-                    let ts = clock.get_time_ns();
-                    emitter.emit_order_rejected(&order, &format!("{e}"), ts, false);
+                    let ts_now = clock.get_time_ns();
+                    emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
                 }
             }
             Ok(())
@@ -608,8 +608,8 @@ impl PolymarketExecutionClient {
                     }
                 }
                 Err(e) => {
-                    let ts = clock.get_time_ns();
-                    emitter.emit_order_rejected(&order, &format!("{e}"), ts, false);
+                    let ts_now = clock.get_time_ns();
+                    emitter.emit_order_rejected(&order, &format!("{e}"), ts_now, false);
                 }
             }
             Ok(())
@@ -718,15 +718,7 @@ impl ExecutionClient for PolymarketExecutionClient {
         }
 
         self.abort_pending_tasks();
-
-        if self.core.is_connected() {
-            let runtime = get_runtime();
-            runtime.block_on(async {
-                if let Err(e) = self.ws_client.disconnect().await {
-                    log::warn!("Error disconnecting WebSocket client: {e}");
-                }
-            });
-        }
+        self.ws_client.abort();
 
         self.core.set_disconnected();
         self.core.set_stopped();
@@ -796,12 +788,12 @@ impl ExecutionClient for PolymarketExecutionClient {
         let order = self.core.cache().order(&cmd.client_order_id).cloned();
         if let Some(order) = order {
             let venue_order_id = order.venue_order_id();
-            let ts = self.clock.get_time_ns();
+            let ts_now = self.clock.get_time_ns();
             self.emitter.emit_order_modify_rejected(
                 &order,
                 venue_order_id,
                 "Order modification not supported on Polymarket",
-                ts,
+                ts_now,
             );
         }
         Ok(())
@@ -825,12 +817,12 @@ impl ExecutionClient for PolymarketExecutionClient {
                 "Cannot cancel order that is not open: {}",
                 cmd.client_order_id
             );
-            let ts = self.clock.get_time_ns();
+            let ts_now = self.clock.get_time_ns();
             self.emitter.emit_order_cancel_rejected(
                 order_ref,
                 order_ref.venue_order_id(),
                 &format!("Order is not open (status: {:?})", order_ref.status()),
-                ts,
+                ts_now,
             );
             return Ok(());
         }
@@ -880,12 +872,12 @@ impl ExecutionClient for PolymarketExecutionClient {
                     );
                 }
                 Err(e) => {
-                    let ts = clock.get_time_ns();
+                    let ts_now = clock.get_time_ns();
                     emitter.emit_order_cancel_rejected(
                         &order_clone,
                         Some(venue_order_id),
                         &format!("HTTP request failed: {e}"),
-                        ts,
+                        ts_now,
                     );
                 }
             }
@@ -990,11 +982,13 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
-        let runtime = get_runtime();
-        runtime.block_on(async {
-            if let Err(e) = self.refresh_account_state().await {
-                log::warn!("Failed to query account state: {e}");
-            }
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        let signature_type = self.config.signature_type;
+
+        self.spawn_task("query_account", async move {
+            fetch_and_emit_account_state(&http_client, &emitter, clock, signature_type).await
         });
         Ok(())
     }
@@ -1020,12 +1014,11 @@ impl ExecutionClient for PolymarketExecutionClient {
             None => (4, 6),
         };
 
-        let runtime = get_runtime();
-        let http_client = &self.http_client;
-        let emitter = &self.emitter;
+        let http_client = self.http_client.clone();
+        let emitter = self.emitter.clone();
         let clock = self.clock;
 
-        runtime.block_on(async {
+        self.spawn_task("query_order", async move {
             match http_client.get_order_optional(&venue_order_id).await {
                 Ok(Some(order)) => {
                     let report = parse_order_status_report(
@@ -1046,6 +1039,7 @@ impl ExecutionClient for PolymarketExecutionClient {
                     log::warn!("Failed to query order {venue_order_id}: {e}");
                 }
             }
+            Ok(())
         });
 
         Ok(())
@@ -1246,8 +1240,8 @@ impl ExecutionClient for PolymarketExecutionClient {
             .await
             .context("failed to fetch positions from Data API")?;
 
-        let ts = self.clock.get_time_ns();
-        let mut reports = build_position_reports(&positions, self.core.account_id, ts);
+        let ts_now = self.clock.get_time_ns();
+        let mut reports = build_position_reports(&positions, self.core.account_id, ts_now);
 
         if let Some(ref filter_id) = cmd.instrument_id {
             reports.retain(|r| &r.instrument_id == filter_id);
@@ -1293,8 +1287,8 @@ fn process_cancel_result(
                 );
             }
             CancelOutcome::Rejected(msg) => {
-                let ts = clock.get_time_ns();
-                emitter.emit_order_cancel_rejected(order, Some(venue_order_id), &msg, ts);
+                let ts_now = clock.get_time_ns();
+                emitter.emit_order_cancel_rejected(order, Some(venue_order_id), &msg, ts_now);
             }
         }
     }
@@ -1319,8 +1313,8 @@ fn handle_order_response(
             if response.success {
                 if let Some(order_id) = response.order_id {
                     let venue_order_id = VenueOrderId::from(order_id.as_str());
-                    let ts = clock.get_time_ns();
-                    emitter.emit_order_accepted(order, venue_order_id, ts);
+                    let ts_now = clock.get_time_ns();
+                    emitter.emit_order_accepted(order, venue_order_id, ts_now);
 
                     // Register order in fill tracker for dust detection
                     fill_tracker.register(
@@ -1394,7 +1388,8 @@ fn handle_order_response(
                                 &order_id,
                                 fallback_px,
                                 get_usdc_currency(),
-                                ts,
+                                ts_now,
+                                ts_now,
                             ) {
                                 emitter.send_fill_report(dust_fill);
                             }
@@ -1424,8 +1419,8 @@ fn handle_order_response(
                 let reason = response
                     .error_msg
                     .unwrap_or_else(|| "unknown error".to_string());
-                let ts = clock.get_time_ns();
-                emitter.emit_order_rejected(order, &reason, ts, false);
+                let ts_now = clock.get_time_ns();
+                emitter.emit_order_rejected(order, &reason, ts_now, false);
                 pending_cancels
                     .lock()
                     .expect(MUTEX_POISONED)
@@ -1433,8 +1428,8 @@ fn handle_order_response(
             }
         }
         Err(e) => {
-            let ts = clock.get_time_ns();
-            emitter.emit_order_rejected(order, &format!("HTTP request failed: {e}"), ts, false);
+            let ts_now = clock.get_time_ns();
+            emitter.emit_order_rejected(order, &format!("HTTP request failed: {e}"), ts_now, false);
             pending_cancels
                 .lock()
                 .expect(MUTEX_POISONED)
@@ -1464,12 +1459,12 @@ async fn execute_deferred_cancel(
             );
         }
         Err(e) => {
-            let ts = clock.get_time_ns();
+            let ts_now = clock.get_time_ns();
             emitter.emit_order_cancel_rejected(
                 order,
                 Some(venue_order_id),
                 &format!("Deferred cancel failed: {e}"),
-                ts,
+                ts_now,
             );
         }
     }
@@ -1547,7 +1542,7 @@ async fn check_fok_status(
         price_precision,
     );
 
-    let ts = clock.get_time_ns();
+    let ts_now = clock.get_time_ns();
     let mut report = OrderStatusReport::new(
         account_id,
         instrument_id,
@@ -1559,9 +1554,9 @@ async fn check_fok_status(
         order_status,
         quantity,
         filled_qty,
-        ts,
-        ts,
-        ts,
+        ts_now,
+        ts_now,
+        ts_now,
         None,
     );
     report.price = Some(price);

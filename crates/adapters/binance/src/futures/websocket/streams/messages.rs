@@ -30,8 +30,9 @@ use ustr::Ustr;
 use crate::{
     common::enums::{
         BinanceAlgoStatus, BinanceAlgoType, BinanceFuturesOrderType, BinanceKlineInterval,
-        BinanceMarginType, BinanceOrderStatus, BinancePositionSide, BinanceSide,
-        BinanceTimeInForce, BinanceWorkingType, BinanceWsMethod,
+        BinanceMarginType, BinanceOrderStatus, BinancePositionSide, BinancePriceMatch,
+        BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce, BinanceWorkingType,
+        BinanceWsMethod,
     },
     futures::http::BinanceFuturesInstrument,
 };
@@ -565,6 +566,7 @@ pub enum AccountUpdateReason {
     OptionsPremiumFee,
     OptionsSettleProfit,
     AutoExchange,
+    Adl,
     CoinSwapDeposit,
     CoinSwapWithdraw,
     #[serde(other)]
@@ -735,10 +737,10 @@ pub struct OrderUpdateData {
     pub realized_profit: String,
     /// Self-trade prevention mode.
     #[serde(rename = "V", default)]
-    pub stp_mode: Option<String>,
+    pub stp_mode: Option<BinanceSelfTradePreventionMode>,
     /// Price match mode.
     #[serde(rename = "pm", default)]
-    pub price_match: Option<String>,
+    pub price_match: Option<BinancePriceMatch>,
     /// Good till date for GTD orders.
     #[serde(rename = "gtd", default)]
     pub good_till_date: Option<i64>,
@@ -942,7 +944,7 @@ pub struct AlgoOrderUpdateData {
     pub working_type: BinanceWorkingType,
     /// Price match mode.
     #[serde(rename = "pm", default)]
-    pub price_match: Option<String>,
+    pub price_match: Option<BinancePriceMatch>,
     /// Close position flag.
     #[serde(rename = "cp", default)]
     pub close_position: Option<bool>,
@@ -975,7 +977,7 @@ pub struct AlgoOrderUpdateData {
     pub callback_rate: Option<String>,
     /// Self-trade prevention mode.
     #[serde(rename = "V", default)]
-    pub stp_mode: Option<String>,
+    pub stp_mode: Option<BinanceSelfTradePreventionMode>,
 }
 
 /// Listen key expired event.
@@ -987,4 +989,23 @@ pub struct BinanceFuturesListenKeyExpiredMsg {
     /// Event time in milliseconds.
     #[serde(rename = "E")]
     pub event_time: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_account_update_reason_adl_deserializes() {
+        let value: AccountUpdateReason = serde_json::from_str("\"ADL\"").unwrap();
+        assert_eq!(value, AccountUpdateReason::Adl);
+    }
+
+    #[rstest]
+    fn test_account_update_reason_unknown_fallback() {
+        let value: AccountUpdateReason = serde_json::from_str("\"SOMETHING_NEW\"").unwrap();
+        assert_eq!(value, AccountUpdateReason::Unknown);
+    }
 }

@@ -20,11 +20,15 @@
     reason = "errors documented on underlying Rust methods"
 )]
 
+pub mod arrow;
 pub mod config;
 pub mod enums;
 pub mod factories;
+pub mod types;
 
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
+use nautilus_model::data::ensure_rust_extractor_registered;
+use nautilus_serialization::ensure_custom_data_registered;
 use nautilus_system::{
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
     get_global_pyo3_registry,
@@ -33,9 +37,10 @@ use pyo3::prelude::*;
 
 use crate::{
     common::{
+        bar::BinanceBar,
         consts::{BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_NAUTILUS_SPOT_BROKER_ID},
         encoder::decode_broker_id,
-        enums::{BinanceEnvironment, BinancePositionSide, BinanceProductType},
+        enums::{BinanceEnvironment, BinanceMarginType, BinancePositionSide, BinanceProductType},
     },
     config::{BinanceDataClientConfig, BinanceExecClientConfig},
     factories::{BinanceDataClientFactory, BinanceExecutionClientFactory},
@@ -130,7 +135,18 @@ fn py_decode_binance_futures_client_order_id(encoded: &str) -> String {
 pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BinanceProductType>()?;
     m.add_class::<BinanceEnvironment>()?;
+    m.add_class::<BinanceMarginType>()?;
     m.add_class::<BinancePositionSide>()?;
+    m.add_class::<BinanceBar>()?;
+    m.add_function(wrap_pyfunction!(arrow::get_binance_arrow_schema_map, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        arrow::py_binance_bar_to_arrow_record_batch_bytes,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        arrow::py_binance_bar_from_arrow_record_batch_bytes,
+        m
+    )?)?;
     m.add_class::<BinanceDataClientConfig>()?;
     m.add_class::<BinanceExecClientConfig>()?;
     m.add_class::<BinanceDataClientFactory>()?;
@@ -140,6 +156,10 @@ pub fn binance(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py_decode_binance_futures_client_order_id,
         m
     )?)?;
+
+    // Register BinanceBar for Arrow/JSON serialization and Python extraction
+    ensure_custom_data_registered::<BinanceBar>();
+    let _ = ensure_rust_extractor_registered::<BinanceBar>();
 
     let registry = get_global_pyo3_registry();
 

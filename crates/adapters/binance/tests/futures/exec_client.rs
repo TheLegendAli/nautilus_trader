@@ -21,7 +21,10 @@ use std::{
 
 use axum::{
     Router,
-    extract::ws::{Message, WebSocket},
+    extract::{
+        Query,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -35,20 +38,20 @@ use nautilus_common::{
     live::runner::set_exec_event_sender,
     messages::{
         ExecutionEvent,
-        execution::{CancelAllOrders, CancelOrder, ModifyOrder, SubmitOrder},
+        execution::{CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount, SubmitOrder},
     },
     testing::wait_until_async,
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{Params, UnixNanos};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
-    enums::{AccountType, OmsType, OrderSide, TimeInForce},
+    enums::{AccountType, OmsType, OrderSide, TimeInForce, TrailingOffsetType, TriggerType},
     events::{AccountState, OrderEventAny},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
     },
-    orders::{LimitOrder, Order, OrderAny},
+    orders::{LimitOrder, Order, OrderAny, TrailingStopMarketOrder},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -100,6 +103,65 @@ async fn handle_ws_connection(mut socket: WebSocket) {
             let resp = json!({"result": null, "id": id});
             let _ = socket.send(Message::Text(resp.to_string().into())).await;
         }
+    }
+}
+
+async fn handle_ws_trading(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_ws_trading_connection)
+}
+
+async fn handle_ws_trading_connection(mut socket: WebSocket) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        let Message::Text(text) = msg else {
+            continue;
+        };
+
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+
+        let request_id = parsed.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let method = parsed.get("method").and_then(|v| v.as_str());
+
+        let response = match method {
+            Some("order.place") => {
+                let mut order = load_fixture("order_response.json");
+                order["clientOrderId"] = parsed
+                    .get("params")
+                    .and_then(|params| params.get("newClientOrderId"))
+                    .cloned()
+                    .unwrap_or_else(|| json!("testOrder123"));
+                json!({
+                    "id": request_id,
+                    "status": 200,
+                    "result": order,
+                    "rateLimits": []
+                })
+            }
+            Some("order.cancel") => json!({
+                "id": request_id,
+                "status": 400,
+                "error": {
+                    "code": -2011,
+                    "msg": "Unknown order sent"
+                },
+                "rateLimits": []
+            }),
+            Some("order.modify") => json!({
+                "id": request_id,
+                "status": 400,
+                "error": {
+                    "code": -4028,
+                    "msg": "Price or quantity not changed"
+                },
+                "rateLimits": []
+            }),
+            _ => continue,
+        };
+
+        let _ = socket
+            .send(Message::Text(response.to_string().into()))
+            .await;
     }
 }
 
@@ -255,6 +317,48 @@ fn create_exec_test_router() -> Router {
             }),
         )
         .route("/ws", get(handle_ws))
+        .route("/ws-fapi/v1", get(handle_ws_trading))
+}
+
+fn create_exec_test_router_with_algo_capture(
+    captured_query: &Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+) -> Router {
+    create_exec_test_router().route(
+        "/fapi/v1/algoOrder",
+        post({
+            let captured_query = captured_query.clone();
+
+            move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+
+                *captured_query.lock().unwrap() = Some(query);
+
+                json_response(&json!({
+                    "algoId": 12345,
+                    "clientAlgoId": "test-algo-order-001",
+                    "algoType": "CONDITIONAL",
+                    "orderType": "TRAILING_STOP_MARKET",
+                    "symbol": "BTCUSDT",
+                    "side": "SELL",
+                    "positionSide": "BOTH",
+                    "timeInForce": "GTC",
+                    "quantity": "0.001",
+                    "algoStatus": "NEW",
+                    "triggerPrice": "10000.00",
+                    "price": "0",
+                    "workingType": "MARK_PRICE",
+                    "activatePrice": "10000.00",
+                    "callbackRate": "0.25",
+                    "reduceOnly": true,
+                    "closePosition": false,
+                    "priceProtect": false,
+                    "selfTradePreventionMode": "NONE"
+                }))
+            }
+        }),
+    )
 }
 
 async fn start_exec_test_server() -> SocketAddr {
@@ -282,6 +386,183 @@ async fn start_exec_test_server() -> SocketAddr {
     .await;
 
     addr
+}
+
+async fn start_exec_test_server_with_algo_capture() -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+) {
+    let captured_query = Arc::new(std::sync::Mutex::new(None));
+    let router = create_exec_test_router_with_algo_capture(&captured_query);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let health_url = format!("http://{addr}/fapi/v1/ping");
+    let http_client =
+        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    wait_until_async(
+        || {
+            let url = health_url.clone();
+            let client = http_client.clone();
+            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    (addr, captured_query)
+}
+
+fn create_exec_test_router_with_order_capture(
+    captured_query: &Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+) -> Router {
+    let captured = captured_query.clone();
+
+    // Build a fresh router but override the /fapi/v1/order POST to capture query params
+    Router::new()
+        .route("/fapi/v1/ping", get(|| async { json_response(&json!({})) }))
+        .route(
+            "/fapi/v1/exchangeInfo",
+            get(|| async {
+                json_response(&json!({
+                    "timezone": "UTC",
+                    "serverTime": 1700000000000_i64,
+                    "rateLimits": [],
+                    "exchangeFilters": [],
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "pair": "BTCUSDT",
+                        "contractType": "PERPETUAL",
+                        "deliveryDate": 4133404800000_i64,
+                        "onboardDate": 1569398400000_i64,
+                        "status": "TRADING",
+                        "baseAsset": "BTC",
+                        "quoteAsset": "USDT",
+                        "marginAsset": "USDT",
+                        "pricePrecision": 2,
+                        "quantityPrecision": 3,
+                        "baseAssetPrecision": 8,
+                        "quotePrecision": 8,
+                        "maintMarginPercent": "2.5000",
+                        "requiredMarginPercent": "5.0000",
+                        "underlyingType": "COIN",
+                        "settlePlan": 0,
+                        "triggerProtect": "0.0500",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10"},
+                            {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"}
+                        ],
+                        "orderTypes": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET"],
+                        "timeInForce": ["GTC", "IOC", "FOK", "GTD"]
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/fapi/v1/positionSide/dual",
+            get(|headers: HeaderMap| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+                json_response(&json!({"dualSidePosition": false}))
+            }),
+        )
+        .route(
+            "/fapi/v1/listenKey",
+            post(|headers: HeaderMap| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+                json_response(&json!({"listenKey": "test_listen_key"}))
+            })
+            .put(|headers: HeaderMap| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+                json_response(&json!({}))
+            }),
+        )
+        .route(
+            "/fapi/v2/account",
+            get(|headers: HeaderMap| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+                json_response(&load_fixture("account_info_v2.json"))
+            }),
+        )
+        .route(
+            "/fapi/v2/positionRisk",
+            get(|headers: HeaderMap| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+                json_response(&load_fixture("position_risk.json"))
+            }),
+        )
+        .route(
+            "/fapi/v1/openOrders",
+            get(|headers: HeaderMap| async move {
+                if !has_auth_headers(&headers) {
+                    return unauthorized_response();
+                }
+                json_response(&json!([]))
+            }),
+        )
+        .route(
+            "/fapi/v1/order",
+            post({
+                move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| {
+                    let captured = captured.clone();
+                    async move {
+                        if !has_auth_headers(&headers) {
+                            return unauthorized_response();
+                        }
+                        *captured.lock().unwrap() = Some(query);
+                        json_response(&load_fixture("order_response.json"))
+                    }
+                }
+            }),
+        )
+        .route("/ws", get(handle_ws))
+}
+
+async fn start_exec_test_server_with_order_capture() -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Option<HashMap<String, String>>>>,
+) {
+    let captured_query = Arc::new(std::sync::Mutex::new(None));
+    let router = create_exec_test_router_with_order_capture(&captured_query);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let health_url = format!("http://{addr}/fapi/v1/ping");
+    let http_client =
+        HttpClient::new(HashMap::new(), Vec::new(), Vec::new(), None, None, None).unwrap();
+    wait_until_async(
+        || {
+            let url = health_url.clone();
+            let client = http_client.clone();
+            async move { client.get(url, None, None, Some(1), None).await.is_ok() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    (addr, captured_query)
 }
 
 fn create_test_execution_client(
@@ -481,6 +762,94 @@ async fn test_submit_order_generates_submitted_event() {
 
 #[rstest]
 #[tokio::test]
+async fn test_submit_trailing_stop_order_uses_activate_price_and_precise_callback_rate() {
+    let (addr, captured_query) = start_exec_test_server_with_algo_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let client_order_id = ClientOrderId::new("trailing-stop-test-001");
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("TEST-STRATEGY");
+
+    let mut order = TrailingStopMarketOrder::new(
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        OrderSide::Sell,
+        Quantity::from("0.001"),
+        Price::from("10000.00"),
+        TriggerType::MarkPrice,
+        rust_decimal::Decimal::from(25),
+        TrailingOffsetType::BasisPoints,
+        TimeInForce::Gtc,
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+    order.activation_price = Some(Price::from("10000.00"));
+
+    let order_any = OrderAny::TrailingStopMarket(order);
+    cache
+        .borrow_mut()
+        .add_order(order_any.clone(), None, None, false)
+        .unwrap();
+
+    let submit_cmd = SubmitOrder::new(
+        trader_id,
+        Some(ClientId::from("BINANCE")),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        order_any.init_event().clone(),
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(&submit_cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(query.get("type"), Some(&"TRAILING_STOP_MARKET".to_string()));
+    assert_eq!(query.get("activatePrice"), Some(&"10000.00".to_string()));
+    assert_eq!(query.get("callbackRate"), Some(&"0.25".to_string()));
+    assert!(!query.contains_key("activationPrice"));
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_cancel_all_orders_completes() {
     let addr = start_exec_test_server().await;
     let base_url_http = format!("http://{addr}");
@@ -665,6 +1034,215 @@ async fn test_modify_order_completes() {
 
 #[rstest]
 #[tokio::test]
+async fn test_cancel_order_ws_rejection_emits_cancel_rejected() {
+    let addr = start_exec_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let base_url_ws_trading = format!("ws://{addr}/ws-fapi/v1");
+
+    let (mut client, mut rx, cache) = create_test_execution_client_with_ws_trading(
+        base_url_http,
+        base_url_ws,
+        base_url_ws_trading,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let client_order_id = ClientOrderId::new("cancel-ws-test-001");
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("TEST-STRATEGY");
+
+    let order = LimitOrder::new(
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.001"),
+        Price::from("50000.00"),
+        TimeInForce::Gtc,
+        None,
+        true,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let order_any = OrderAny::Limit(order);
+    cache
+        .borrow_mut()
+        .add_order(order_any.clone(), None, None, false)
+        .unwrap();
+
+    let submit_cmd = SubmitOrder::new(
+        trader_id,
+        Some(ClientId::from("BINANCE")),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        order_any.init_event().clone(),
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(&submit_cmd).unwrap();
+
+    let cancel_cmd = CancelOrder::new(
+        trader_id,
+        Some(ClientId::from("BINANCE")),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        Some(VenueOrderId::from("12345")),
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.cancel_order(&cancel_cmd).unwrap();
+
+    match recv_until(&mut rx, |event| {
+        matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::CancelRejected(_))
+        )
+    })
+    .await
+    {
+        ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert!(event.reason.as_str().contains("code=-2011"));
+        }
+        other => panic!("Expected CancelRejected event, was {other:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_modify_order_ws_rejection_emits_modify_rejected() {
+    let addr = start_exec_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+    let base_url_ws_trading = format!("ws://{addr}/ws-fapi/v1");
+
+    let (mut client, mut rx, cache) = create_test_execution_client_with_ws_trading(
+        base_url_http,
+        base_url_ws,
+        base_url_ws_trading,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let client_order_id = ClientOrderId::new("modify-ws-test-001");
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("TEST-STRATEGY");
+
+    let order = LimitOrder::new(
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.001"),
+        Price::from("50000.00"),
+        TimeInForce::Gtc,
+        None,
+        true,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let order_any = OrderAny::Limit(order);
+    cache
+        .borrow_mut()
+        .add_order(order_any.clone(), None, None, false)
+        .unwrap();
+
+    let submit_cmd = SubmitOrder::new(
+        trader_id,
+        Some(ClientId::from("BINANCE")),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        order_any.init_event().clone(),
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(&submit_cmd).unwrap();
+
+    let modify_cmd = ModifyOrder::new(
+        trader_id,
+        Some(ClientId::from("BINANCE")),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        Some(VenueOrderId::from("12345")),
+        Some(Quantity::from("0.002")),
+        Some(Price::from("51000.00")),
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client.modify_order(&modify_cmd).unwrap();
+
+    match recv_until(&mut rx, |event| {
+        matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))
+        )
+    })
+    .await
+    {
+        ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) => {
+            assert_eq!(event.client_order_id, client_order_id);
+            assert!(event.reason.as_str().contains("code=-4028"));
+        }
+        other => panic!("Expected ModifyRejected event, was {other:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_connect_disconnect_reconnect() {
     let addr = start_exec_test_server().await;
     let base_url_http = format!("http://{addr}");
@@ -682,6 +1260,181 @@ async fn test_connect_disconnect_reconnect() {
     // Reconnect
     client.connect().await.unwrap();
     assert!(client.is_connected());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_with_price_match_sends_price_match_and_omits_price() {
+    let (addr, captured_query) = start_exec_test_server_with_order_capture().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+    let client_order_id = ClientOrderId::new("price-match-test-001");
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("TEST-STRATEGY");
+
+    let order = LimitOrder::new(
+        trader_id,
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.001"),
+        Price::from("50000.00"),
+        TimeInForce::Gtc,
+        None,  // expire_time
+        false, // post_only (must be false for price_match)
+        false, // reduce_only
+        false, // quote_quantity
+        None,  // display_qty
+        None,  // emulation_trigger
+        None,  // trigger_instrument_id
+        None,  // contingency_type
+        None,  // order_list_id
+        None,  // linked_order_ids
+        None,  // parent_order_id
+        None,  // exec_algorithm_id
+        None,  // exec_algorithm_params
+        None,  // exec_spawn_id
+        None,  // tags
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let order_any = OrderAny::Limit(order);
+    cache
+        .borrow_mut()
+        .add_order(order_any.clone(), None, None, false)
+        .unwrap();
+
+    let mut params = Params::new();
+    params.insert(
+        "price_match".to_string(),
+        serde_json::Value::String("OPPONENT_5".to_string()),
+    );
+
+    let submit_cmd = SubmitOrder::new(
+        trader_id,
+        Some(ClientId::from("BINANCE")),
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        order_any.init_event().clone(),
+        None, // exec_algorithm_id
+        None, // position_id
+        Some(params),
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    client.submit_order(&submit_cmd).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_query = captured_query.clone();
+            async move { captured_query.lock().unwrap().is_some() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let query = captured_query.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        query.get("priceMatch"),
+        Some(&"OPPONENT_5".to_string()),
+        "priceMatch should be OPPONENT_5"
+    );
+    assert!(
+        !query.contains_key("price"),
+        "price must be omitted when priceMatch is set"
+    );
+    assert_eq!(query.get("type"), Some(&"LIMIT".to_string()));
+    assert_eq!(query.get("side"), Some(&"BUY".to_string()));
+    assert_eq!(query.get("quantity"), Some(&"0.001".to_string()));
+
+    // Drain the submitted event to confirm the order was processed
+    wait_until_async(
+        || {
+            let found = rx
+                .try_recv()
+                .is_ok_and(|e| matches!(e, ExecutionEvent::Order(OrderEventAny::Submitted(_))));
+            async move { found }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+fn create_test_execution_client_with_ws_trading(
+    base_url_http: String,
+    base_url_ws: String,
+    base_url_ws_trading: String,
+) -> (
+    BinanceFuturesExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    let trader_id = TraderId::from("TESTER-001");
+    let account_id = AccountId::from("BINANCE-001");
+    let client_id = ClientId::from("BINANCE");
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let core = ExecutionClientCore::new(
+        trader_id,
+        client_id,
+        Venue::from("BINANCE"),
+        OmsType::Hedging,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache.clone(),
+    );
+
+    let config = BinanceExecClientConfig {
+        trader_id,
+        account_id,
+        base_url_http: Some(base_url_http),
+        base_url_ws: Some(base_url_ws),
+        base_url_ws_trading: Some(base_url_ws_trading),
+        use_ws_trading: true,
+        api_key: Some("test_api_key".to_string()),
+        api_secret: Some("test_api_secret".to_string()),
+        ..Default::default()
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    set_exec_event_sender(tx);
+
+    let client = BinanceFuturesExecutionClient::new(core, config).unwrap();
+
+    (client, rx, cache)
+}
+
+async fn recv_until<F>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    predicate: F,
+) -> ExecutionEvent
+where
+    F: Fn(&ExecutionEvent) -> bool,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rx.recv().await.expect("Execution event channel closed");
+            if predicate(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("Timed out waiting for matching execution event")
 }
 
 type WsInjector = Arc<tokio::sync::broadcast::Sender<String>>;
@@ -826,4 +1579,34 @@ async fn test_order_trade_update_processed_with_default_precision_on_cache_miss(
         Duration::from_secs(5),
     )
     .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_query_account_does_not_block_within_runtime() {
+    let addr = start_exec_test_server().await;
+    let base_url_http = format!("http://{addr}");
+    let base_url_ws = format!("ws://{addr}/ws");
+
+    let (mut client, mut rx, cache) = create_test_execution_client(base_url_http, base_url_ws);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let cmd = QueryAccount::new(
+        TraderId::from("TESTER-001"),
+        Some(ClientId::from("BINANCE")),
+        AccountId::from("BINANCE-001"),
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    let result = client.query_account(&cmd);
+    assert!(result.is_ok());
+
+    match recv_until(&mut rx, |event| matches!(event, ExecutionEvent::Account(_))).await {
+        ExecutionEvent::Account(_) => {}
+        other => panic!("Expected Account event, was {other:?}"),
+    }
 }
