@@ -59,12 +59,7 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
 from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
-from nautilus_trader.execution.messages import GenerateFillReports
-from nautilus_trader.execution.messages import GenerateOrderStatusReport
-from nautilus_trader.execution.messages import GenerateOrderStatusReports
-from nautilus_trader.execution.messages import GeneratePositionStatusReports
 from nautilus_trader.execution.messages import ModifyOrder
-from nautilus_trader.execution.messages import QueryAccount
 from nautilus_trader.execution.messages import SubmitOrder
 from nautilus_trader.execution.messages import SubmitOrderList
 from nautilus_trader.execution.reports import ExecutionMassStatus
@@ -451,7 +446,7 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         for cancel in command.cancels:
             await self._cancel_order(cancel)
 
-    async def _query_account(self, _command: QueryAccount) -> None:
+    async def _query_account(self) -> None:
         await self._query_account_snapshot()
 
     # ------------------------------------------------------------------
@@ -460,10 +455,10 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
     async def generate_order_status_report(
         self,
-        command: GenerateOrderStatusReport,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId | None = None,
+        venue_order_id: VenueOrderId | None = None,
     ) -> OrderStatusReport | None:
-        venue_order_id = command.venue_order_id
-        client_order_id = command.client_order_id
 
         # Try the local cache first.
         basket_id: str | None = None
@@ -490,7 +485,10 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
     async def generate_order_status_reports(
         self,
-        command: GenerateOrderStatusReports,
+        instrument_id: InstrumentId | None = None,
+        start: Any = None,
+        end: Any = None,
+        open_only: bool = False,
     ) -> list[OrderStatusReport]:
         reports: list[OrderStatusReport] = []
         try:
@@ -512,7 +510,10 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
     async def generate_fill_reports(
         self,
-        command: GenerateFillReports,
+        instrument_id: InstrumentId | None = None,
+        venue_order_id: VenueOrderId | None = None,
+        start: Any = None,
+        end: Any = None,
     ) -> list[FillReport]:
         """Replay cached fills collected via ``on_exchange_order_notification``."""
         reports: list[FillReport] = []
@@ -547,7 +548,9 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
     async def generate_position_status_reports(
         self,
-        command: GeneratePositionStatusReports,
+        instrument_id: InstrumentId | None = None,
+        start: Any = None,
+        end: Any = None,
     ) -> list[PositionStatusReport]:
         reports: list[PositionStatusReport] = []
         try:
@@ -589,7 +592,6 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
                     report_id=UUID4(),
                     ts_last=ssboe_usecs_to_nanos(ssboe, usecs),
                     ts_init=self._clock.timestamp_ns(),
-                    avg_px_open=Decimal(str(avg_px)) if avg_px else None,
                 )
                 reports.append(report)
         except Exception as e:
@@ -610,23 +612,11 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         self.reconciliation_active = True
         try:
             now_ns = self._clock.timestamp_ns()
-            order_cmd = GenerateOrderStatusReports(
-                instrument_id=None, start=None, end=None, open_only=False,
-                command_id=UUID4(), ts_init=now_ns,
-            )
-            fill_cmd = GenerateFillReports(
-                instrument_id=None, venue_order_id=None, start=None, end=None,
-                command_id=UUID4(), ts_init=now_ns,
-            )
-            pos_cmd = GeneratePositionStatusReports(
-                instrument_id=None, start=None, end=None,
-                command_id=UUID4(), ts_init=now_ns,
-            )
 
             order_reports, fill_reports, position_reports = await asyncio.gather(
-                self.generate_order_status_reports(order_cmd),
-                self.generate_fill_reports(fill_cmd),
-                self.generate_position_status_reports(pos_cmd),
+                self.generate_order_status_reports(),
+                self.generate_fill_reports(),
+                self.generate_position_status_reports(),
             )
 
             mass_status = ExecutionMassStatus(

@@ -17,6 +17,7 @@ from nautilus_trader.adapters.rithmic.config import RithmicExecClientConfig
 from nautilus_trader.adapters.rithmic.config import RithmicInstrumentProviderConfig
 from nautilus_trader.adapters.rithmic.config import RithmicInstrumentSpec
 from nautilus_trader.adapters.rithmic.execution import RithmicLiveExecutionClient
+from nautilus_trader.adapters.rithmic.factories import RithmicLiveExecClientFactory
 from nautilus_trader.adapters.rithmic.providers import RithmicInstrumentProvider
 
 
@@ -25,5 +26,6 @@ __all__ = [
     "RithmicInstrumentProviderConfig",
     "RithmicInstrumentSpec",
     "RithmicLiveExecutionClient",
+    "RithmicLiveExecClientFactory",
     "RithmicInstrumentProvider",
 ]
