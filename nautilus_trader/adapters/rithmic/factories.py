@@ -167,10 +167,7 @@ class RithmicLiveExecClientFactory(LiveExecClientFactory):
 
         provider = RithmicInstrumentProvider(config=config.instrument_provider)
 
-        account_id_str = config.account_id or os.environ.get("RITHMIC_ACCOUNT_ID", "")
-        assert account_id_str, (
-            "Must set RithmicExecClientConfig.account_id or RITHMIC_ACCOUNT_ID env var."
-        )
+        account_id_str = config.account_id or os.environ.get("RITHMIC_ACCOUNT_ID", "") or name
         account_id = AccountId(f"{name}-{account_id_str}")
 
         return RithmicLiveExecutionClient(

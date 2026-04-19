@@ -282,60 +282,6 @@
     "description": "Nasdaq Trades"
   },
   {
-    "publisher_id": 48,
-    "dataset": "DBEQ.PLUS",
-    "venue": "XCHI",
-    "description": "DBEQ Plus - NYSE Chicago"
-  },
-  {
-    "publisher_id": 49,
-    "dataset": "DBEQ.PLUS",
-    "venue": "XCIS",
-    "description": "DBEQ Plus - NYSE National"
-  },
-  {
-    "publisher_id": 50,
-    "dataset": "DBEQ.PLUS",
-    "venue": "IEXG",
-    "description": "DBEQ Plus - IEX"
-  },
-  {
-    "publisher_id": 51,
-    "dataset": "DBEQ.PLUS",
-    "venue": "EPRL",
-    "description": "DBEQ Plus - MIAX Pearl"
-  },
-  {
-    "publisher_id": 52,
-    "dataset": "DBEQ.PLUS",
-    "venue": "XNAS",
-    "description": "DBEQ Plus - Nasdaq"
-  },
-  {
-    "publisher_id": 53,
-    "dataset": "DBEQ.PLUS",
-    "venue": "XNYS",
-    "description": "DBEQ Plus - NYSE"
-  },
-  {
-    "publisher_id": 54,
-    "dataset": "DBEQ.PLUS",
-    "venue": "FINN",
-    "description": "DBEQ Plus - FINRA/Nasdaq TRF Carteret"
-  },
-  {
-    "publisher_id": 55,
-    "dataset": "DBEQ.PLUS",
-    "venue": "FINY",
-    "description": "DBEQ Plus - FINRA/NYSE TRF"
-  },
-  {
-    "publisher_id": 56,
-    "dataset": "DBEQ.PLUS",
-    "venue": "FINC",
-    "description": "DBEQ Plus - FINRA/Nasdaq TRF Chicago"
-  },
-  {
     "publisher_id": 57,
     "dataset": "IFEU.IMPACT",
     "venue": "IFEU",
@@ -354,130 +300,10 @@
     "description": "DBEQ Basic - Consolidated"
   },
   {
-    "publisher_id": 60,
-    "dataset": "DBEQ.PLUS",
-    "venue": "DBEQ",
-    "description": "DBEQ Plus - Consolidated"
-  },
-  {
     "publisher_id": 61,
     "dataset": "OPRA.PILLAR",
     "venue": "SPHR",
     "description": "OPRA - MIAX Sapphire"
-  },
-  {
-    "publisher_id": 62,
-    "dataset": "DBEQ.MAX",
-    "venue": "XCHI",
-    "description": "DBEQ Max - NYSE Chicago"
-  },
-  {
-    "publisher_id": 63,
-    "dataset": "DBEQ.MAX",
-    "venue": "XCIS",
-    "description": "DBEQ Max - NYSE National"
-  },
-  {
-    "publisher_id": 64,
-    "dataset": "DBEQ.MAX",
-    "venue": "IEXG",
-    "description": "DBEQ Max - IEX"
-  },
-  {
-    "publisher_id": 65,
-    "dataset": "DBEQ.MAX",
-    "venue": "EPRL",
-    "description": "DBEQ Max - MIAX Pearl"
-  },
-  {
-    "publisher_id": 66,
-    "dataset": "DBEQ.MAX",
-    "venue": "XNAS",
-    "description": "DBEQ Max - Nasdaq"
-  },
-  {
-    "publisher_id": 67,
-    "dataset": "DBEQ.MAX",
-    "venue": "XNYS",
-    "description": "DBEQ Max - NYSE"
-  },
-  {
-    "publisher_id": 68,
-    "dataset": "DBEQ.MAX",
-    "venue": "FINN",
-    "description": "DBEQ Max - FINRA/Nasdaq TRF Carteret"
-  },
-  {
-    "publisher_id": 69,
-    "dataset": "DBEQ.MAX",
-    "venue": "FINY",
-    "description": "DBEQ Max - FINRA/NYSE TRF"
-  },
-  {
-    "publisher_id": 70,
-    "dataset": "DBEQ.MAX",
-    "venue": "FINC",
-    "description": "DBEQ Max - FINRA/Nasdaq TRF Chicago"
-  },
-  {
-    "publisher_id": 71,
-    "dataset": "DBEQ.MAX",
-    "venue": "BATS",
-    "description": "DBEQ Max - CBOE BZX"
-  },
-  {
-    "publisher_id": 72,
-    "dataset": "DBEQ.MAX",
-    "venue": "BATY",
-    "description": "DBEQ Max - CBOE BYX"
-  },
-  {
-    "publisher_id": 73,
-    "dataset": "DBEQ.MAX",
-    "venue": "EDGA",
-    "description": "DBEQ Max - CBOE EDGA"
-  },
-  {
-    "publisher_id": 74,
-    "dataset": "DBEQ.MAX",
-    "venue": "EDGX",
-    "description": "DBEQ Max - CBOE EDGX"
-  },
-  {
-    "publisher_id": 75,
-    "dataset": "DBEQ.MAX",
-    "venue": "XBOS",
-    "description": "DBEQ Max - Nasdaq BX"
-  },
-  {
-    "publisher_id": 76,
-    "dataset": "DBEQ.MAX",
-    "venue": "XPSX",
-    "description": "DBEQ Max - Nasdaq PSX"
-  },
-  {
-    "publisher_id": 77,
-    "dataset": "DBEQ.MAX",
-    "venue": "MEMX",
-    "description": "DBEQ Max - MEMX"
-  },
-  {
-    "publisher_id": 78,
-    "dataset": "DBEQ.MAX",
-    "venue": "XASE",
-    "description": "DBEQ Max - NYSE American"
-  },
-  {
-    "publisher_id": 79,
-    "dataset": "DBEQ.MAX",
-    "venue": "ARCX",
-    "description": "DBEQ Max - NYSE Arca"
-  },
-  {
-    "publisher_id": 80,
-    "dataset": "DBEQ.MAX",
-    "venue": "LTSE",
-    "description": "DBEQ Max - Long-Term Stock Exchange"
   },
   {
     "publisher_id": 81,
@@ -534,33 +360,9 @@
     "description": "Nasdaq Basic - Nasdaq PSX"
   },
   {
-    "publisher_id": 90,
-    "dataset": "DBEQ.SUMMARY",
-    "venue": "DBEQ",
-    "description": "Databento Equities Summary"
-  },
-  {
-    "publisher_id": 91,
-    "dataset": "XCIS.BBOTRADES",
-    "venue": "XCIS",
-    "description": "NYSE National BBO and Trades"
-  },
-  {
-    "publisher_id": 92,
-    "dataset": "XNYS.BBOTRADES",
-    "venue": "XNYS",
-    "description": "NYSE BBO and Trades"
-  },
-  {
     "publisher_id": 93,
     "dataset": "XNAS.BASIC",
     "venue": "DBEQ",
     "description": "Nasdaq Basic - Consolidated"
-  },
-  {
-    "publisher_id": 94,
-    "dataset": "DBEQ.MAX",
-    "venue": "DBEQ",
-    "description": "DBEQ Max - Consolidated"
   }
 ]

@@ -170,6 +170,10 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         # Load instruments from provider.
         await self._instrument_provider.load_all_async()
 
+        # Register account_id with the base class before emitting account state.
+        if self.account_id is None:
+            self._set_account_id(self._account_id)
+
         # Prime account state with a one-shot snapshot.
         await self._query_account_snapshot()
 
@@ -843,10 +847,10 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         Translate an ``AccountPnLPositionUpdate`` (template 451) into a
         NautilusTrader :meth:`generate_account_state` call.
         """
-        account_balance_raw: float = getattr(update, "account_balance", 0.0)
-        cash_on_hand: float = getattr(update, "cash_on_hand", 0.0)
-        margin_balance: float = getattr(update, "margin_balance", 0.0)
-        excess_buy_margin: float = getattr(update, "excess_buy_margin", 0.0)
+        account_balance_raw: float = float(getattr(update, "account_balance", 0.0) or 0.0)
+        cash_on_hand: float = float(getattr(update, "cash_on_hand", 0.0) or 0.0)
+        margin_balance: float = float(getattr(update, "margin_balance", 0.0) or 0.0)
+        excess_buy_margin: float = float(getattr(update, "excess_buy_margin", 0.0) or 0.0)
 
         if account_balance_raw == 0.0 and cash_on_hand == 0.0:
             return  # snapshot not yet populated
