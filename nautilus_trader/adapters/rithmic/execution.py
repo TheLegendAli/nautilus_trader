@@ -128,7 +128,7 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
     ) -> None:
         super().__init__(
             loop=loop,
-            client_id=ClientId(config.account_id or account_id.get_issuer()),
+            client_id=ClientId(account_id.get_issuer()),
             venue=None,  # Multi-venue intermediary — same pattern as IB adapter
             oms_type=OmsType.NETTING,
             instrument_provider=instrument_provider,
