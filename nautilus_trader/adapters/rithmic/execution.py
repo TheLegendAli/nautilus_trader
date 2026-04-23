@@ -239,7 +239,8 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
         try:
             response = await self._client.submit_order(**kwargs)
-            basket_id: str = getattr(response, "basket_id", order.client_order_id.value)
+            first = response[0] if isinstance(response, list) and response else response
+            basket_id: str = getattr(first, "basket_id", None) or order.client_order_id.value
             self._register_order(order.client_order_id.value, basket_id)
             self.generate_order_submitted(
                 strategy_id=order.strategy_id,
@@ -378,7 +379,8 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
         try:
             response = await self._client.submit_order(**kwargs)
-            basket_id: str = getattr(response, "basket_id", entry.client_order_id.value)
+            first = response[0] if isinstance(response, list) and response else response
+            basket_id: str = getattr(first, "basket_id", None) or entry.client_order_id.value
             self._register_order(entry.client_order_id.value, basket_id)
 
             # Register child orders too — Rithmic creates them internally but we
