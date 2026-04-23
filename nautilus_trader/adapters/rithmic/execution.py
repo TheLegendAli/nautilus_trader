@@ -913,13 +913,8 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
             RithmicLiveExecutionClient._MIC_TO_RITHMIC = {
                 v: k for k, v in RITHMIC_EXCHANGE_TO_MIC.items()
             }
-            # Databento venue aliases that don't appear in the MIC mapping
-            RithmicLiveExecutionClient._MIC_TO_RITHMIC.update({
-                "GLBX": "CME",   # CME Globex (Databento)
-                "XCBT": "CBOT",
-                "XNYM": "NYMEX",
-                "XCEC": "COMEX",
-            })
+            # GLBX (Databento) maps to CME for order routing
+            RithmicLiveExecutionClient._MIC_TO_RITHMIC["GLBX"] = "CME"
         venue = instrument_id.venue.value
         return RithmicLiveExecutionClient._MIC_TO_RITHMIC.get(venue, venue)
 

@@ -39,11 +39,11 @@ from nautilus_trader.model.objects import Quantity
 # ---------------------------------------------------------------------------
 
 RITHMIC_EXCHANGE_TO_MIC: dict[str, str] = {
-    # CME Group
-    "CME": "XCME",
-    "CBOT": "XCBT",
-    "NYMEX": "XNYM",
-    "COMEX": "XCEC",
+    # CME Group — use Databento venue codes so instrument IDs match live feed
+    "CME": "GLBX",
+    "CBOT": "GLBX",
+    "NYMEX": "GLBX",
+    "COMEX": "GLBX",
     # ICE
     "ICE": "IFUS",
     "ICEUS": "IFUS",
