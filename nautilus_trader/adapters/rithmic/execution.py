@@ -33,6 +33,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -50,6 +51,7 @@ from nautilus_trader.adapters.rithmic.parsing.execution import NT_ORDER_SIDE_TO_
 from nautilus_trader.adapters.rithmic.parsing.execution import NT_ORDER_TYPE_TO_RITHMIC
 from nautilus_trader.adapters.rithmic.parsing.execution import NT_TIME_IN_FORCE_TO_RITHMIC
 from nautilus_trader.adapters.rithmic.parsing.execution import ssboe_usecs_to_nanos
+from nautilus_trader.adapters.rithmic.parsing.instruments import RITHMIC_EXCHANGE_TO_MIC
 from nautilus_trader.adapters.rithmic.parsing.instruments import make_instrument_id
 from nautilus_trader.adapters.rithmic.providers import RithmicInstrumentProvider
 from nautilus_trader.cache.cache import Cache
@@ -233,8 +235,7 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         ):
             kwargs["trigger_price"] = float(order.trigger_price)
 
-        if hasattr(order, "account_id") and order.account_id:
-            kwargs["account_id"] = self._account_id.get_id()
+        kwargs["account_id"] = self._account_id.get_id()
 
         try:
             response = await self._client.submit_order(**kwargs)
@@ -258,7 +259,11 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         order_list = command.order_list
-        if order_list.is_bracket():
+        is_bracket = (
+            len(order_list.orders) >= 2
+            and order_list.orders[0].contingency_type == ContingencyType.OTO
+        )
+        if is_bracket:
             await self._submit_bracket_order(command)
         else:
             # Fall back to submitting each order individually.
@@ -809,8 +814,6 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         Each exchange-notification snapshot with ``notify_type=FILL`` is ingested into
         the client's fill cache so ``generate_fill_reports`` includes past-session fills.
         """
-        import datetime
-
         self._log.info(f"Loading fill history for last {days} day(s)…")
         try:
             available_dates = await self._client.show_order_history_dates()
@@ -836,7 +839,6 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
             for n in notifications:
                 self._client.ingest_historical_notification(n)
-                from async_rithmic import ExchangeOrderNotificationType
                 if getattr(n, "notify_type", 0) == ExchangeOrderNotificationType.FILL:
                     total += 1
 
@@ -856,9 +858,14 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
             return  # snapshot not yet populated
 
         currency = Currency.from_str("USD")
-        total = Money(account_balance_raw, currency)
-        free = Money(cash_on_hand, currency)
-        locked = Money(max(0.0, account_balance_raw - cash_on_hand), currency)
+        precision = currency.precision
+        total_raw = round(account_balance_raw, precision)
+        locked_raw = round(max(0.0, account_balance_raw - cash_on_hand), precision)
+        free_raw = round(total_raw - locked_raw, precision)  # derived so total - locked == free exactly
+
+        total = Money(total_raw, currency)
+        locked = Money(locked_raw, currency)
+        free = Money(free_raw, currency)
 
         balance = AccountBalance(total=total, free=free, locked=locked)
 
@@ -900,12 +907,17 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
         Builds an inverted lookup from :data:`RITHMIC_EXCHANGE_TO_MIC` on
         first call.  Falls back to the raw venue string if no mapping found.
         """
-        from nautilus_trader.adapters.rithmic.parsing.instruments import RITHMIC_EXCHANGE_TO_MIC
-
         if not hasattr(RithmicLiveExecutionClient, "_MIC_TO_RITHMIC"):
             RithmicLiveExecutionClient._MIC_TO_RITHMIC = {
                 v: k for k, v in RITHMIC_EXCHANGE_TO_MIC.items()
             }
+            # Databento venue aliases that don't appear in the MIC mapping
+            RithmicLiveExecutionClient._MIC_TO_RITHMIC.update({
+                "GLBX": "CME",   # CME Globex (Databento)
+                "XCBT": "CBOT",
+                "XNYM": "NYMEX",
+                "XCEC": "COMEX",
+            })
         venue = instrument_id.venue.value
         return RithmicLiveExecutionClient._MIC_TO_RITHMIC.get(venue, venue)
 
