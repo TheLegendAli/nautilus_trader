@@ -154,8 +154,10 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
         # Map client_order_id → basket_id for cancel/modify routing.
         self._client_order_id_to_basket: dict[str, str] = {}
-        # Map basket_id → client_order_id for event routing back to strategies.
+        # Map basket_id → entry client_order_id for event routing back to strategies.
         self._basket_to_client_order_id: dict[str, str] = {}
+        # Map basket_id → {entry, tp, sl} for bracket fill routing.
+        self._basket_to_bracket: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # LiveExecutionClient lifecycle
@@ -381,12 +383,17 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
             response = await self._client.submit_order(**kwargs)
             first = response[0] if isinstance(response, list) and response else response
             basket_id: str = getattr(first, "basket_id", None) or entry.client_order_id.value
+            # Only the entry goes in the reverse map — the basket_id always maps to the
+            # entry so that the entry fill is attributed correctly.  Children only need
+            # the forward direction (coid → basket) for cancel/modify routing.
             self._register_order(entry.client_order_id.value, basket_id)
-
-            # Register child orders too — Rithmic creates them internally but we
-            # still need them in the cache for event routing if they report back.
             for child in children:
-                self._register_order(child.client_order_id.value, basket_id)
+                self._client_order_id_to_basket[child.client_order_id.value] = basket_id
+            self._basket_to_bracket[basket_id] = {
+                "entry": entry,
+                "tp": tp_order,
+                "sl": sl_order,
+            }
 
             self.generate_order_submitted(
                 strategy_id=command.strategy_id,
@@ -746,6 +753,29 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
                     ts_event=ts,
                 )
 
+    def _resolve_bracket_fill_order(self, basket_id: str, entry: Order, fill_price: float) -> Order:
+        """Return the correct bracket leg for a fill after the entry is already filled."""
+        bracket = self._basket_to_bracket.get(basket_id, {})
+        tp: Order | None = bracket.get("tp")
+        sl: Order | None = bracket.get("sl")
+
+        # Filter to orders that are still open.
+        candidates = [o for o in (tp, sl) if o is not None and o.status != OrderStatus.FILLED and not o.is_closed]
+        if not candidates:
+            return entry
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Both still open: distinguish by fill price relative to entry.
+        # For SHORT entry: TP is below entry price, SL is above.
+        # For LONG entry: TP is above entry price, SL is below.
+        entry_price = float(entry.price)
+        if entry.side == OrderSide.SELL:
+            return tp if fill_price < entry_price else sl
+        else:
+            return tp if fill_price > entry_price else sl
+
     async def _handle_fill(self, n: Any, order: Order, basket_id: str, ts: int) -> None:
         """Emit a fill event for a FILL exchange notification."""
         fill_size: int = getattr(n, "fill_size", 0)
@@ -756,6 +786,22 @@ class RithmicLiveExecutionClient(LiveExecutionClient):
 
         if not fill_size or not fill_id:
             return
+
+        # For bracket orders: if the entry is already filled, route this fill to
+        # the correct child leg (TP or SL) based on fill price.
+        if basket_id in self._basket_to_bracket and order.status == OrderStatus.FILLED:
+            child = self._resolve_bracket_fill_order(basket_id, order, fill_price)
+            if child is not order:
+                # Ensure the child transitions through ACCEPTED before FILLED.
+                if child.status == OrderStatus.SUBMITTED:
+                    self.generate_order_accepted(
+                        strategy_id=child.strategy_id,
+                        instrument_id=child.instrument_id,
+                        client_order_id=child.client_order_id,
+                        venue_order_id=VenueOrderId(basket_id),
+                        ts_event=ts,
+                    )
+                order = child
 
         instrument = self._cache.instrument(order.instrument_id)
         if instrument is None:

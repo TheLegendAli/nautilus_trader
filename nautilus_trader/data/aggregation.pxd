@@ -97,12 +97,15 @@ cdef class TimeBarAggregator(BarAggregator):
     cdef bint _build_on_next_tick
     cdef uint64_t _stored_open_ns
     cdef uint64_t _stored_close_ns
+    cdef uint64_t _prev_stored_open_ns
     cdef tuple _cached_update
     cdef str _timer_name
     cdef bint _build_with_no_updates
     cdef bint _timestamp_on_close
     cdef bint _is_left_open
     cdef bint _add_delay
+    cdef bint _await_boundary_bar
+    cdef bint _awaiting_late_bar
 
     cdef readonly timedelta interval
     """The aggregators time interval.\n\n:returns: `timedelta`"""

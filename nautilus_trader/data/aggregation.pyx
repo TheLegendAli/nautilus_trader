@@ -21,6 +21,7 @@ from cpython.datetime cimport timedelta
 from libc.stdint cimport uint64_t
 
 from nautilus_trader.common.component cimport Clock
+from nautilus_trader.common.component cimport LiveClock
 from nautilus_trader.common.component cimport Logger
 from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.core.correctness cimport Condition
@@ -696,10 +697,20 @@ cdef class TimeBarAggregator(BarAggregator):
         self._build_on_next_tick = False
         self._stored_open_ns = dt_to_unix_nanos(self.get_start_time())
         self._stored_close_ns = 0
+        self._prev_stored_open_ns = 0
         self._cached_update = None
         self._build_with_no_updates = build_with_no_updates
         self._timestamp_on_close = timestamp_on_close
         self._add_delay = bar_type.is_composite() and bar_type.composite().is_internally_aggregated()
+        # In live mode, the boundary 1m bar arrives slightly after the timer fires, so defer
+        # building the 15m bar until that bar arrives. In backtest, bars arrive in-order with
+        # no latency so no deferral is needed (and would shift bars by 1 minute).
+        self._await_boundary_bar = (
+            isinstance(clock, LiveClock)
+            and bar_type.is_composite()
+            and not bar_type.composite().is_internally_aggregated()
+        )
+        self._awaiting_late_bar = False
 
         if interval_type == "left-open":
             self._is_left_open = True
@@ -856,6 +867,24 @@ cdef class TimeBarAggregator(BarAggregator):
             self._stored_close_ns = 0
 
     cdef void _apply_update_bar(self, Bar bar, Quantity volume, uint64_t ts_init):
+        cdef uint64_t ts_event_val
+        if self._awaiting_late_bar:
+            self._awaiting_late_bar = False
+            if bar.ts_event < self._stored_close_ns:
+                # Boundary bar arrived — include it in the closing period
+                # Use bar.ts_event (bar open time) not ts_init, because in live mode
+                # ts_init = ts_recv + 60s which is far beyond _stored_close_ns
+                self._builder.update_bar(bar, volume, ts_init)
+                ts_event_val = self._stored_close_ns if self._timestamp_on_close else self._prev_stored_open_ns
+                self._build_and_send(ts_event=ts_event_val, ts_init=ts_init)
+            else:
+                # Bar belongs to next period — close current period without it, then add bar
+                ts_event_val = self._stored_close_ns if self._timestamp_on_close else self._prev_stored_open_ns
+                self._build_and_send(ts_event=ts_event_val, ts_init=self._stored_close_ns)
+                self._builder.update_bar(bar, volume, ts_init)
+            self._stored_close_ns = 0
+            self._prev_stored_open_ns = 0
+            return
         self._builder.update_bar(bar, volume, ts_init)
 
     cpdef void _build_bar(self, TimeEvent event):
@@ -866,7 +895,19 @@ cdef class TimeBarAggregator(BarAggregator):
             return
 
         if not self._build_with_no_updates and self._builder.count == 0:
+            self._stored_open_ns = event.ts_event
+            self.next_close_ns = self._clock.next_time_ns(self._timer_name)
             return  # Do not build and emit bar
+
+        if self._await_boundary_bar:
+            # Defer: wait for the last 1m bar (which closes exactly at this boundary)
+            # to arrive via _apply_update_bar before emitting the 15m bar
+            self._prev_stored_open_ns = self._stored_open_ns
+            self._stored_close_ns = event.ts_event
+            self._awaiting_late_bar = True
+            self._stored_open_ns = event.ts_event
+            self.next_close_ns = self._clock.next_time_ns(self._timer_name)
+            return
 
         cdef uint64_t ts_init = event.ts_event
         cdef uint64_t ts_event
