@@ -526,15 +526,16 @@ class LiveMarketDataClient(MarketDataClient):
             success_color=LogColor.BLUE,
         )
 
-    def subscribe_bars(self, bar_type: BarType) -> None:
+    def subscribe_bars(self, bar_type: BarType, start=None) -> None:
         PyCondition.is_true(
             bar_type.is_externally_aggregated(),
             "aggregation_source is not EXTERNAL",
         )
 
         self._add_subscription_bars(bar_type)
+        kwargs = {"start": start} if start is not None else {}
         self.create_task(
-            self._subscribe_bars(bar_type),
+            self._subscribe_bars(bar_type, **kwargs),
             log_msg=f"subscribe: bars {bar_type}",
             success_msg=f"Subscribed {bar_type} bars",
             success_color=LogColor.BLUE,

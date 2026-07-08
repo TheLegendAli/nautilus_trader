@@ -88,7 +88,7 @@ cdef class MarketDataClient(DataClient):
     cpdef void subscribe_order_book_snapshots(self, InstrumentId instrument_id, BookType book_type, int depth=*, dict kwargs=*)
     cpdef void subscribe_quote_ticks(self, InstrumentId instrument_id)
     cpdef void subscribe_trade_ticks(self, InstrumentId instrument_id)
-    cpdef void subscribe_bars(self, BarType bar_type)
+    cpdef void subscribe_bars(self, BarType bar_type, object start=*)
     cpdef void subscribe_instrument_status(self, InstrumentId instrument_id)
     cpdef void subscribe_instrument_close(self, InstrumentId instrument_id)
     cpdef void unsubscribe_instruments(self)

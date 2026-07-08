@@ -130,7 +130,7 @@ cdef class DataEngine(Component):
     cpdef void _handle_subscribe_synthetic_quote_ticks(self, InstrumentId instrument_id)
     cpdef void _handle_subscribe_trade_ticks(self, MarketDataClient client, InstrumentId instrument_id)
     cpdef void _handle_subscribe_synthetic_trade_ticks(self, InstrumentId instrument_id)
-    cpdef void _handle_subscribe_bars(self, MarketDataClient client, BarType bar_type, bint await_partial)
+    cpdef void _handle_subscribe_bars(self, MarketDataClient client, BarType bar_type, bint await_partial, object start=*)
     cpdef void _handle_subscribe_data(self, DataClient client, DataType data_type)
     cpdef void _handle_subscribe_instrument_status(self, MarketDataClient client, InstrumentId instrument_id)
     cpdef void _handle_subscribe_instrument_close(self, MarketDataClient client, InstrumentId instrument_id)

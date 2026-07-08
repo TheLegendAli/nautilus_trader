@@ -128,6 +128,8 @@ class DatabentoDataClient(LiveMarketDataClient):
         self._dataset_ranges: dict[Dataset, tuple[pd.Timestamp, pd.Timestamp]] = {}
         self._dataset_ranges_requested: set[Dataset] = set()
         self._trade_tick_subscriptions: set[InstrumentId] = set()
+        self._warmup_buffering: bool = False
+        self._warmup_buffer: list = []
 
         # Cache parent symbol index
         for dataset, parent_symbols in (config.parent_symbols or {}).items():
@@ -456,7 +458,10 @@ class DatabentoDataClient(LiveMarketDataClient):
                 schema=DatabentoSchema.DEFINITION.value,
                 symbols=[i.symbol.value for i in instrument_ids],
             )
-            await self._check_live_client_started(dataset, live_client)
+            # Do NOT start the live client here — let the first bars/data subscription
+            # with an optional `start` time-travel parameter trigger the start, so that
+            # all subscribe() calls (including time-travel start=) are queued before
+            # live_client.start() is called.
         except asyncio.CancelledError:
             self._log.warning("`_subscribe_instrument_ids` was canceled while still pending")
 
@@ -617,7 +622,13 @@ class DatabentoDataClient(LiveMarketDataClient):
         except asyncio.CancelledError:
             self._log.warning("`_subscribe_trade_ticks` was canceled while still pending")
 
-    async def _subscribe_bars(self, bar_type: BarType) -> None:
+    async def _subscribe_bars(self, bar_type: BarType, start=None) -> None:
+        # Maximum window that Databento live time-travel can handle reliably.
+        # Requests beyond this are split: bulk history via HTTP, then a short
+        # bridge window via live time-travel to land seamlessly into real-time.
+        _LIVE_BRIDGE_NS: int = 60 * 60 * 1_000_000_000       # 1 hour
+        _SAFE_WINDOW_NS: int = 12 * 60 * 60 * 1_000_000_000  # 12 hours
+
         try:
             dataset: Dataset = self._loader.get_dataset_for_venue(bar_type.instrument_id.venue)
 
@@ -628,12 +639,77 @@ class DatabentoDataClient(LiveMarketDataClient):
                 return
 
             live_client = self._get_live_client(dataset)
-            live_client.subscribe(
-                schema=schema.value,
-                symbols=[bar_type.instrument_id.symbol.value],
-            )
+
+            live_start_ns: int | None = None
+
+            if start is not None:
+                start_ns = int(start.value) if hasattr(start, "value") else int(start)
+                now_ns = self._clock.timestamp_ns()
+                window_ns = now_ns - start_ns
+
+                if window_ns > _SAFE_WINDOW_NS:
+                    # Bulk portion via HTTP so we don't blow the live replay limit.
+                    # Subscribe the live client FIRST so it connects while HTTP fetch runs in parallel.
+                    bridge_ns = now_ns - _LIVE_BRIDGE_NS
+                    self._log.info(
+                        f"Warmup window {window_ns / 3.6e12:.1f}h exceeds safe live-replay limit — "
+                        f"fetching {(bridge_ns - start_ns) / 3.6e12:.1f}h via HTTP then bridging "
+                        f"last 1h via live time-travel for {bar_type}",
+                    )
+                    # Buffer any bridge bars that arrive during the HTTP fetch so they don't
+                    # race with historical bars going into the DataEngine aggregator.
+                    self._warmup_buffer.clear()
+                    self._warmup_buffering = True
+                    live_client.subscribe(
+                        schema=schema.value,
+                        symbols=[bar_type.instrument_id.symbol.value],
+                        start=bridge_ns,
+                    )
+                    await self._check_live_client_started(dataset, live_client)
+
+                    # HTTP fetch runs while the live client is connecting in the background.
+                    pyo3_bars = await self._http_client.get_range_bars(
+                        dataset=dataset,
+                        symbols=[bar_type.instrument_id.symbol.value],
+                        aggregation=nautilus_pyo3.BarAggregation(
+                            bar_aggregation_to_str(bar_type.spec.aggregation),
+                        ),
+                        start=start_ns,
+                        end=bridge_ns,
+                    )
+                    bars = Bar.from_pyo3_list(pyo3_bars)
+                    self._log.info(f"HTTP warmup delivered {len(bars)} bars for {bar_type}")
+                    for bar in bars:
+                        self._handle_data(bar)
+
+                    # Flush bridge bars that arrived during the HTTP fetch, now that historical
+                    # bars are fully injected and the aggregator state is correct.
+                    self._warmup_buffering = False
+                    n_buffered = len(self._warmup_buffer)
+                    if n_buffered:
+                        self._log.info(f"Flushing {n_buffered} buffered bridge bars for {bar_type}")
+                    for buffered_data in self._warmup_buffer:
+                        self._handle_data(buffered_data)
+                    self._warmup_buffer.clear()
+                    return  # already subscribed above
+                else:
+                    live_start_ns = start_ns
+
+            subscribe_kwargs: dict[str, Any] = {
+                "schema": schema.value,
+                "symbols": [bar_type.instrument_id.symbol.value],
+            }
+            if live_start_ns is not None:
+                subscribe_kwargs["start"] = live_start_ns
+                self._log.info(
+                    f"Subscribing {bar_type} with time-travel start={live_start_ns} "
+                    f"(live_client_started={self._has_subscribed.get(dataset, False)})",
+                )
+            live_client.subscribe(**subscribe_kwargs)
             await self._check_live_client_started(dataset, live_client)
         except asyncio.CancelledError:
+            self._warmup_buffering = False
+            self._warmup_buffer.clear()
             self._log.warning("`_subscribe_bars` was canceled while still pending")
 
     async def _subscribe_instrument_status(self, instrument_id: InstrumentId) -> None:
@@ -1023,4 +1099,7 @@ class DatabentoDataClient(LiveMarketDataClient):
         # and eventually be garbage collected. The contained pointer
         # to `Data` is still owned and managed by Rust.
         data = capsule_to_data(pycapsule)
+        if self._warmup_buffering:
+            self._warmup_buffer.append(data)
+            return
         self._handle_data(data)

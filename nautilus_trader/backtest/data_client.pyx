@@ -232,7 +232,7 @@ cdef class BacktestMarketDataClient(MarketDataClient):
         self._add_subscription_trade_ticks(instrument_id)
         # Do nothing else for backtest
 
-    cpdef void subscribe_bars(self, BarType bar_type):
+    cpdef void subscribe_bars(self, BarType bar_type, object start=None):
         Condition.not_none(bar_type, "bar_type")
 
         if not self._cache.instrument(bar_type.instrument_id):

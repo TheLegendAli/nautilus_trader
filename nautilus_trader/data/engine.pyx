@@ -688,6 +688,7 @@ cdef class DataEngine(Component):
                 client,
                 command.data_type.metadata.get("bar_type"),
                 command.data_type.metadata.get("await_partial"),
+                command.data_type.metadata.get("start"),
             )
         elif command.data_type.type == InstrumentStatus:
             self._handle_subscribe_instrument_status(
@@ -1013,6 +1014,7 @@ cdef class DataEngine(Component):
         MarketDataClient client,
         BarType bar_type,
         bint await_partial,
+        object start = None,
     ):
         Condition.not_none(client, "client")
         Condition.not_none(bar_type, "bar_type")
@@ -1030,7 +1032,7 @@ cdef class DataEngine(Component):
                 return
 
             if bar_type not in client.subscribed_bars():
-                client.subscribe_bars(bar_type)
+                client.subscribe_bars(bar_type, start=start)
 
     cpdef void _handle_subscribe_data(
         self,

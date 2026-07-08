@@ -34,8 +34,12 @@ from nautilus_trader.common.config import ImportableActorConfig
 from nautilus_trader.common.executor import ActorExecutor
 from nautilus_trader.common.executor import TaskId
 from nautilus_trader.common.signal import generate_signal_class
-from nautilus_trader.model.greeks import GreeksData
-from nautilus_trader.model.greeks import PortfolioGreeks
+try:
+    from nautilus_trader.model.greeks import GreeksData
+    from nautilus_trader.model.greeks import PortfolioGreeks
+except (ValueError, ImportError):
+    GreeksData = object
+    PortfolioGreeks = object
 
 from cpython.datetime cimport datetime
 from libc.stdint cimport uint64_t
@@ -1404,6 +1408,7 @@ cdef class Actor(Component):
         BarType bar_type,
         ClientId client_id = None,
         bint await_partial = False,
+        object start = None,
     ):
         """
         Subscribe to streaming `Bar` data for the given bar type.
@@ -1418,6 +1423,9 @@ cdef class Actor(Component):
         await_partial : bool, default False
             If the bar aggregator should await the arrival of a historical partial bar prior
             to actively aggregating new bars.
+        start : pd.Timestamp, optional
+            If provided, the live client will replay data from this timestamp before
+            switching to real-time streaming (Databento live time-travel).
 
         """
         Condition.not_none(bar_type, "bar_type")
@@ -1431,6 +1439,7 @@ cdef class Actor(Component):
         cdef dict metadata = {
             "bar_type": bar_type,
             "await_partial": await_partial,
+            "start": start,
         }
 
         cdef Subscribe command = Subscribe(

@@ -498,7 +498,7 @@ cdef class MarketDataClient(DataClient):
         )
         raise NotImplementedError("method `subscribe_instrument_close` must be implemented in the subclass")
 
-    cpdef void subscribe_bars(self, BarType bar_type):
+    cpdef void subscribe_bars(self, BarType bar_type, object start=None):
         """
         Subscribe to `Bar` data for the given bar type.
 
@@ -506,6 +506,8 @@ cdef class MarketDataClient(DataClient):
         ----------
         bar_type : BarType
             The bar type to subscribe to.
+        start : pd.Timestamp, optional
+            If provided, replay from this timestamp before live streaming.
 
         """
         self._log.error(  # pragma: no cover

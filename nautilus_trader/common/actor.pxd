@@ -18,8 +18,6 @@ from typing import Callable
 from cpython.datetime cimport datetime
 from libc.stdint cimport uint64_t
 
-from nautilus_trader.risk.greeks import GreeksData
-
 from nautilus_trader.cache.base cimport CacheFacade
 from nautilus_trader.common.component cimport Clock
 from nautilus_trader.common.component cimport Component
@@ -54,7 +52,7 @@ cdef class Actor(Component):
     cdef set[type] _warning_events
     cdef dict[UUID4, object] _pending_requests
     cdef set[type] _pyo3_conversion_types
-    cdef dict[InstrumentId, list[GreeksData]] _future_greeks
+    cdef dict _future_greeks
     cdef dict[str, type] _signal_classes
     cdef list[Indicator] _indicators
     cdef dict[InstrumentId, list[Indicator]] _indicators_for_quotes
@@ -160,7 +158,7 @@ cdef class Actor(Component):
     )
     cpdef void subscribe_quote_ticks(self, InstrumentId instrument_id, ClientId client_id=*)
     cpdef void subscribe_trade_ticks(self, InstrumentId instrument_id, ClientId client_id=*)
-    cpdef void subscribe_bars(self, BarType bar_type, ClientId client_id=*, bint await_partial=*)
+    cpdef void subscribe_bars(self, BarType bar_type, ClientId client_id=*, bint await_partial=*, object start=*)
     cpdef void subscribe_instrument_status(self, InstrumentId instrument_id, ClientId client_id=*)
     cpdef void subscribe_instrument_close(self, InstrumentId instrument_id, ClientId client_id=*)
     cpdef void unsubscribe_data(self, DataType data_type, ClientId client_id=*)
